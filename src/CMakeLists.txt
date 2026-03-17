@@ -1,12 +1,9 @@
 idf_component_register(
-  SRCS
-    "main.cpp"
-    "hal/esp32_nrf24_hal.cpp"
-    "nrf24/nrf24.cpp"
-    "app/radio_manager.cpp"
-    "util/frame_file.cpp"
-    "util/morse.cpp"
-  INCLUDE_DIRS
-    "."
-    "../include"
+    SRCS
+        "main.cpp"
+        "nrf24.cpp"
+        "esp32_nrf24_hal.cpp"
+    INCLUDE_DIRS
+        "."
+        "../include"
 )
