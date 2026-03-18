@@ -18,8 +18,8 @@ void app_main(void)
     Esp32Nrf24Hal hal(config);
 
     // TODO:
-    // Nrf24 radio(hal);
-    // RadioManager manager(radio);
+    Nrf24 radio(hal);
+    RadioManager manager(radio);
 
     ESP_LOGI(TAG, "Firmware scaffold started");
 
