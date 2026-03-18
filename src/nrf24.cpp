@@ -1,64 +1,152 @@
 #include "nrf24.hpp"
 
-static constexpr uint8_t CMD_R_REGISTER = 0x00;
-static constexpr uint8_t CMD_W_REGISTER = 0x20;
-static constexpr uint8_t CMD_NOP        = 0xFF;
-
-static constexpr uint8_t REG_CONFIG     = 0x00;
-static constexpr uint8_t REG_EN_AA      = 0x01;
-static constexpr uint8_t REG_EN_RXADDR  = 0x02;
-static constexpr uint8_t REG_SETUP_AW   = 0x03;
-static constexpr uint8_t REG_SETUP_RETR = 0x04;
-static constexpr uint8_t REG_RF_CH      = 0x05;
-static constexpr uint8_t REG_RF_SETUP   = 0x06;
-static constexpr uint8_t REG_STATUS     = 0x07;
-
-uint8_t Nrf24::status()
+Nrf24::Nrf24(Nrf24Hal& hal)
+    : hal_(hal),
+      static_payload_size_(32)
 {
-    uint8_t tx[1] = { CMD_NOP };
-    uint8_t rx[1] = { 0 };
-    hal_.spiTxRx(tx, rx, 1);
-    return rx[0];
+}
+
+bool Nrf24::probe()
+{
+    // TODO:
+    // Read/write a few known registers and verify response
+    return false;
+}
+
+bool Nrf24::initDefaults(uint8_t channel)
+{
+    (void)channel;
+
+    // TODO:
+    // Set CRC, channel, payload width, retries, power state, etc.
+    return false;
+}
+
+uint8_t Nrf24::getStatus()
+{
+    // TODO:
+    // Send NOP command and return STATUS
+    return 0;
 }
 
 uint8_t Nrf24::readReg(uint8_t reg)
 {
-    uint8_t tx[2] = {
-        static_cast<uint8_t>(CMD_R_REGISTER | (reg & 0x1F)),
-        0xFF
-    };
-    uint8_t rx[2] = { 0, 0 };
-    hal_.spiTxRx(tx, rx, 2);
-    return rx[1];
+    (void)reg;
+
+    // TODO:
+    return 0;
+}
+
+void Nrf24::readRegs(uint8_t reg, uint8_t* out, size_t len)
+{
+    (void)reg;
+    (void)out;
+    (void)len;
+
+    // TODO
 }
 
 void Nrf24::writeReg(uint8_t reg, uint8_t value)
 {
-    uint8_t tx[2] = {
-        static_cast<uint8_t>(CMD_W_REGISTER | (reg & 0x1F)),
-        value
-    };
-    uint8_t rx[2] = { 0, 0 };
-    hal_.spiTxRx(tx, rx, 2);
+    (void)reg;
+    (void)value;
+
+    // TODO
 }
 
-bool Nrf24::begin()
+void Nrf24::writeRegs(uint8_t reg, const uint8_t* data, size_t len)
 {
-    hal_.ce(false);
-    hal_.delayUs(5000);
+    (void)reg;
+    (void)data;
+    (void)len;
 
-    // Simple, stable bring-up config
-    writeReg(REG_EN_AA,      0x00); // disable auto-ack for now
-    writeReg(REG_EN_RXADDR,  0x01); // enable pipe 0
-    writeReg(REG_SETUP_AW,   0x03); // 5-byte address
-    writeReg(REG_SETUP_RETR, 0x00); // disable retries for now
-    writeReg(REG_RF_CH,      76);   // 2.476 GHz
-    writeReg(REG_RF_SETUP,   0x06); // 1 Mbps, 0 dBm
-    writeReg(REG_STATUS,     0x70); // clear IRQ flags
-    writeReg(REG_CONFIG,     0x0E); // PWR_UP=1, EN_CRC=1, CRCO=1, TX mode
+    // TODO
+}
 
-    hal_.delayUs(5000);
+void Nrf24::flushTx()
+{
+    // TODO
+}
 
-    uint8_t cfg = readReg(REG_CONFIG);
-    return (cfg == 0x0E);
+void Nrf24::flushRx()
+{
+    // TODO
+}
+
+void Nrf24::clearIrq(bool rx_dr, bool tx_ds, bool max_rt)
+{
+    (void)rx_dr;
+    (void)tx_ds;
+    (void)max_rt;
+
+    // TODO
+}
+
+bool Nrf24::powerUp()
+{
+    // TODO
+    return false;
+}
+
+bool Nrf24::powerDown()
+{
+    // TODO
+    return false;
+}
+
+bool Nrf24::startRx()
+{
+    // TODO
+    return false;
+}
+
+bool Nrf24::stopRx()
+{
+    // TODO
+    return false;
+}
+
+bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
+{
+    (void)payload;
+    (void)len;
+    (void)timeoutUs;
+
+    // TODO
+    return false;
+}
+
+bool Nrf24::readOnePacket(uint8_t* out, size_t capacity, size_t& outLen)
+{
+    (void)out;
+    (void)capacity;
+
+    outLen = 0;
+
+    // TODO
+    return false;
+}
+
+bool Nrf24::startContinuousCarrier(uint8_t channel, uint8_t rfPowerBits)
+{
+    (void)channel;
+    (void)rfPowerBits;
+
+    // TODO
+    return false;
+}
+
+void Nrf24::stopContinuousCarrier()
+{
+    // TODO
+}
+
+void Nrf24::setStaticPayloadSize(uint8_t size)
+{
+    static_payload_size_ = size;
+}
+
+uint8_t Nrf24::staticPayloadSize() const
+{
+    return static_payload_size_;
 }

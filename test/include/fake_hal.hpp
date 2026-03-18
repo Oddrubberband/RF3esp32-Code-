@@ -1,34 +1,39 @@
 #pragma once
-#include "nrf24_hal.hpp"
-#include <array>
+
+#include <cstddef>
+#include <cstdint>
 #include <vector>
-#include <cstring>
 
-struct FakeHal : public Nrf24Hal {
-  std::array<uint8_t, 0x20> regs{};          // nRF24 has 0x00..0x1F core regs
-  std::vector<uint8_t> lastTx;
+#include "nrf24_hal.hpp"
 
-  void spiTxRx(const uint8_t* tx, uint8_t* rx, size_t n) override {
-    lastTx.assign(tx, tx + n);
-    std::memset(rx, 0, n);
+class FakeHal : public Nrf24Hal {
+public:
+    std::vector<uint8_t> last_tx;
+    std::vector<uint8_t> next_rx;
+    bool ce_level = false;
+    uint64_t time_us = 0;
 
-    uint8_t cmd = tx[0];
+    void spiTxRx(const uint8_t* tx, uint8_t* rx, size_t n) override
+    {
+        last_tx.assign(tx, tx + n);
 
-    // R_REGISTER (0x00..0x1F)
-    if ((cmd & 0xE0) == 0x00 && n >= 2) {
-      uint8_t reg = cmd & 0x1F;
-      rx[1] = regs[reg];
-      return;
+        for (size_t i = 0; i < n; ++i) {
+            rx[i] = (i < next_rx.size()) ? next_rx[i] : 0;
+        }
     }
 
-    // W_REGISTER (0x20..0x3F)
-    if ((cmd & 0xE0) == 0x20 && n >= 2) {
-      uint8_t reg = cmd & 0x1F;
-      regs[reg] = tx[1];
-      return;
+    void ce(bool level) override
+    {
+        ce_level = level;
     }
-  }
 
-  void ce(bool) override {}
-  void delayUs(uint32_t) override {}
+    void delayUs(uint32_t us) override
+    {
+        time_us += us;
+    }
+
+    uint64_t nowUs() override
+    {
+        return time_us;
+    }
 };

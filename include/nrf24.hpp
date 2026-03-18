@@ -1,18 +1,25 @@
 #pragma once
+
 #include <cstddef>
 #include <cstdint>
 #include "nrf24_hal.hpp"
 
+// Low-level nRF24L01+ driver.
+// This class should handle register access, FIFO commands,
+// power/mode control, and packet-level radio operations.
+
 class Nrf24 {
 public:
-    explicit Nrf24(Nrf24Hal& hal) : hal_(hal) {}
+    // TODO: constructor that accepts a Nrf24Hal reference
 
-    uint8_t status();
-    uint8_t readReg(uint8_t reg);
-    void writeReg(uint8_t reg, uint8_t value);
-
-    bool begin();
+    // TODO: basic bring-up / probe functions
+    // TODO: register read/write functions
+    // TODO: FIFO helper functions
+    // TODO: IRQ/status helper functions
+    // TODO: TX/RX control functions
+    // TODO: CW/test mode functions
 
 private:
-    Nrf24Hal& hal_;
+    // TODO: store reference to HAL
+    // TODO: add constants/helpers as needed
 };

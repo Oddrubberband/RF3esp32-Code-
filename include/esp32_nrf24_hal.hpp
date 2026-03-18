@@ -1,25 +1,18 @@
 #pragma once
 
 #include "nrf24_hal.hpp"
-#include "driver/gpio.h"
-#include "driver/spi_master.h"
 
+// TODO:
+// Add the ESP-IDF includes you need here, such as GPIO/SPI headers.
+
+// ESP32-specific implementation of Nrf24Hal.
 class Esp32Nrf24Hal : public Nrf24Hal {
 public:
-    Esp32Nrf24Hal(spi_host_device_t host,
-                  gpio_num_t sck,
-                  gpio_num_t mosi,
-                  gpio_num_t miso,
-                  gpio_num_t ce_pin,
-                  gpio_num_t csn_pin);
+    // TODO: define constructor
+    // TODO: define destructor if needed
 
-    ~Esp32Nrf24Hal() override = default;
-
-    void spiTxRx(const uint8_t* tx, uint8_t* rx, size_t n) override;
-    void ce(bool level) override;
-    void delayUs(uint32_t us) override;
+    // TODO: override the HAL functions from Nrf24Hal
 
 private:
-    spi_device_handle_t spi_ = nullptr;
-    gpio_num_t ce_pin_;
+    // TODO: add private members for SPI handle, pins, config, etc.
 };
