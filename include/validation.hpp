@@ -3,18 +3,15 @@
 #include <cstddef>
 #include <cstdint>
 
-// Generic validation result.
 struct ValidationResult {
-    // TODO: add fields such as:
-    // - success/failure
-    // - message
+    bool ok;
+    const char* message;
 };
 
-// Input validation helpers.
 class Validation {
 public:
-    // TODO: payload length validation
-    // TODO: channel validation
-    // TODO: Morse timing validation
-    // TODO: CW duration validation
+    static ValidationResult payloadSize(size_t len);
+    static ValidationResult channel(uint8_t ch);
+    static ValidationResult dotTimeMs(uint32_t dot_ms);
+    static ValidationResult cwDurationMs(uint32_t duration_ms);
 };

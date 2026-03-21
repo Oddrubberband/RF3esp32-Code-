@@ -4,18 +4,15 @@
 #include <string>
 #include <vector>
 
-// Represents one keyed timing event.
 struct KeyEvent {
-    // TODO: add fields such as:
-    // - key down/up
-    // - duration in ms
+    bool key_down = false;
+    uint32_t duration_ms = 0;
 };
 
-// Morse conversion helper.
 class Morse {
 public:
-    // TODO: function to encode text into KeyEvent sequence
+    static std::vector<KeyEvent> encode(const std::string& text, uint32_t dot_ms);
 
 private:
-    // TODO: helper to map one character to Morse symbols
+    static std::string symbolFor(char c);
 };

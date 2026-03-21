@@ -9,12 +9,25 @@ bool RadioManager::boot(uint8_t channel)
 {
     status_.state = RadioState::Boot;
     status_.channel = channel;
+    status_.last_fault = 0;
+    status_.last_tx_ok = false;
+    status_.last_rx_len = 0;
 
-    // TODO:
-    // call radio_.probe()
-    // call radio_.initDefaults(channel)
-    // update status_
-    return false;
+    if (!radio_.probe()) {
+        status_.state = RadioState::Fault;
+        status_.last_fault = 1;
+        return false;
+    }
+
+    if (!radio_.initDefaults(channel)) {
+        status_.state = RadioState::Fault;
+        status_.last_fault = 2;
+        return false;
+    }
+
+    status_.last_status = radio_.getStatus();
+    status_.state = RadioState::Standby;
+    return true;
 }
 
 RadioStatus RadioManager::status() const
@@ -24,67 +37,117 @@ RadioStatus RadioManager::status() const
 
 bool RadioManager::enterRx()
 {
-    // TODO
+    if (radio_.startRx()) {
+        status_.state = RadioState::RxListening;
+        status_.last_status = radio_.getStatus();
+        return true;
+    }
+
+    status_.state = RadioState::Fault;
+    status_.last_fault = 1;
     return false;
 }
 
+
 bool RadioManager::leaveRx()
 {
-    // TODO
+    if (radio_.stopRx()) {
+        status_.state = RadioState::Standby;
+        return true;
+    }
+
+    status_.state = RadioState::Fault;
+    status_.last_fault = 2;
     return false;
 }
 
 bool RadioManager::sendPayload(const uint8_t* payload, size_t len)
 {
-    (void)payload;
-    (void)len;
+    status_.state = RadioState::TxBusy;
 
-    // TODO
+    if (radio_.transmitOnce(payload, len)) {
+        status_.last_tx_ok = true;
+        status_.state = RadioState::Standby;
+        return true;
+    }
+
+    status_.state = RadioState::Fault;
+    status_.last_tx_ok = false;
+    status_.last_fault = 3; 
     return false;
 }
 
 bool RadioManager::receivePayload(uint8_t* out, size_t capacity, size_t& outLen)
 {
-    (void)out;
-    (void)capacity;
-
     outLen = 0;
 
-    // TODO
+    if (radio_.readOnePacket(out, capacity, outLen)) {
+        status_.last_rx_len = outLen;
+        status_.state = RadioState::RxListening;
+        return true;
+    }
+
+    status_.state = RadioState::Fault;
+    
+    status_.last_fault = 4;
     return false;
 }
 
 bool RadioManager::sleep()
 {
-    // TODO
+    if (radio_.powerDown()) {
+        status_.state = RadioState::Sleep;
+        return true;
+    }
+
+    status_.state = RadioState::Fault;
+    status_.last_fault = 5;
     return false;
 }
 
 bool RadioManager::wake()
 {
-    // TODO
+    if (radio_.powerUp()) {
+        status_.state = RadioState::Standby;
+        status_.last_status = radio_.getStatus();
+        return true;
+    }
+    status_.state = RadioState::Fault;
+    status_.last_fault = 7;
     return false;
 }
 
 bool RadioManager::powerDown()
 {
-    // TODO
+    if (radio_.powerDown()) {
+        status_.state = RadioState::PowerDown;
+        return true;
+    }
+
+    status_.state = RadioState::Fault;
+    status_.last_fault = 6;
     return false;
 }
 
 bool RadioManager::startCw(uint8_t channel, uint8_t rfPowerBits)
 {
-    (void)channel;
-    (void)rfPowerBits;
+    if (radio_.startContinuousCarrier(channel, rfPowerBits)) {
+        status_.channel = channel;
+        status_.state = RadioState::CwTest;
+        status_.last_status = radio_.getStatus();
+        return true;
+    }
 
-    // TODO
+    status_.state = RadioState::Fault;
+    status_.last_fault = 8;
     return false;
 }
 
 bool RadioManager::stopCw()
 {
-    // TODO
-    return false;
+    radio_.stopContinuousCarrier();
+    status_.state = RadioState::Standby;
+    return true;
 }
 
 const char* RadioManager::stateName(RadioState state)
