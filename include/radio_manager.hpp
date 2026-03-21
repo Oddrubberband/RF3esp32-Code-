@@ -1,8 +1,11 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 #include "nrf24.hpp"
 
-// Higher-level application-facing radio state.
+// App-level view of the radio mode the rest of the program cares about.
 enum class RadioState {
     Boot,
     Standby,
@@ -14,31 +17,40 @@ enum class RadioState {
     Fault
 };
 
-// Status structure for the rest of the firmware.
+// Snapshot of the last meaningful radio result for logs and UI.
 struct RadioStatus {
-    // TODO: add fields you want to track, such as:
-    // - current state
-    // - last status register value
-    // - last TX result
-    // - last RX length
-    // - last fault code
-    // - current channel
+    RadioState state = RadioState::Boot;
+    uint8_t last_status = 0;
+    bool last_tx_ok = false;
+    size_t last_rx_len = 0;
+    int last_fault = 0;
+    uint8_t channel = 76;
 };
 
-// Higher-level controller for radio behavior.
-// This should use Nrf24, not raw SPI.
+// Thin stateful wrapper around the lower-level nRF24 driver.
 class RadioManager {
 public:
-    // TODO: constructor
+    explicit RadioManager(Nrf24& radio);
 
-    // TODO: boot / init sequence
-    // TODO: status getter
-    // TODO: RX enter/leave
-    // TODO: send / receive helpers
-    // TODO: sleep / wake / power-down
-    // TODO: CW mode helpers
+    bool boot(uint8_t channel = 76);
+    RadioStatus status() const;
+
+    bool enterRx();
+    bool leaveRx();
+
+    bool sendPayload(const uint8_t* payload, size_t len);
+    bool receivePayload(uint8_t* out, size_t capacity, size_t& outLen);
+
+    bool sleep();
+    bool wake();
+    bool powerDown();
+
+    bool startCw(uint8_t channel, uint8_t rfPowerBits);
+    bool stopCw();
+
+    static const char* stateName(RadioState state);
 
 private:
-    // TODO: store reference to Nrf24
-    // TODO: store RadioStatus
+    Nrf24& radio_;
+    RadioStatus status_{};
 };

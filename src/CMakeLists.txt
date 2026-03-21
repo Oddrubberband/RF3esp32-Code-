@@ -1,6 +1,8 @@
 idf_component_register(
     SRCS
         "main.cpp"
+        "audio_packet.cpp"
+        "audio_reassembler.cpp"
         "esp32_nrf24_hal.cpp"
         "nrf24.cpp"
         "radio_manager.cpp"
@@ -10,4 +12,6 @@ idf_component_register(
     INCLUDE_DIRS
         "."
         "../include"
+    PRIV_REQUIRES
+        spiffs
 )
