@@ -14,25 +14,31 @@ std::vector<KeyEvent> Morse::encode(const std::string& text, uint32_t dot_ms)
         const char c = text[i];
 
         if (c == ' ') {
+            // Standard Morse word gaps are seven dots wide.
             events.push_back({false, dot_ms * 7});
             continue;
         }
 
         const std::string symbols = symbolFor(c);
         if (symbols.empty()) {
+            // Unsupported characters are skipped rather than aborting the whole
+            // message, which keeps the helper forgiving for user-interface (UI) input.
             continue;
         }
 
         for (size_t j = 0; j < symbols.size(); ++j) {
+            // Dots are one unit, dashes are three units.
             const uint32_t down_time = (symbols[j] == '-') ? (dot_ms * 3) : dot_ms;
             events.push_back({true, down_time});
 
             if (j + 1 < symbols.size()) {
+                // Symbols within one letter are separated by a one-dot gap.
                 events.push_back({false, dot_ms});
             }
         }
 
         if (i + 1 < text.size() && text[i + 1] != ' ') {
+            // Distinct letters are separated by a three-dot gap.
             events.push_back({false, dot_ms * 3});
         }
     }
@@ -42,6 +48,8 @@ std::vector<KeyEvent> Morse::encode(const std::string& text, uint32_t dot_ms)
 
 std::string Morse::symbolFor(char c)
 {
+    // Lookup is implemented as a switch rather than a table so the file stays
+    // dependency-free and trivial to step through in a debugger.
     c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
 
     switch (c) {

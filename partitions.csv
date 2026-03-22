@@ -1,5 +1,15 @@
+# Partition layout for the demo firmware.
+#
+# The important part for the audio workflow is the Serial Peripheral Interface
+# Flash File System (SPIFFS) partition at the end:
+# it stores the converted .u8 tracks that the console lists and transmits.
 # Name,   Type, SubType, Offset,   Size, Flags
+# Small key-value storage used by the Espressif IoT Development Framework
+# (ESP-IDF) internals and optional future settings.
 nvs,      data, nvs,     0x9000,   0x5000,
+# Physical-layer (PHY) calibration data expected by the Wi-Fi/radio stack.
 phy_init, data, phy,     0xe000,   0x1000,
-factory,  app,  factory, 0x10000,  0x1F0000,
-spiffs,   data, spiffs,  0x200000, 0xE00000,
+# Main application image flashed by idf.py / PlatformIO upload.
+factory,  app,  factory, 0x10000,  0x180000,
+# SPIFFS image built from data/ and uploaded with the uploadfs target.
+spiffs,   data, spiffs,  0x190000, 0x270000,

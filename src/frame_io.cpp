@@ -5,6 +5,8 @@
 
 std::string FrameIO::toLine(const FrameRecord& record)
 {
+    // Keep the textual format simple and grep-friendly so recorded frames can
+    // be inspected by hand or parsed by tests without extra dependencies.
     const std::string direction = record.is_tx ? "TX" : "RX";
     const std::string payload_hex = bytesToHex(record.payload);
 
@@ -16,6 +18,7 @@ std::string FrameIO::toLine(const FrameRecord& record)
 
 bool FrameIO::fromLine(const std::string& line, FrameRecord& record)
 {
+    // Parse the same pipe-delimited layout emitted by toLine.
     std::stringstream ss(line);
     std::string direction;
     std::string timestamp_str;
@@ -49,6 +52,8 @@ bool FrameIO::fromLine(const std::string& line, FrameRecord& record)
 
 bool FrameIO::appendRecord(const char* path, const FrameRecord& record)
 {
+    // Persisting frames as newline-delimited records keeps appends cheap and
+    // avoids having to maintain a more complex binary log format.
     const std::string line = toLine(record);
     if (line.empty()) {
         return false;
@@ -72,6 +77,9 @@ std::string FrameIO::bytesToHex(const std::vector<uint8_t>& data)
     std::string hex;
     hex.reserve(data.size() * 2);
 
+    // Each byte becomes two American Standard Code for Information Interchange
+    // (ASCII) hex digits so the payload can safely travel through plain-text
+    // logs and files.
     for (uint8_t byte : data) {
         hex.push_back(hex_digits[(byte >> 4) & 0x0F]);
         hex.push_back(hex_digits[byte & 0x0F]);
@@ -88,6 +96,8 @@ bool FrameIO::hexToBytes(const std::string& hex, std::vector<uint8_t>& out)
         return false;
     }
 
+    // Accept either upper- or lower-case hex so logs stay easy to edit or
+    // generate from multiple tools.
     auto hexValue = [](char c) -> int {
         if (c >= '0' && c <= '9') return c - '0';
         if (c >= 'A' && c <= 'F') return c - 'A' + 10;

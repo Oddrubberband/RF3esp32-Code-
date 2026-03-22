@@ -8,7 +8,10 @@ Nrf24::Nrf24(Nrf24Hal& hal)
 
 bool Nrf24::probe()
 {
-    // Probe by writing a harmless register and making sure the value sticks.
+    // Probe by writing the radio-frequency channel register (RF_CH) and
+    // verifying that the written value can be read back. If this fails, Serial
+    // Peripheral Interface (SPI) wiring, power, or chip-select handling is
+    // wrong.
     const uint8_t old_channel = readReg(0x05);
     const uint8_t test_value = 0x4B;
 
@@ -25,7 +28,15 @@ bool Nrf24::initDefaults(uint8_t channel)
         return false;
     }
 
-    // This demo uses a simple static-payload setup with one RX pipe enabled.
+    // This demo keeps the radio setup intentionally small:
+    // - no auto-ack
+    // - one enabled receive (RX) pipe
+    // - 5-byte addresses
+    // - fixed payload width
+    // - fixed demo channel and radio-frequency (RF) setup
+    //
+    // The individual register values are the bare minimum needed for a
+    // predictable static-payload test/demo workflow.
     hal_.ce(false);
 
     writeReg(0x00, 0x0C);
@@ -46,7 +57,8 @@ bool Nrf24::initDefaults(uint8_t channel)
 
 uint8_t Nrf24::getStatus()
 {
-    // A NOP SPI transfer returns the current STATUS byte in the first response byte.
+    // A no-operation (NOP) Serial Peripheral Interface (SPI) transfer returns
+    // the current STATUS byte in the first response byte.
     const uint8_t tx[1] = {0xFF};
     uint8_t rx[1] = {0};
 
@@ -56,6 +68,9 @@ uint8_t Nrf24::getStatus()
 
 uint8_t Nrf24::readReg(uint8_t reg)
 {
+    // A register read is a two-byte Serial Peripheral Interface (SPI) exchange:
+    // command byte first, then one
+    // dummy byte that clocks back the register value.
     const uint8_t tx[2] = {static_cast<uint8_t>(reg & 0x1F), 0xFF};
     uint8_t rx[2] = {0, 0};
 
@@ -69,6 +84,8 @@ void Nrf24::readRegs(uint8_t reg, uint8_t* out, size_t len)
         return;
     }
 
+    // Multi-byte reads work like single-byte reads, but the command is followed
+    // by one dummy byte per returned register byte.
     uint8_t tx[33] = {0};
     uint8_t rx[33] = {0};
 
@@ -86,6 +103,7 @@ void Nrf24::readRegs(uint8_t reg, uint8_t* out, size_t len)
 
 void Nrf24::writeReg(uint8_t reg, uint8_t value)
 {
+    // The write command is just the register address with bit 5 set.
     const uint8_t tx[2] = {
         static_cast<uint8_t>(0x20 | (reg & 0x1F)),
         value
@@ -101,6 +119,8 @@ void Nrf24::writeRegs(uint8_t reg, const uint8_t* data, size_t len)
         return;
     }
 
+    // Multi-byte writes are used for address fields or larger payload-like
+    // register blocks.
     uint8_t tx[33] = {0};
     uint8_t rx[33] = {0};
 
@@ -114,6 +134,8 @@ void Nrf24::writeRegs(uint8_t reg, const uint8_t* data, size_t len)
 
 void Nrf24::flushTx()
 {
+    // The FLUSH_TX command drops any queued transmit (TX) payloads so the next
+    // send begins from a clean state.
     const uint8_t tx[1] = {0xE1};
     uint8_t rx[1] = {0};
 
@@ -122,6 +144,8 @@ void Nrf24::flushTx()
 
 void Nrf24::flushRx()
 {
+    // The FLUSH_RX command discards unread receive (RX) payloads when
+    // switching modes or recovering from an error.
     const uint8_t tx[1] = {0xE2};
     uint8_t rx[1] = {0};
 
@@ -148,6 +172,8 @@ void Nrf24::clearIrq(bool rx_dr, bool tx_ds, bool max_rt)
 
 bool Nrf24::powerUp()
 {
+    // The power-up bit (PWR_UP) requires a small settling delay before the
+    // radio is fully ready.
     uint8_t config = readReg(0x00);
     config |= (1 << 1);
     writeReg(0x00, config);
@@ -157,6 +183,8 @@ bool Nrf24::powerUp()
 
 bool Nrf24::powerDown()
 {
+    // Power-down is immediate from the driver's perspective; the chip handles
+    // the lower-level transition internally.
     uint8_t config = readReg(0x00);
     config &= static_cast<uint8_t>(~(1 << 1));
     writeReg(0x00, config);
@@ -165,6 +193,8 @@ bool Nrf24::powerDown()
 
 bool Nrf24::startRx()
 {
+    // Receive (RX) mode is entered by setting the primary-receive bit
+    // (PRIM_RX) and then holding Chip Enable (CE) high.
     hal_.ce(false);
 
     uint8_t config = readReg(0x00);
@@ -183,6 +213,8 @@ bool Nrf24::startRx()
 
 bool Nrf24::stopRx()
 {
+    // Leaving receive (RX) mode is the inverse: drop Chip Enable (CE) and
+    // clear PRIM_RX.
     hal_.ce(false);
 
     uint8_t config = readReg(0x00);
@@ -198,7 +230,8 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
         return false;
     }
 
-    // Force TX mode, queue one payload, pulse CE, then poll until success/fail/timeout.
+    // Force transmit (TX) mode, queue one payload, pulse Chip Enable (CE),
+    // then poll until success, failure, or timeout.
     hal_.ce(false);
 
     uint8_t config = readReg(0x00);
@@ -225,6 +258,8 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
 
     const uint64_t start = hal_.nowUs();
 
+    // Poll the STATUS register until the chip reports transmit (TX) success,
+    // maximum retries, or timeout.
     while ((hal_.nowUs() - start) < timeoutUs) {
         const uint8_t status = getStatus();
 
@@ -252,12 +287,15 @@ bool Nrf24::readOnePacket(uint8_t* out, size_t capacity, size_t& outLen)
         return false;
     }
 
+    // The receive-data-ready flag (RX_DR) indicates at least one payload is
+    // waiting in the receive first-in, first-out queue (RX FIFO).
     const uint8_t status = getStatus();
     if ((status & (1 << 6)) == 0) {
         return false;
     }
 
-    // The project currently uses fixed-width payloads, so read the configured number of bytes.
+    // The project currently uses fixed-width payloads, so read the configured
+    // number of bytes.
     uint8_t tx[33] = {0};
     uint8_t rx[33] = {0};
 
@@ -284,7 +322,9 @@ bool Nrf24::startContinuousCarrier(uint8_t channel, uint8_t rfPowerBits)
         return false;
     }
 
-    // Minimal CW/test mode: TX mode on the requested channel with CE held high.
+    // Minimal continuous-wave (CW) test mode: configure the channel and
+    // radio-frequency (RF) power, put the radio in transmit (TX) mode, then
+    // keep Chip Enable (CE) asserted so the chip emits an unmodulated carrier.
     hal_.ce(false);
 
     writeReg(0x05, channel);
@@ -306,12 +346,16 @@ bool Nrf24::startContinuousCarrier(uint8_t channel, uint8_t rfPowerBits)
 
 void Nrf24::stopContinuousCarrier()
 {
+    // Continuous-wave (CW) test mode is left by dropping Chip Enable (CE) and
+    // returning the chip to power-down.
     hal_.ce(false);
     powerDown();
 }
 
 void Nrf24::setStaticPayloadSize(uint8_t size)
 {
+    // Tests may shrink or expand the fixed payload width. The main firmware
+    // keeps this at 32 bytes to maximize audio bytes per packet.
     static_payload_size_ = size;
 }
 

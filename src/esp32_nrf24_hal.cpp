@@ -4,9 +4,17 @@
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 
+// The constructor performs all one-time Espressif IoT Development Framework
+// (ESP-IDF) hardware setup needed by the generic nRF24 driver: configure Chip
+// Enable (CE) as a General-Purpose Input/Output (GPIO) pin, then create a
+// Serial Peripheral Interface (SPI) device whose chip-select (CS) line is
+// driven automatically by the SPI master.
 Esp32Nrf24Hal::Esp32Nrf24Hal(const Esp32Nrf24Config& config)
     : config_(config)
 {
+    // Chip Enable (CE) is controlled outside normal SPI transfers, so it is a
+    // plain output pin that starts low to keep the radio quiescent during
+    // setup.
     gpio_config_t io_conf{};
     io_conf.pin_bit_mask = (1ULL << config_.ce_pin);
     io_conf.mode = GPIO_MODE_OUTPUT;
@@ -17,6 +25,7 @@ Esp32Nrf24Hal::Esp32Nrf24Hal(const Esp32Nrf24Config& config)
 
     gpio_set_level(config_.ce_pin, 0);
 
+    // Build an SPI bus description from the chosen board wiring.
     spi_bus_config_t buscfg{};
     buscfg.sclk_io_num = config_.sck_pin;
     buscfg.mosi_io_num = config_.mosi_pin;
@@ -26,6 +35,8 @@ Esp32Nrf24Hal::Esp32Nrf24Hal(const Esp32Nrf24Config& config)
 
     ESP_ERROR_CHECK(spi_bus_initialize(config_.host, &buscfg, SPI_DMA_CH_AUTO));
 
+    // Register the nRF24 as an SPI device. ESP-IDF will assert and release Chip
+    // Select Not (CSN) for each transaction automatically.
     spi_device_interface_config_t devcfg{};
     devcfg.clock_speed_hz = config_.spi_clock_hz;
     devcfg.mode = 0;
@@ -41,6 +52,8 @@ void Esp32Nrf24Hal::spiTxRx(const uint8_t* tx, uint8_t* rx, size_t n)
         return;
     }
 
+    // The nRF24 protocol is command/response oriented, so each transfer clocks
+    // out a small contiguous frame and reads back any simultaneous response.
     spi_transaction_t t{};
     t.length = static_cast<uint32_t>(n * 8);
     t.tx_buffer = tx;
@@ -56,10 +69,15 @@ void Esp32Nrf24Hal::ce(bool level)
 
 void Esp32Nrf24Hal::delayUs(uint32_t us)
 {
+    // The radio requires short guard times between some register writes and
+    // Chip Enable (CE) transitions. Busy-waiting is acceptable at these small
+    // intervals.
     esp_rom_delay_us(us);
 }
 
 uint64_t Esp32Nrf24Hal::nowUs()
 {
+    // esp_timer_get_time already returns microseconds, which is exactly what the
+    // driver's polling loops expect.
     return static_cast<uint64_t>(esp_timer_get_time());
 }

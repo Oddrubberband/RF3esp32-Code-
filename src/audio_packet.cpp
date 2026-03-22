@@ -1,5 +1,8 @@
 #include "audio_packet.hpp"
 
+// The implementation here mirrors the compact on-air packet format documented
+// in the header: a tiny fixed header plus a variable-length pulse-code
+// modulation (PCM) body.
 namespace AudioPacket {
 bool encode(uint16_t sequence,
             const uint8_t* audio,
@@ -9,6 +12,8 @@ bool encode(uint16_t sequence,
             uint8_t* out_packet,
             size_t& out_packet_len)
 {
+    // Always initialize the output length so callers never observe stale values
+    // after a rejected encode attempt.
     out_packet_len = 0;
 
     if (!audio || !out_packet || audio_len == 0 || audio_len > kAudioBytesPerPacket) {
@@ -41,6 +46,8 @@ bool decode(const uint8_t* packet,
             Header& out_header,
             const uint8_t*& out_audio)
 {
+    // Clear the outputs first so callers can safely inspect them only on
+    // success.
     out_audio = nullptr;
     out_header = {};
 
@@ -58,6 +65,8 @@ bool decode(const uint8_t* packet,
         return false;
     }
 
+    // The packet is only valid when the declared audio size matches the actual
+    // number of bytes supplied by the transport.
     if (packet_len != kHeaderBytes + out_header.audio_len) {
         return false;
     }
