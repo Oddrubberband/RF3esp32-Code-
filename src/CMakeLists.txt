@@ -8,8 +8,10 @@ idf_component_register(
         "audio_packet.cpp"
         "audio_reassembler.cpp"
         "esp32_nrf24_hal.cpp"
+        "morse.cpp"
         "nrf24.cpp"
         "radio_manager.cpp"
+        "validation.cpp"
     INCLUDE_DIRS
         # Local component headers plus the shared project include directory.
         "."

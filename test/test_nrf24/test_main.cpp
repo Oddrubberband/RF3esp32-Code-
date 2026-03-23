@@ -348,6 +348,34 @@ void test_morse_encode_e_creates_single_dot_event(void)
     TEST_ASSERT_EQUAL_UINT32(100, events[0].duration_ms);
 }
 
+void test_morse_encode_word_gap_is_seven_dots(void)
+{
+    const std::vector<KeyEvent> events = Morse::encode("E E", 50);
+
+    TEST_ASSERT_EQUAL(3, static_cast<int>(events.size()));
+    TEST_ASSERT_TRUE(events[0].key_down);
+    TEST_ASSERT_FALSE(events[1].key_down);
+    TEST_ASSERT_TRUE(events[2].key_down);
+    TEST_ASSERT_EQUAL_UINT32(50, events[0].duration_ms);
+    TEST_ASSERT_EQUAL_UINT32(350, events[1].duration_ms);
+    TEST_ASSERT_EQUAL_UINT32(50, events[2].duration_ms);
+}
+
+void test_stopContinuousCarrier_restores_demo_rf_setup(void)
+{
+    FakeHal hal;
+    Nrf24 radio(hal);
+
+    TEST_ASSERT_TRUE(radio.initDefaults(76));
+    TEST_ASSERT_TRUE(radio.startContinuousCarrier(76, 0x06));
+
+    radio.stopContinuousCarrier();
+
+    TEST_ASSERT_FALSE(hal.ce_level);
+    TEST_ASSERT_EQUAL_UINT8(0x06, hal.regs[0x06]);
+    TEST_ASSERT_TRUE((hal.regs[0x00] & (1 << 1)) != 0);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -371,5 +399,7 @@ int main(void)
     RUN_TEST(test_frame_io_round_trip_preserves_record);
     RUN_TEST(test_validation_rejects_oversized_payload);
     RUN_TEST(test_morse_encode_e_creates_single_dot_event);
+    RUN_TEST(test_morse_encode_word_gap_is_seven_dots);
+    RUN_TEST(test_stopContinuousCarrier_restores_demo_rf_setup);
     return UNITY_END();
 }

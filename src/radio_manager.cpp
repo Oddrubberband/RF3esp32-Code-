@@ -18,6 +18,9 @@ bool RadioManager::boot(uint8_t channel)
 
     if (!radio_.probe()) {
         status_.state = RadioState::Fault;
+        // Preserve one live STATUS byte so the console and boot logs can show
+        // whether the radio looked absent, floating, or partially responsive.
+        status_.last_status = radio_.getStatus();
         status_.last_fault = 1;  // Serial Peripheral Interface (SPI) register probe failed.
         return false;
     }
@@ -166,6 +169,7 @@ bool RadioManager::stopCw()
     // always returns true after restoring the app-facing state.
     radio_.stopContinuousCarrier();
     status_.state = RadioState::Standby;
+    status_.last_status = radio_.getStatus();
     return true;
 }
 

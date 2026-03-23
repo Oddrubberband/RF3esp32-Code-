@@ -346,10 +346,13 @@ bool Nrf24::startContinuousCarrier(uint8_t channel, uint8_t rfPowerBits)
 
 void Nrf24::stopContinuousCarrier()
 {
-    // Continuous-wave (CW) test mode is left by dropping Chip Enable (CE) and
-    // returning the chip to power-down.
+    // Leave continuous-wave (CW) mode by dropping Chip Enable (CE) and
+    // restoring the normal radio-frequency (RF) setup used by the demo while
+    // staying in powered transmit standby.
     hal_.ce(false);
-    powerDown();
+    writeReg(0x06, 0x06);
+    clearIrq();
+    flushTx();
 }
 
 void Nrf24::setStaticPayloadSize(uint8_t size)

@@ -91,6 +91,9 @@ monitor exposes commands such as:
 - `FILES`
 - `SELECT <file>`
 - `TX [file]`
+- `TX LOOP [count|INF] [file]`
+- `TX STOP`
+- `MORSE <text>`
 - `RX`
 - `STANDBY`
 - `SLEEP`
@@ -98,6 +101,7 @@ monitor exposes commands such as:
 - `POWERDOWN`
 - `CHANNEL <0-125>`
 - `CW START [channel] [power0-3]`
+- `CW LOOP <on_ms> <off_ms> [channel] [power0-3]`
 - `CW STOP`
 
 ## Notes

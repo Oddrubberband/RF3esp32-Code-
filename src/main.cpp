@@ -20,8 +20,10 @@
 
 #include "audio_packet.hpp"
 #include "esp32_nrf24_hal.hpp"
+#include "morse.hpp"
 #include "nrf24.hpp"
 #include "radio_manager.hpp"
+#include "validation.hpp"
 
 // main.cpp owns the top-level demo flow:
 // - mount the Serial Peripheral Interface Flash File System (SPIFFS) partition
@@ -47,6 +49,11 @@ constexpr uint32_t kPayloadBitsPerSecond =
     kPacketsPerSecond * AudioPacket::kPacketBytes * 8;
 constexpr const char* kSpiffsRoot = "/spiffs";
 constexpr const char* kDefaultTrack = "song.u8";
+constexpr uint32_t kDefaultMorseDotMs = 100;
+constexpr uint8_t kDefaultMorsePowerLevel = 3;
+constexpr TickType_t kLoopWorkerPeriod = pdMS_TO_TICKS(20);
+constexpr TickType_t kLoopStopPollPeriod = pdMS_TO_TICKS(20);
+constexpr TickType_t kLoopStopTimeout = pdMS_TO_TICKS(2000);
 constexpr TickType_t kRxPollPeriod = pdMS_TO_TICKS(20);
 constexpr size_t kConsoleLineBytes = 160;
 
@@ -59,6 +66,39 @@ struct TrackInfo {
     std::string name;
     size_t bytes = 0;
 };
+
+enum class LoopMode {
+    None,
+    Tx,
+    Cw,
+    Morse
+};
+
+struct LoopConfig {
+    LoopMode mode = LoopMode::None;
+    bool active = false;
+    bool infinite = false;
+    uint32_t remaining_iterations = 0;
+    uint32_t completed_iterations = 0;
+    std::string track_name;
+    std::string morse_text;
+    uint32_t cw_on_ms = 0;
+    uint32_t cw_off_ms = 0;
+    uint8_t channel = 76;
+    uint8_t power_level = 3;
+};
+
+const char* loopModeName(LoopMode mode)
+{
+    switch (mode) {
+        case LoopMode::Tx: return "TxLoop";
+        case LoopMode::Cw: return "CwLoop";
+        case LoopMode::Morse: return "Morse";
+        case LoopMode::None:
+        default:
+            return "None";
+    }
+}
 
 // ---- small string and parsing helpers ------------------------------------
 
@@ -151,6 +191,42 @@ bool parseUint8Arg(std::string_view text, uint8_t minimum, uint8_t maximum, uint
     return true;
 }
 
+bool parseUint32Arg(std::string_view text, uint32_t minimum, uint32_t maximum, uint32_t& out)
+{
+    if (text.empty()) {
+        return false;
+    }
+
+    char* end = nullptr;
+    const std::string value(text);
+    const unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
+    if (!end || *end != '\0' || parsed < minimum || parsed > maximum) {
+        return false;
+    }
+
+    out = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+bool parseLoopCountToken(std::string_view text, bool& infinite, uint32_t& count)
+{
+    const std::string upper = uppercaseCopy(text);
+    if (upper == "INF" || upper == "FOREVER") {
+        infinite = true;
+        count = 0;
+        return true;
+    }
+
+    uint32_t parsed = 0;
+    if (!parseUint32Arg(text, 1, UINT32_MAX, parsed)) {
+        return false;
+    }
+
+    infinite = false;
+    count = parsed;
+    return true;
+}
+
 bool statFileSize(const std::string& path, size_t& bytes)
 {
     // SPIFFS directory listings only provide file names. stat() is used to get
@@ -172,6 +248,12 @@ double durationSeconds(size_t bytes)
     // Duration is derived directly from the known pulse-code modulation (PCM)
     // format: one byte per sample at 8 kHz.
     return static_cast<double>(bytes) / static_cast<double>(kAudioBytesPerSecond);
+}
+
+void delayAtLeastMs(uint32_t duration_ms)
+{
+    const TickType_t ticks = pdMS_TO_TICKS(duration_ms);
+    vTaskDelay(ticks > 0 ? ticks : 1);
 }
 
 // ---- SPIFFS track discovery helpers --------------------------------------
@@ -305,7 +387,9 @@ bool mountSongFs()
     return true;
 }
 
-bool sendU8Song(RadioManager& manager, const char* path)
+bool sendU8Song(RadioManager& manager,
+                const char* path,
+                const volatile bool* stop_requested = nullptr)
 {
     // Stream one audio file to the radio by:
     // 1. reading fixed-size chunks from SPIFFS
@@ -323,6 +407,12 @@ bool sendU8Song(RadioManager& manager, const char* path)
     uint16_t sequence = 0;
 
     while (true) {
+        if (stop_requested && *stop_requested) {
+            std::fclose(fp);
+            ESP_LOGI(TAG, "Stopped TX at packet %u", sequence);
+            return false;
+        }
+
         // Read one packet's worth of pulse-code modulation (PCM) data from
         // disk.
         const size_t bytes_read =
@@ -391,6 +481,12 @@ public:
             return false;
         }
 
+        loop_mutex_ = xSemaphoreCreateMutex();
+        if (!loop_mutex_) {
+            ESP_LOGE(TAG, "Failed to allocate loop mutex");
+            return false;
+        }
+
         std::setvbuf(stdin, nullptr, _IONBF, 0);
         std::setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -414,6 +510,12 @@ public:
             ESP_LOGW(TAG, "Radio boot failed, state=%s fault=%d",
                      RadioManager::stateName(status.state),
                      status.last_fault);
+            ESP_LOGW(TAG, "Probe snapshot: STATUS=0x%02X", static_cast<unsigned>(status.last_status));
+            if (status.last_status == 0x00) {
+                ESP_LOGW(TAG, "STATUS=0x00 usually means the nRF24 is unpowered, MISO is held low, or CSN/SCK/MOSI/MISO wiring is not reaching the chip.");
+            } else if (status.last_status == 0xFF) {
+                ESP_LOGW(TAG, "STATUS=0xFF usually means CSN is not selecting the radio or MISO is floating high.");
+            }
             ESP_LOGW(TAG, "Continuing without radio so SPIFFS and the serial console remain testable.");
         }
 
@@ -430,6 +532,11 @@ public:
 
         if (xTaskCreate(&DemoConsoleApp::rxTaskEntry, "radio_rx", 4096, this, 4, &rx_task_) != pdPASS) {
             ESP_LOGE(TAG, "Failed to start RX polling task");
+            return false;
+        }
+
+        if (xTaskCreate(&DemoConsoleApp::loopTaskEntry, "radio_loop", 4096, this, 4, &loop_task_) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start loop task");
             return false;
         }
 
@@ -509,6 +616,11 @@ private:
         static_cast<DemoConsoleApp*>(ctx)->rxTask();
     }
 
+    static void loopTaskEntry(void* ctx)
+    {
+        static_cast<DemoConsoleApp*>(ctx)->loopTask();
+    }
+
     void printPrompt() const
     {
         std::printf("\nrf24> ");
@@ -525,7 +637,10 @@ private:
             "  STATUS               Show radio state and selected file\n"
             "  FILES                List available .u8 tracks in SPIFFS\n"
             "  SELECT <file>        Choose which SPIFFS track TX will send\n"
-            "  TX [file]            Send the selected track, or another track if provided\n"
+            "  TX [file]            Start sending the selected or named track\n"
+            "  TX LOOP [n|INF] [f]  Repeatedly send the selected or named track\n"
+            "  TX STOP              Stop an active TX send or loop\n"
+            "  MORSE <text>         Key A-Z/0-9/spaces as Morse; use CW STOP to abort\n"
             "  RX                   Enter receive/listen mode\n"
             "  STANDBY              Leave RX/CW/sleep and return to standby\n"
             "  SLEEP                Put the radio into sleep mode\n"
@@ -533,6 +648,7 @@ private:
             "  POWERDOWN            Fully power down the radio\n"
             "  CHANNEL <0-125>      Reinitialize the radio on a new channel\n"
             "  CW START [ch] [0-3]  Start a continuous-wave test on a channel/power level\n"
+            "  CW LOOP <on> <off>   Repeat CW bursts until stopped\n"
             "  CW STOP              Stop the continuous-wave test\n"
             "\nPrepare new tracks on the host with the PlatformIO 'Prepare Demo Audio' target\n"
             "or by running: python tools/prepare_demo_audio.py <path-to-song.mp3>\n");
@@ -549,6 +665,118 @@ private:
     void giveRadio()
     {
         xSemaphoreGive(radio_mutex_);
+    }
+
+    bool takeLoop(TickType_t timeout = portMAX_DELAY)
+    {
+        return xSemaphoreTake(loop_mutex_, timeout) == pdTRUE;
+    }
+
+    void giveLoop()
+    {
+        xSemaphoreGive(loop_mutex_);
+    }
+
+    LoopConfig loopSnapshot()
+    {
+        LoopConfig snapshot;
+        if (!takeLoop(pdMS_TO_TICKS(50))) {
+            return snapshot;
+        }
+
+        snapshot = loop_config_;
+        giveLoop();
+        return snapshot;
+    }
+
+    void clearLoopLocked()
+    {
+        loop_config_ = LoopConfig{};
+    }
+
+    bool isLoopActive()
+    {
+        if (!takeLoop(pdMS_TO_TICKS(50))) {
+            return false;
+        }
+
+        const bool active = loop_config_.active;
+        giveLoop();
+        return active;
+    }
+
+    bool isLoopModeActive(LoopMode mode)
+    {
+        if (!takeLoop(pdMS_TO_TICKS(50))) {
+            return false;
+        }
+
+        const bool active = loop_config_.active && loop_config_.mode == mode;
+        giveLoop();
+        return active;
+    }
+
+    bool requestLoopStop()
+    {
+        if (!isLoopActive()) {
+            loop_stop_requested_ = false;
+            return false;
+        }
+
+        loop_stop_requested_ = true;
+        return true;
+    }
+
+    bool stopLoopAndWait(TickType_t timeout = kLoopStopTimeout)
+    {
+        if (!isLoopActive()) {
+            loop_stop_requested_ = false;
+            return true;
+        }
+
+        loop_stop_requested_ = true;
+        TickType_t waited = 0;
+        while (waited < timeout) {
+            if (!isLoopActive()) {
+                loop_stop_requested_ = false;
+                return true;
+            }
+
+            vTaskDelay(kLoopStopPollPeriod);
+            waited += kLoopStopPollPeriod;
+        }
+
+        return !isLoopActive();
+    }
+
+    bool waitForLoopStopOrTimeout(uint32_t duration_ms)
+    {
+        uint32_t remaining_ms = duration_ms;
+        while (remaining_ms > 0) {
+            if (loop_stop_requested_) {
+                return false;
+            }
+
+            const uint32_t slice_ms = std::min<uint32_t>(remaining_ms, 20);
+            delayAtLeastMs(slice_ms);
+            remaining_ms -= slice_ms;
+        }
+
+        return !loop_stop_requested_;
+    }
+
+    bool stopCurrentCwIfNeeded()
+    {
+        if (!takeRadio(pdMS_TO_TICKS(100))) {
+            return false;
+        }
+
+        bool ok = true;
+        if (manager_.status().state == RadioState::CwTest) {
+            ok = manager_.stopCw();
+        }
+        giveRadio();
+        return ok;
     }
 
     bool ensureStandbyLocked()
@@ -589,7 +817,7 @@ private:
     {
         // STATUS combines the cached RadioStatus snapshot with a live
         // hasPendingRx() check when receive (RX) mode is active.
-        if (!takeRadio()) {
+        if (!takeRadio(pdMS_TO_TICKS(50))) {
             std::printf("Could not read radio status right now.\n");
             return;
         }
@@ -598,6 +826,7 @@ private:
         const bool rx_pending =
             status.state == RadioState::RxListening ? manager_.hasPendingRx() : false;
         giveRadio();
+        const LoopConfig loop = loopSnapshot();
 
         std::printf("State=%s channel=%u selected=%s last_status=0x%02X tx_ok=%s rx_len=%u fault=%d",
                     RadioManager::stateName(status.state),
@@ -609,6 +838,28 @@ private:
                     status.last_fault);
         if (status.state == RadioState::RxListening) {
             std::printf(" rx_pending=%s", rx_pending ? "true" : "false");
+        }
+        if (!last_morse_text_.empty()) {
+            std::printf(" last_morse=\"%s\"", last_morse_text_.c_str());
+        }
+        if (loop.active) {
+            std::printf(" loop=%s", loopModeName(loop.mode));
+            if (loop.mode == LoopMode::Tx) {
+                std::printf(" loop_track=%s", loop.track_name.c_str());
+                if (loop.infinite) {
+                    std::printf(" loop_remaining=inf");
+                } else {
+                    std::printf(" loop_remaining=%u", static_cast<unsigned>(loop.remaining_iterations));
+                }
+            } else if (loop.mode == LoopMode::Cw) {
+                std::printf(" loop_on_ms=%u loop_off_ms=%u loop_power=%u",
+                            static_cast<unsigned>(loop.cw_on_ms),
+                            static_cast<unsigned>(loop.cw_off_ms),
+                            static_cast<unsigned>(loop.power_level));
+            } else if (loop.mode == LoopMode::Morse) {
+                std::printf(" loop_text=%s", loop.morse_text.c_str());
+            }
+            std::printf(" loop_done=%u", static_cast<unsigned>(loop.completed_iterations));
         }
         std::printf("\n");
     }
@@ -642,6 +893,76 @@ private:
 
     bool commandTx(const std::vector<std::string>& words)
     {
+        if (words.size() >= 2) {
+            const std::string action = uppercaseCopy(words[1]);
+            if (action == "STOP") {
+                if (!isLoopModeActive(LoopMode::Tx)) {
+                    std::printf("No TX send is active.\n");
+                    return false;
+                }
+
+                requestLoopStop();
+                std::printf("TX stop requested.\n");
+                return true;
+            }
+
+            if (action == "LOOP") {
+                if (words.size() > 4) {
+                    std::printf("Usage: TX LOOP [count|INF] [file.u8]\n");
+                    return false;
+                }
+
+                bool infinite = true;
+                uint32_t loop_count = 0;
+                std::string request = selected_track_;
+
+                if (words.size() >= 3) {
+                    if (parseLoopCountToken(words[2], infinite, loop_count)) {
+                        if (words.size() >= 4) {
+                            request = words[3];
+                        }
+                    } else {
+                        request = words[2];
+                    }
+                }
+
+                TrackInfo track{};
+                if (!resolveTrack(request, track)) {
+                    std::printf("Track '%s' was not found in SPIFFS.\n", request.c_str());
+                    return false;
+                }
+
+                if (!stopLoopAndWait()) {
+                    std::printf("Could not stop the current loop cleanly.\n");
+                    return false;
+                }
+
+                if (!takeLoop()) {
+                    std::printf("Could not start TX loop right now.\n");
+                    return false;
+                }
+
+                selected_track_ = track.name;
+                loop_stop_requested_ = false;
+                loop_config_ = LoopConfig{};
+                loop_config_.mode = LoopMode::Tx;
+                loop_config_.active = true;
+                loop_config_.infinite = infinite;
+                loop_config_.remaining_iterations = loop_count;
+                loop_config_.track_name = track.name;
+                giveLoop();
+
+                if (infinite) {
+                    std::printf("TX loop active for %s (infinite)\n", track.name.c_str());
+                } else {
+                    std::printf("TX loop active for %s (%u passes)\n",
+                                track.name.c_str(),
+                                static_cast<unsigned>(loop_count));
+                }
+                return true;
+            }
+        }
+
         // Transmit (TX) either uses the explicitly requested file or the
         // currently
         // selected default track.
@@ -652,32 +973,141 @@ private:
             return false;
         }
 
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        if (!takeLoop()) {
+            std::printf("Could not start TX right now.\n");
+            return false;
+        }
+
+        selected_track_ = track.name;
+        loop_stop_requested_ = false;
+        loop_config_ = LoopConfig{};
+        loop_config_.mode = LoopMode::Tx;
+        loop_config_.active = true;
+        loop_config_.infinite = false;
+        loop_config_.remaining_iterations = 1;
+        loop_config_.track_name = track.name;
+        giveLoop();
+
+        std::printf("TX started for %s. Use TX STOP to abort.\n", track.name.c_str());
+        return true;
+    }
+
+    bool keyMorseEventsLocked(const std::vector<KeyEvent>& events,
+                              uint8_t channel,
+                              uint8_t power_level,
+                              const volatile bool* stop_requested = nullptr)
+    {
+        if (events.empty()) {
+            return false;
+        }
+
+        const uint8_t rf_power_bits = static_cast<uint8_t>(power_level << 1);
+        for (const KeyEvent& event : events) {
+            if (stop_requested && *stop_requested) {
+                if (manager_.status().state == RadioState::CwTest) {
+                    manager_.stopCw();
+                }
+                return false;
+            }
+
+            bool ok = true;
+
+            if (event.key_down) {
+                ok = manager_.startCw(channel, rf_power_bits);
+            } else if (manager_.status().state == RadioState::CwTest) {
+                ok = manager_.stopCw();
+            }
+
+            if (!ok) {
+                if (manager_.status().state == RadioState::CwTest) {
+                    manager_.stopCw();
+                }
+                return false;
+            }
+
+            if (stop_requested) {
+                if (!waitForLoopStopOrTimeout(event.duration_ms)) {
+                    if (manager_.status().state == RadioState::CwTest) {
+                        manager_.stopCw();
+                    }
+                    return false;
+                }
+            } else {
+                delayAtLeastMs(event.duration_ms);
+            }
+        }
+
+        if (manager_.status().state == RadioState::CwTest) {
+            return manager_.stopCw();
+        }
+
+        return manager_.status().state == RadioState::Standby;
+    }
+
+    bool commandMorse(const std::string& line)
+    {
+        const size_t separator = line.find_first_of(" \t");
+        if (separator == std::string::npos) {
+            std::printf("Usage: MORSE <text>\n");
+            return false;
+        }
+
+        const std::string text = trimAscii(line.substr(separator + 1));
+        if (text.empty()) {
+            std::printf("Usage: MORSE <text>\n");
+            return false;
+        }
+
+        const ValidationResult dot_result = Validation::dotTimeMs(kDefaultMorseDotMs);
+        if (!dot_result.ok) {
+            std::printf("Morse timing error: %s\n", dot_result.message);
+            return false;
+        }
+
+        const std::vector<KeyEvent> events = Morse::encode(text, kDefaultMorseDotMs);
+        if (events.empty()) {
+            std::printf("Message had no Morse-supported characters. Use A-Z, 0-9, and spaces.\n");
+            return false;
+        }
+
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        uint8_t channel = 76;
         if (!takeRadio()) {
             std::printf("Radio is busy.\n");
             return false;
         }
-
-        // Keep the radio state transitions serialized with the actual file
-        // transmission so background receive (RX) polling does not interfere.
-        bool ok = ensureStandbyLocked();
-        if (ok) {
-            selected_track_ = track.name;
-            const std::string path = buildTrackPath(selected_track_);
-            ESP_LOGI(TAG, "Starting TX for %s", path.c_str());
-            ok = sendU8Song(manager_, path.c_str());
-        }
-
-        const RadioStatus status = manager_.status();
+        channel = manager_.status().channel;
         giveRadio();
 
-        if (!ok) {
-            std::printf("TX failed. state=%s fault=%d\n",
-                        RadioManager::stateName(status.state),
-                        status.last_fault);
+        if (!takeLoop()) {
+            std::printf("Could not start Morse right now.\n");
             return false;
         }
 
-        std::printf("TX complete for %s\n", selected_track_.c_str());
+        loop_stop_requested_ = false;
+        loop_config_ = LoopConfig{};
+        loop_config_.mode = LoopMode::Morse;
+        loop_config_.active = true;
+        loop_config_.infinite = false;
+        loop_config_.remaining_iterations = 1;
+        loop_config_.morse_text = text;
+        loop_config_.channel = channel;
+        loop_config_.power_level = kDefaultMorsePowerLevel;
+        last_morse_text_ = text;
+        giveLoop();
+
+        std::printf("Morse started on channel %u at dot=%u ms. Use CW STOP to abort.\n",
+                    static_cast<unsigned>(channel),
+                    static_cast<unsigned>(kDefaultMorseDotMs));
         return true;
     }
 
@@ -686,6 +1116,11 @@ private:
         // Receive (RX) is a persistent mode rather than a one-shot action. The
         // background
         // rxTask() is what actually polls for and logs packets afterward.
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
         if (!takeRadio()) {
             std::printf("Radio is busy.\n");
             return false;
@@ -713,6 +1148,11 @@ private:
     bool commandStandby()
     {
         // STANDBY is the "normalize state" command for the operator.
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
         if (!takeRadio()) {
             std::printf("Radio is busy.\n");
             return false;
@@ -737,6 +1177,11 @@ private:
     {
         // Sleep keeps the radio configuration but requests the chip's lower
         // power state.
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
         if (!takeRadio()) {
             std::printf("Radio is busy.\n");
             return false;
@@ -765,6 +1210,11 @@ private:
     {
         // WAKE simply routes through ensureStandbyLocked(), which knows how to
         // bring sleep or power-down states back to standby.
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
         if (!takeRadio()) {
             std::printf("Radio is busy.\n");
             return false;
@@ -789,6 +1239,11 @@ private:
     {
         // Power-down is a stronger operator action than sleep, but the console
         // still treats it as another coarse state transition.
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
         if (!takeRadio()) {
             std::printf("Radio is busy.\n");
             return false;
@@ -828,6 +1283,11 @@ private:
             return false;
         }
 
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
         if (!takeRadio()) {
             std::printf("Radio is busy.\n");
             return false;
@@ -854,29 +1314,23 @@ private:
         // for verifying channel/power output without sending normal packet
         // payloads.
         if (words.size() < 2) {
-            std::printf("Usage: CW START [channel] [power0-3] | CW STOP\n");
+            std::printf("Usage: CW START [channel] [power0-3] | CW LOOP <on_ms> <off_ms> [channel] [power0-3] | CW STOP\n");
             return false;
         }
 
         const std::string action = uppercaseCopy(words[1]);
         if (action == "STOP") {
-            if (!takeRadio()) {
-                std::printf("Radio is busy.\n");
-                return false;
+            const bool loop_was_active =
+                isLoopModeActive(LoopMode::Cw) || isLoopModeActive(LoopMode::Morse);
+            if (loop_was_active) {
+                if (!stopLoopAndWait()) {
+                    std::printf("Could not stop CW mode right now.\n");
+                    return false;
+                }
             }
 
-            bool ok = true;
-            if (manager_.status().state == RadioState::CwTest) {
-                ok = manager_.stopCw();
-            }
-
-            const RadioStatus status = manager_.status();
-            giveRadio();
-
-            if (!ok) {
-                std::printf("Could not stop CW mode. state=%s fault=%d\n",
-                            RadioManager::stateName(status.state),
-                            status.last_fault);
+            if (!stopCurrentCwIfNeeded()) {
+                std::printf("Could not stop CW mode right now.\n");
                 return false;
             }
 
@@ -884,8 +1338,74 @@ private:
             return true;
         }
 
+        if (action == "LOOP") {
+            if (words.size() < 4 || words.size() > 6) {
+                std::printf("Usage: CW LOOP <on_ms> <off_ms> [channel] [power0-3]\n");
+                return false;
+            }
+
+            uint32_t on_ms = 0;
+            uint32_t off_ms = 0;
+            if (!parseUint32Arg(words[2], 1, UINT32_MAX, on_ms) ||
+                !parseUint32Arg(words[3], 1, UINT32_MAX, off_ms)) {
+                std::printf("CW loop timings must be positive millisecond values.\n");
+                return false;
+            }
+
+            if (!Validation::cwDurationMs(on_ms).ok || !Validation::cwDurationMs(off_ms).ok) {
+                std::printf("CW loop timings must be greater than zero.\n");
+                return false;
+            }
+
+            uint8_t channel = manager_.status().channel;
+            uint8_t power_level = 3;
+
+            if (words.size() >= 5 && !parseUint8Arg(words[4], 0, 125, channel)) {
+                std::printf("CW channel must be in the range 0-125.\n");
+                return false;
+            }
+
+            if (words.size() >= 6 && !parseUint8Arg(words[5], 0, 3, power_level)) {
+                std::printf("CW power level must be in the range 0-3.\n");
+                return false;
+            }
+
+            if (!stopLoopAndWait()) {
+                std::printf("Could not stop the current loop cleanly.\n");
+                return false;
+            }
+
+            if (!takeLoop()) {
+                std::printf("Could not start CW loop right now.\n");
+                return false;
+            }
+
+            loop_stop_requested_ = false;
+            loop_config_ = LoopConfig{};
+            loop_config_.mode = LoopMode::Cw;
+            loop_config_.active = true;
+            loop_config_.infinite = true;
+            loop_config_.cw_on_ms = on_ms;
+            loop_config_.cw_off_ms = off_ms;
+            loop_config_.channel = channel;
+            loop_config_.power_level = power_level;
+            giveLoop();
+
+            std::printf("CW loop active: %u ms on, %u ms off, channel %u, power %u\n",
+                        static_cast<unsigned>(on_ms),
+                        static_cast<unsigned>(off_ms),
+                        static_cast<unsigned>(channel),
+                        static_cast<unsigned>(power_level));
+            return true;
+        }
+
         if (action != "START") {
-            std::printf("Usage: CW START [channel] [power0-3] | CW STOP\n");
+            std::printf("Usage: CW START [channel] [power0-3] | CW LOOP <on_ms> <off_ms> [channel] [power0-3] | CW STOP\n");
+            return false;
+        }
+
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
             return false;
         }
 
@@ -930,6 +1450,194 @@ private:
                     static_cast<unsigned>(status.channel),
                     static_cast<unsigned>(power_level));
         return true;
+    }
+
+    void runTxLoopIteration(const LoopConfig& loop)
+    {
+        if (!takeRadio()) {
+            return;
+        }
+
+        bool ok = ensureStandbyLocked();
+        RadioStatus status = manager_.status();
+        if (ok) {
+            const std::string path = buildTrackPath(loop.track_name);
+            ok = sendU8Song(manager_, path.c_str(), &loop_stop_requested_);
+            status = manager_.status();
+        }
+        giveRadio();
+
+        const bool stopped = loop_stop_requested_;
+        if (!takeLoop(pdMS_TO_TICKS(50))) {
+            return;
+        }
+
+        if (loop_config_.active && loop_config_.mode == LoopMode::Tx) {
+            if (ok) {
+                ++loop_config_.completed_iterations;
+                if (!loop_config_.infinite && loop_config_.remaining_iterations > 0) {
+                    --loop_config_.remaining_iterations;
+                }
+            }
+
+            const bool finished = ok && !loop_config_.infinite && loop_config_.remaining_iterations == 0;
+            if (stopped || !ok || finished) {
+                clearLoopLocked();
+            }
+        }
+        giveLoop();
+
+        if (ok) {
+            ESP_LOGI(TAG, "TX pass complete for %s", loop.track_name.c_str());
+        } else if (stopped) {
+            ESP_LOGI(TAG, "TX stopped for %s", loop.track_name.c_str());
+        }
+
+        if (!ok && !stopped) {
+            ESP_LOGW(TAG, "TX loop stopped, state=%s fault=%d",
+                     RadioManager::stateName(status.state),
+                     status.last_fault);
+        }
+    }
+
+    void runCwLoopCycle(const LoopConfig& loop)
+    {
+        if (!takeRadio()) {
+            return;
+        }
+
+        bool ok = ensureStandbyLocked();
+        RadioStatus status = manager_.status();
+        if (ok) {
+            ok = manager_.startCw(loop.channel, static_cast<uint8_t>(loop.power_level << 1));
+            status = manager_.status();
+        }
+        giveRadio();
+
+        if (!ok) {
+            if (takeLoop(pdMS_TO_TICKS(50))) {
+                if (loop_config_.active && loop_config_.mode == LoopMode::Cw) {
+                    clearLoopLocked();
+                }
+                giveLoop();
+            }
+            ESP_LOGW(TAG, "CW loop stopped, state=%s fault=%d",
+                     RadioManager::stateName(status.state),
+                     status.last_fault);
+            return;
+        }
+
+        waitForLoopStopOrTimeout(loop.cw_on_ms);
+
+        if (!stopCurrentCwIfNeeded()) {
+            return;
+        }
+
+        const bool stopped = loop_stop_requested_;
+        if (takeLoop(pdMS_TO_TICKS(50))) {
+            if (loop_config_.active && loop_config_.mode == LoopMode::Cw) {
+                ++loop_config_.completed_iterations;
+                if (stopped) {
+                    clearLoopLocked();
+                }
+            }
+            giveLoop();
+        }
+
+        if (stopped) {
+            return;
+        }
+
+        waitForLoopStopOrTimeout(loop.cw_off_ms);
+
+        if (loop_stop_requested_ && takeLoop(pdMS_TO_TICKS(50))) {
+            if (loop_config_.active && loop_config_.mode == LoopMode::Cw) {
+                clearLoopLocked();
+            }
+            giveLoop();
+        }
+    }
+
+    void runMorseIteration(const LoopConfig& loop)
+    {
+        const std::vector<KeyEvent> events = Morse::encode(loop.morse_text, kDefaultMorseDotMs);
+        if (events.empty()) {
+            if (takeLoop(pdMS_TO_TICKS(50))) {
+                if (loop_config_.active && loop_config_.mode == LoopMode::Morse) {
+                    clearLoopLocked();
+                }
+                giveLoop();
+            }
+            return;
+        }
+
+        if (!takeRadio()) {
+            return;
+        }
+
+        bool ok = ensureStandbyLocked();
+        RadioStatus status = manager_.status();
+        if (ok) {
+            ESP_LOGI(TAG, "Starting Morse on channel %u: %s",
+                     static_cast<unsigned>(loop.channel),
+                     loop.morse_text.c_str());
+            ok = keyMorseEventsLocked(events, loop.channel, loop.power_level, &loop_stop_requested_);
+            status = manager_.status();
+        }
+        giveRadio();
+
+        const bool stopped = loop_stop_requested_;
+        if (takeLoop(pdMS_TO_TICKS(50))) {
+            if (loop_config_.active && loop_config_.mode == LoopMode::Morse) {
+                if (ok) {
+                    ++loop_config_.completed_iterations;
+                    if (!loop_config_.infinite && loop_config_.remaining_iterations > 0) {
+                        --loop_config_.remaining_iterations;
+                    }
+                }
+
+                clearLoopLocked();
+            }
+            giveLoop();
+        }
+
+        if (ok) {
+            ESP_LOGI(TAG, "Morse complete: %s", loop.morse_text.c_str());
+        } else if (stopped) {
+            ESP_LOGI(TAG, "Morse stopped: %s", loop.morse_text.c_str());
+        } else {
+            ESP_LOGW(TAG, "Morse stopped, state=%s fault=%d",
+                     RadioManager::stateName(status.state),
+                     status.last_fault);
+        }
+    }
+
+    void loopTask()
+    {
+        while (true) {
+            const LoopConfig loop = loopSnapshot();
+            if (!loop.active) {
+                vTaskDelay(kLoopWorkerPeriod);
+                continue;
+            }
+
+            if (loop.mode == LoopMode::Tx) {
+                runTxLoopIteration(loop);
+                continue;
+            }
+
+            if (loop.mode == LoopMode::Cw) {
+                runCwLoopCycle(loop);
+                continue;
+            }
+
+            if (loop.mode == LoopMode::Morse) {
+                runMorseIteration(loop);
+                continue;
+            }
+
+            vTaskDelay(kLoopWorkerPeriod);
+        }
     }
 
     void logRxPacket(const uint8_t* payload, size_t len)
@@ -1005,6 +1713,9 @@ private:
         if (command == "TX") {
             return commandTx(words);
         }
+        if (command == "MORSE") {
+            return commandMorse(line);
+        }
         if (command == "RX") {
             return commandRx();
         }
@@ -1034,7 +1745,12 @@ private:
     RadioManager& manager_;
     SemaphoreHandle_t radio_mutex_ = nullptr;  // Serializes all radio access.
     TaskHandle_t rx_task_ = nullptr;           // Background receive (RX) polling task.
+    SemaphoreHandle_t loop_mutex_ = nullptr;   // Guards background TX/CW loop configuration.
+    TaskHandle_t loop_task_ = nullptr;         // Background TX/CW loop worker.
     std::string selected_track_ = kDefaultTrack;  // Default file used by transmit (TX).
+    std::string last_morse_text_;              // Most recent MORSE text for STATUS output.
+    LoopConfig loop_config_{};
+    volatile bool loop_stop_requested_ = false;
 };
 }  // namespace
 
