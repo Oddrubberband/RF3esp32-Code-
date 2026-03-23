@@ -411,10 +411,10 @@ public:
         giveRadio();
 
         if (!boot_ok) {
-            ESP_LOGE(TAG, "Radio boot failed, state=%s fault=%d",
+            ESP_LOGW(TAG, "Radio boot failed, state=%s fault=%d",
                      RadioManager::stateName(status.state),
                      status.last_fault);
-            return false;
+            ESP_LOGW(TAG, "Continuing without radio so SPIFFS and the serial console remain testable.");
         }
 
         // If the configured default track is missing, fall back to the first
@@ -433,7 +433,11 @@ public:
             return false;
         }
 
-        ESP_LOGI(TAG, "Radio boot OK, state=%s", RadioManager::stateName(status.state));
+        if (boot_ok) {
+            ESP_LOGI(TAG, "Radio boot OK, state=%s", RadioManager::stateName(status.state));
+        } else {
+            ESP_LOGI(TAG, "Radio unavailable, console running in filesystem-only mode.");
+        }
         ESP_LOGI(TAG, "Audio stream: %u bytes/sec, ~%u packets/sec, ~%u payload bits/sec",
                  static_cast<unsigned>(kAudioBytesPerSecond),
                  static_cast<unsigned>(kPacketsPerSecond),
@@ -446,21 +450,52 @@ public:
 
     void run()
     {
-        // The console loop is intentionally tiny: read one line, trim it, and
-        // dispatch to the corresponding command handler.
-        std::array<char, kConsoleLineBytes> line{};
+        // UART-backed stdin may deliver one character at a time depending on
+        // the host monitor. Accumulate characters locally so commands are only
+        // dispatched after Enter is pressed.
+        std::string pending_line;
+        pending_line.reserve(kConsoleLineBytes);
+        bool prompt_visible = false;
 
         while (true) {
-            printPrompt();
-            if (!std::fgets(line.data(), static_cast<int>(line.size()), stdin)) {
+            if (!prompt_visible) {
+                printPrompt();
+                prompt_visible = true;
+            }
+
+            const int raw = std::fgetc(stdin);
+            if (raw == EOF) {
                 clearerr(stdin);
                 vTaskDelay(pdMS_TO_TICKS(50));
                 continue;
             }
 
-            const std::string command_line = trimAscii(line.data());
-            if (!command_line.empty()) {
-                handleCommand(command_line);
+            const char ch = static_cast<char>(raw);
+            if (ch == '\r' || ch == '\n') {
+                std::printf("\n");
+                std::fflush(stdout);
+                const std::string command_line = trimAscii(pending_line);
+                pending_line.clear();
+                if (!command_line.empty()) {
+                    handleCommand(command_line);
+                }
+                prompt_visible = false;
+                continue;
+            }
+
+            if (ch == '\b' || static_cast<unsigned char>(ch) == 0x7F) {
+                if (!pending_line.empty()) {
+                    pending_line.pop_back();
+                    std::printf("\b \b");
+                    std::fflush(stdout);
+                }
+                continue;
+            }
+
+            if (pending_line.size() + 1 < kConsoleLineBytes) {
+                pending_line.push_back(ch);
+                std::printf("%c", ch);
+                std::fflush(stdout);
             }
         }
     }
