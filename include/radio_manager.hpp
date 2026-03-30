@@ -21,10 +21,17 @@ enum class RadioState {
 struct RadioStatus {
     RadioState state = RadioState::Boot;
     uint8_t last_status = 0;  // Most recently observed STATUS register value.
+    uint8_t last_fifo_status = 0;  // Most recently observed FIFO_STATUS register value.
+    uint8_t last_observe_tx = 0;  // Most recently observed OBSERVE_TX register value.
+    bool irq_connected = false;  // Whether the optional active-low nRF24 IRQ pin is wired.
+    bool irq_asserted = false;  // Whether the live IRQ line is currently low.
     bool last_tx_ok = false;  // Whether the most recent one-shot transmit (TX) succeeded.
+    bool last_tx_timed_out = false;  // Whether the last TX failure was a poll timeout instead of MAX_RT.
+    bool last_tx_saw_irq = false;  // Whether IRQ went low at any point during the most recent TX attempt.
     size_t last_rx_len = 0;   // Number of bytes returned by the last receive (RX) read.
     int last_fault = 0;       // Small numeric breadcrumb describing the failure point.
     uint8_t channel = 76;     // Current radio-frequency (RF) channel the app believes the radio uses.
+    int power_level = -1;     // Decoded nRF24 output power level from RF_SETUP, or -1 if unknown.
 };
 
 // RadioManager wraps Nrf24 with a stable state model for the rest of the app.
@@ -40,6 +47,8 @@ public:
     bool boot(uint8_t channel = 76);
     // Return the latest state snapshot.
     RadioStatus status() const;
+    // Refresh the cached snapshot from live radio registers. Caller should hold the radio lock.
+    void refreshSnapshot();
 
     // State transitions used by the console commands.
     bool enterRx();
@@ -63,6 +72,8 @@ public:
     static const char* stateName(RadioState state);
 
 private:
+    void refreshPowerLevel();
+
     Nrf24& radio_;
     RadioStatus status_{};
 };

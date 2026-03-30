@@ -25,6 +25,16 @@ Esp32Nrf24Hal::Esp32Nrf24Hal(const Esp32Nrf24Config& config)
 
     gpio_set_level(config_.ce_pin, 0);
 
+    if (config_.irq_pin != Esp32Nrf24Config::kNoIrqPin) {
+        gpio_config_t irq_conf{};
+        irq_conf.pin_bit_mask = (1ULL << config_.irq_pin);
+        irq_conf.mode = GPIO_MODE_INPUT;
+        irq_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+        irq_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        irq_conf.intr_type = GPIO_INTR_DISABLE;
+        ESP_ERROR_CHECK(gpio_config(&irq_conf));
+    }
+
     // Build an SPI bus description from the chosen board wiring.
     spi_bus_config_t buscfg{};
     buscfg.sclk_io_num = config_.sck_pin;
@@ -65,6 +75,20 @@ void Esp32Nrf24Hal::spiTxRx(const uint8_t* tx, uint8_t* rx, size_t n)
 void Esp32Nrf24Hal::ce(bool level)
 {
     gpio_set_level(config_.ce_pin, level ? 1 : 0);
+}
+
+bool Esp32Nrf24Hal::irqConnected() const
+{
+    return config_.irq_pin != Esp32Nrf24Config::kNoIrqPin;
+}
+
+bool Esp32Nrf24Hal::irqAsserted() const
+{
+    if (!irqConnected()) {
+        return false;
+    }
+
+    return gpio_get_level(config_.irq_pin) == 0;
 }
 
 void Esp32Nrf24Hal::delayUs(uint32_t us)

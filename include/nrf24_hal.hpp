@@ -16,6 +16,10 @@ struct Nrf24Hal {
     virtual void spiTxRx(const uint8_t* tx, uint8_t* rx, size_t n) = 0;
     // Drive the radio's Chip Enable (CE) line.
     virtual void ce(bool level) = 0;
+    // Report whether the radio's optional active-low IRQ pin is wired.
+    virtual bool irqConnected() const = 0;
+    // Return true while the radio is actively asserting IRQ low.
+    virtual bool irqAsserted() const = 0;
     // Busy-wait for short hardware timing windows.
     virtual void delayUs(uint32_t us) = 0;
     // Return a microsecond-resolution timer for timeout loops.

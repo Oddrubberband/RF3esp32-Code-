@@ -6,6 +6,11 @@ RadioManager::RadioManager(Nrf24& radio)
 {
 }
 
+void RadioManager::refreshPowerLevel()
+{
+    status_.power_level = static_cast<int>(radio_.readRfPowerLevel());
+}
+
 bool RadioManager::boot(uint8_t channel)
 {
     // Reset the status snapshot before each boot attempt so any later fault code
@@ -14,7 +19,12 @@ bool RadioManager::boot(uint8_t channel)
     status_.channel = channel;
     status_.last_fault = 0;
     status_.last_tx_ok = false;
+    status_.last_tx_timed_out = false;
+    status_.last_tx_saw_irq = false;
     status_.last_rx_len = 0;
+    status_.power_level = -1;
+    status_.irq_connected = false;
+    status_.irq_asserted = false;
 
     if (!radio_.probe()) {
         status_.state = RadioState::Fault;
@@ -31,7 +41,7 @@ bool RadioManager::boot(uint8_t channel)
         return false;
     }
 
-    status_.last_status = radio_.getStatus();
+    refreshSnapshot();
     status_.state = RadioState::Standby;
     return true;
 }
@@ -39,6 +49,22 @@ bool RadioManager::boot(uint8_t channel)
 RadioStatus RadioManager::status() const
 {
     return status_;
+}
+
+void RadioManager::refreshSnapshot()
+{
+    status_.last_status = radio_.getStatus();
+    status_.last_fifo_status = radio_.readReg(0x17);
+    status_.last_observe_tx = radio_.readReg(0x08);
+    status_.irq_connected = radio_.irqConnected();
+    status_.irq_asserted = radio_.irqAsserted();
+    status_.channel = radio_.readReg(0x05);
+    if (status_.last_status == 0x00 || status_.last_status == 0xFF) {
+        status_.power_level = -1;
+        return;
+    }
+
+    refreshPowerLevel();
 }
 
 bool RadioManager::enterRx()
@@ -84,13 +110,30 @@ bool RadioManager::sendPayload(const uint8_t* payload, size_t len)
 
     if (radio_.transmitOnce(payload, len)) {
         status_.last_tx_ok = true;
-        status_.last_status = radio_.getStatus();
+        status_.last_tx_timed_out = false;
+        status_.last_tx_saw_irq = radio_.lastTxSawIrq();
+        status_.last_status = radio_.lastTxStatus();
+        status_.last_fifo_status = radio_.lastTxFifoStatus();
+        status_.last_observe_tx = radio_.lastTxObserve();
+        status_.irq_connected = radio_.irqConnected();
+        status_.irq_asserted = radio_.irqAsserted();
+        status_.channel = radio_.readReg(0x05);
+        refreshPowerLevel();
         status_.state = RadioState::Standby;
         return true;
     }
 
     status_.state = RadioState::Fault;
     status_.last_tx_ok = false;
+    status_.last_tx_timed_out = radio_.lastTxTimedOut();
+    status_.last_tx_saw_irq = radio_.lastTxSawIrq();
+    status_.last_status = radio_.lastTxStatus();
+    status_.last_fifo_status = radio_.lastTxFifoStatus();
+    status_.last_observe_tx = radio_.lastTxObserve();
+    status_.irq_connected = radio_.irqConnected();
+    status_.irq_asserted = radio_.irqAsserted();
+    status_.channel = radio_.readReg(0x05);
+    refreshPowerLevel();
     status_.last_fault = 3;  // Transmit (TX) operation failed or timed out.
     return false;
 }
@@ -129,7 +172,7 @@ bool RadioManager::wake()
 {
     if (radio_.powerUp()) {
         status_.state = RadioState::Standby;
-        status_.last_status = radio_.getStatus();
+        refreshSnapshot();
         return true;
     }
     status_.state = RadioState::Fault;
@@ -154,7 +197,7 @@ bool RadioManager::startCw(uint8_t channel, uint8_t rfPowerBits)
     if (radio_.startContinuousCarrier(channel, rfPowerBits)) {
         status_.channel = channel;
         status_.state = RadioState::CwTest;
-        status_.last_status = radio_.getStatus();
+        refreshSnapshot();
         return true;
     }
 
@@ -169,7 +212,7 @@ bool RadioManager::stopCw()
     // always returns true after restoring the app-facing state.
     radio_.stopContinuousCarrier();
     status_.state = RadioState::Standby;
-    status_.last_status = radio_.getStatus();
+    refreshSnapshot();
     return true;
 }
 

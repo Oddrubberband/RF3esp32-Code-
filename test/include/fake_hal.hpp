@@ -11,6 +11,11 @@
 // Tiny nRF24 simulation used by host-side tests to exercise driver logic without hardware.
 class FakeHal : public Nrf24Hal {
 public:
+    FakeHal()
+    {
+        regs[0x07] = 0x0E;
+    }
+
     std::array<uint8_t, 0x20> regs{};
     std::vector<uint8_t> last_tx;
     std::vector<std::vector<uint8_t>> tx_log;
@@ -18,7 +23,10 @@ public:
     std::vector<uint8_t> rx_fifo;
     std::vector<uint8_t> last_payload_write;
     bool ce_level = false;
+    bool irq_connected = true;
     bool next_tx_success = true;
+    bool supports_cont_wave = true;
+    bool tx_reuse = false;
     uint64_t time_us = 0;
     uint32_t now_step_us = 100;
     int tx_trigger_count = 0;
@@ -78,6 +86,8 @@ public:
 
                 if (index == 0x07) {
                     regs[0x07] &= static_cast<uint8_t>(~(tx[i] & 0x70));
+                } else if (index == 0x06 && !supports_cont_wave) {
+                    regs[index] = static_cast<uint8_t>(tx[i] & 0x7F);
                 } else {
                     regs[index] = tx[i];
                 }
@@ -100,10 +110,25 @@ public:
             case 0xA0:
                 last_payload_write.assign(tx + 1, tx + n);
                 tx_fifo = last_payload_write;
+                tx_reuse = false;
+                break;
+
+            case 0xE3:
+                tx_reuse = true;
+                tx_fifo = last_payload_write;
+                if (ce_level && !tx_fifo.empty()) {
+                    ++tx_trigger_count;
+                    if (next_tx_success) {
+                        regs[0x07] |= (1 << 5);
+                    } else {
+                        regs[0x07] |= (1 << 4);
+                    }
+                }
                 break;
 
             case 0xE1:
                 tx_fifo.clear();
+                tx_reuse = false;
                 break;
 
             case 0xE2:
@@ -129,11 +154,23 @@ public:
             ++tx_trigger_count;
             if (next_tx_success) {
                 regs[0x07] |= (1 << 5);
-                tx_fifo.clear();
+                if (!tx_reuse) {
+                    tx_fifo.clear();
+                }
             } else {
                 regs[0x07] |= (1 << 4);
             }
         }
+    }
+
+    bool irqConnected() const override
+    {
+        return irq_connected;
+    }
+
+    bool irqAsserted() const override
+    {
+        return irq_connected && (regs[0x07] & 0x70) != 0;
     }
 
     void delayUs(uint32_t us) override

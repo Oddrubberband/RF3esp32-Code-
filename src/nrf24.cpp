@@ -1,5 +1,7 @@
 #include "nrf24.hpp"
 
+#include <array>
+
 Nrf24::Nrf24(Nrf24Hal& hal)
     : hal_(hal),
       static_payload_size_(32)
@@ -34,6 +36,7 @@ bool Nrf24::initDefaults(uint8_t channel)
     // - 5-byte addresses
     // - fixed payload width
     // - fixed demo channel and radio-frequency (RF) setup
+    // - no auto retransmit, because this demo does not use ACKs
     //
     // The individual register values are the bare minimum needed for a
     // predictable static-payload test/demo workflow.
@@ -43,7 +46,7 @@ bool Nrf24::initDefaults(uint8_t channel)
     writeReg(0x01, 0x00);
     writeReg(0x02, 0x01);
     writeReg(0x03, 0x03);
-    writeReg(0x04, 0x03);
+    writeReg(0x04, 0x00);
     writeReg(0x05, channel);
     writeReg(0x06, 0x06);
     writeReg(0x11, static_payload_size_);
@@ -76,6 +79,12 @@ uint8_t Nrf24::readReg(uint8_t reg)
 
     hal_.spiTxRx(tx, rx, 2);
     return rx[1];
+}
+
+uint8_t Nrf24::readRfPowerLevel()
+{
+    // RF_SETUP bits 2:1 encode the output power level as a small 0-3 value.
+    return static_cast<uint8_t>((readReg(0x06) >> 1) & 0x03);
 }
 
 void Nrf24::readRegs(uint8_t reg, uint8_t* out, size_t len)
@@ -230,8 +239,16 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
         return false;
     }
 
-    // Force transmit (TX) mode, queue one payload, pulse Chip Enable (CE),
-    // then poll until success, failure, or timeout.
+    last_tx_status_ = getStatus();
+    last_tx_fifo_status_ = readReg(0x17);
+    last_tx_observe_ = readReg(0x08);
+    last_tx_timed_out_ = false;
+    last_tx_saw_irq_ = false;
+
+    // Force transmit (TX) mode, queue one payload, then keep Chip Enable (CE)
+    // asserted while we wait for the radio to report completion. A short pulse
+    // is sufficient per the datasheet, but some modules appear more reliable
+    // when CE stays high through the standby-to-transmit settling window.
     hal_.ce(false);
 
     uint8_t config = readReg(0x00);
@@ -252,29 +269,61 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
 
     hal_.spiTxRx(tx, rx, len + 1);
 
+    // Leave extra time between the payload write and CE assertion. Nordic's
+    // minimum is short, but clone modules can be noticeably less tolerant.
+    hal_.delayUs(150);
     hal_.ce(true);
-    hal_.delayUs(15);
-    hal_.ce(false);
 
+    const bool irq_connected = hal_.irqConnected();
     const uint64_t start = hal_.nowUs();
 
     // Poll the STATUS register until the chip reports transmit (TX) success,
-    // maximum retries, or timeout.
+    // maximum retries, or timeout. When IRQ is wired, treat it as the primary
+    // hint that the radio has a completion event ready.
     while ((hal_.nowUs() - start) < timeoutUs) {
+        bool should_read_status = !irq_connected;
+        if (irq_connected) {
+            const bool irq_now = hal_.irqAsserted();
+            last_tx_saw_irq_ = last_tx_saw_irq_ || irq_now;
+            should_read_status = irq_now;
+        }
+
+        if (!should_read_status) {
+            continue;
+        }
+
         const uint8_t status = getStatus();
 
         if (status & (1 << 5)) {
+            last_tx_status_ = status;
+            last_tx_fifo_status_ = readReg(0x17);
+            last_tx_observe_ = readReg(0x08);
+            last_tx_timed_out_ = false;
+            hal_.ce(false);
             clearIrq(false, true, false);
             return true;
         }
 
         if (status & (1 << 4)) {
+            last_tx_status_ = status;
+            last_tx_fifo_status_ = readReg(0x17);
+            last_tx_observe_ = readReg(0x08);
+            last_tx_timed_out_ = false;
+            hal_.ce(false);
             clearIrq(false, false, true);
             flushTx();
             return false;
         }
     }
 
+    if (irq_connected) {
+        last_tx_saw_irq_ = last_tx_saw_irq_ || hal_.irqAsserted();
+    }
+    last_tx_status_ = getStatus();
+    last_tx_fifo_status_ = readReg(0x17);
+    last_tx_observe_ = readReg(0x08);
+    last_tx_timed_out_ = true;
+    hal_.ce(false);
     flushTx();
     return false;
 }
@@ -322,37 +371,130 @@ bool Nrf24::startContinuousCarrier(uint8_t channel, uint8_t rfPowerBits)
         return false;
     }
 
-    // Minimal continuous-wave (CW) test mode: configure the channel and
-    // radio-frequency (RF) power, put the radio in transmit (TX) mode, then
-    // keep Chip Enable (CE) asserted so the chip emits an unmodulated carrier.
-    hal_.ce(false);
+    if (cw_mode_ != CwMode::None) {
+        stopContinuousCarrier();
+    }
 
-    writeReg(0x05, channel);
-    writeReg(0x06, static_cast<uint8_t>(0x90 | (rfPowerBits & 0x06)));
+    // Save the live radio configuration so stopContinuousCarrier() can restore
+    // the normal packet settings after the bench-test carrier stops.
+    cw_restore_.valid = true;
+    cw_restore_.config = readReg(0x00);
+    cw_restore_.en_aa = readReg(0x01);
+    cw_restore_.setup_retr = readReg(0x04);
+    cw_restore_.rf_ch = readReg(0x05);
+    cw_restore_.rf_setup = readReg(0x06);
+    readRegs(0x10, cw_restore_.tx_addr, sizeof(cw_restore_.tx_addr));
 
-    uint8_t config = readReg(0x00);
+    const uint8_t rf_setup_base = static_cast<uint8_t>(cw_restore_.rf_setup & 0x29);
+    uint8_t config = cw_restore_.config;
+    const bool was_powered = (config & (1 << 1)) != 0;
     config |= (1 << 1);
     config &= static_cast<uint8_t>(~(1 << 0));
+
+    hal_.ce(false);
     writeReg(0x00, config);
+    writeReg(0x05, channel);
+    writeReg(0x06, static_cast<uint8_t>(rf_setup_base | 0x90 | (rfPowerBits & 0x06)));
 
     clearIrq();
     flushTx();
 
-    hal_.ce(true);
-    hal_.delayUs(150);
+    if (!was_powered) {
+        hal_.delayUs(1500);
+    }
 
-    return true;
+    // Genuine nRF24L01+ parts support CONT_WAVE. If the bit does not stick,
+    // fall back to the older payload-reuse sequence so CW still produces RF
+    // output on older radios and some clone modules.
+    if ((readReg(0x06) & 0x80) != 0) {
+        cw_mode_ = CwMode::ContWave;
+        hal_.ce(true);
+        hal_.delayUs(150);
+        return true;
+    }
+
+    constexpr std::array<uint8_t, 5> kCarrierAddress = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    constexpr std::array<uint8_t, 32> kCarrierPayload = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+
+    config &= static_cast<uint8_t>(~0x0C);
+    writeReg(0x00, config);
+    writeReg(0x01, 0x00);
+    writeReg(0x04, 0x00);
+    writeReg(0x05, channel);
+    writeReg(0x06, static_cast<uint8_t>(rf_setup_base | 0x10 | (rfPowerBits & 0x06)));
+    writeRegs(0x10, kCarrierAddress.data(), kCarrierAddress.size());
+
+    uint8_t tx[33] = {0};
+    uint8_t rx[33] = {0};
+    tx[0] = 0xA0;
+    for (size_t i = 0; i < kCarrierPayload.size(); ++i) {
+        tx[i + 1] = kCarrierPayload[i];
+    }
+
+    clearIrq();
+    flushTx();
+    hal_.spiTxRx(tx, rx, sizeof(tx));
+
+    hal_.ce(true);
+    hal_.delayUs(15);
+    hal_.ce(false);
+
+    const uint64_t start = hal_.nowUs();
+    while ((hal_.nowUs() - start) < 2000) {
+        const uint8_t status = getStatus();
+        if (status & (1 << 5)) {
+            clearIrq(false, true, true);
+
+            const uint8_t reuse_tx_payload[1] = {0xE3};
+            uint8_t reuse_rx[1] = {0};
+
+            hal_.ce(true);
+            hal_.spiTxRx(reuse_tx_payload, reuse_rx, 1);
+            cw_mode_ = CwMode::PayloadReuse;
+            return true;
+        }
+
+        if (status & (1 << 4)) {
+            clearIrq(false, false, true);
+            flushTx();
+            stopContinuousCarrier();
+            return false;
+        }
+    }
+
+    flushTx();
+    stopContinuousCarrier();
+    return false;
 }
 
 void Nrf24::stopContinuousCarrier()
 {
-    // Leave continuous-wave (CW) mode by dropping Chip Enable (CE) and
-    // restoring the normal radio-frequency (RF) setup used by the demo while
-    // staying in powered transmit standby.
+    // Leave continuous-wave (CW) mode by dropping Chip Enable (CE), clearing
+    // any queued payload reuse, and restoring the packet-oriented demo setup.
     hal_.ce(false);
-    writeReg(0x06, 0x06);
     clearIrq();
     flushTx();
+
+    if (!cw_restore_.valid) {
+        writeReg(0x06, 0x06);
+        cw_mode_ = CwMode::None;
+        return;
+    }
+
+    writeReg(0x00, cw_restore_.config);
+    writeReg(0x01, cw_restore_.en_aa);
+    writeReg(0x04, cw_restore_.setup_retr);
+    writeReg(0x05, cw_restore_.rf_ch);
+    writeReg(0x06, cw_restore_.rf_setup);
+    writeRegs(0x10, cw_restore_.tx_addr, sizeof(cw_restore_.tx_addr));
+
+    cw_restore_ = CwRestoreState{};
+    cw_mode_ = CwMode::None;
 }
 
 void Nrf24::setStaticPayloadSize(uint8_t size)
@@ -365,4 +507,39 @@ void Nrf24::setStaticPayloadSize(uint8_t size)
 uint8_t Nrf24::staticPayloadSize() const
 {
     return static_payload_size_;
+}
+
+bool Nrf24::irqConnected() const
+{
+    return hal_.irqConnected();
+}
+
+bool Nrf24::irqAsserted() const
+{
+    return hal_.irqAsserted();
+}
+
+uint8_t Nrf24::lastTxStatus() const
+{
+    return last_tx_status_;
+}
+
+uint8_t Nrf24::lastTxFifoStatus() const
+{
+    return last_tx_fifo_status_;
+}
+
+uint8_t Nrf24::lastTxObserve() const
+{
+    return last_tx_observe_;
+}
+
+bool Nrf24::lastTxTimedOut() const
+{
+    return last_tx_timed_out_;
+}
+
+bool Nrf24::lastTxSawIrq() const
+{
+    return last_tx_saw_irq_;
 }

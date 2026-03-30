@@ -22,6 +22,7 @@ public:
     // Low-level register access used both internally and by diagnostics.
     uint8_t getStatus();
     uint8_t readReg(uint8_t reg);
+    uint8_t readRfPowerLevel();
     void readRegs(uint8_t reg, uint8_t* out, size_t len);
     void writeReg(uint8_t reg, uint8_t value);
     void writeRegs(uint8_t reg, const uint8_t* data, size_t len);
@@ -48,8 +49,38 @@ public:
     // The demo uses a fixed payload width, but tests can override it.
     void setStaticPayloadSize(uint8_t size);
     uint8_t staticPayloadSize() const;
+    bool irqConnected() const;
+    bool irqAsserted() const;
+    uint8_t lastTxStatus() const;
+    uint8_t lastTxFifoStatus() const;
+    uint8_t lastTxObserve() const;
+    bool lastTxTimedOut() const;
+    bool lastTxSawIrq() const;
 
 private:
+    enum class CwMode {
+        None,
+        ContWave,
+        PayloadReuse
+    };
+
+    struct CwRestoreState {
+        bool valid = false;
+        uint8_t config = 0;
+        uint8_t en_aa = 0;
+        uint8_t setup_retr = 0;
+        uint8_t rf_ch = 0;
+        uint8_t rf_setup = 0;
+        uint8_t tx_addr[5] = {};
+    };
+
     Nrf24Hal& hal_;
     uint8_t static_payload_size_ = 32;  // Number of bytes expected in each receive (RX) payload read.
+    uint8_t last_tx_status_ = 0;
+    uint8_t last_tx_fifo_status_ = 0;
+    uint8_t last_tx_observe_ = 0;
+    bool last_tx_timed_out_ = false;
+    bool last_tx_saw_irq_ = false;
+    CwMode cw_mode_ = CwMode::None;
+    CwRestoreState cw_restore_{};
 };

@@ -88,11 +88,11 @@ monitor exposes commands such as:
 
 - `HELP`
 - `STATUS`
+- `STOP`
 - `FILES`
 - `SELECT <file>`
 - `TX [file]`
 - `TX LOOP [count|INF] [file]`
-- `TX STOP`
 - `MORSE <text>`
 - `RX`
 - `STANDBY`
@@ -101,8 +101,7 @@ monitor exposes commands such as:
 - `POWERDOWN`
 - `CHANNEL <0-125>`
 - `CW START [channel] [power0-3]`
-- `CW LOOP <on_ms> <off_ms> [channel] [power0-3]`
-- `CW STOP`
+- `CW LOOP <on_ms> <off_ms> [channel] [power0-3] [EVERY <loops>]`
 
 ## Notes
 

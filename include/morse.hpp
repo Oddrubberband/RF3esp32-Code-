@@ -19,6 +19,8 @@ class Morse {
 public:
     // Encode text using the supplied dot length in milliseconds.
     static std::vector<KeyEvent> encode(const std::string& text, uint32_t dot_ms);
+    // Render text as dot/dash Morse symbols for console display.
+    static std::string render(const std::string& text);
 
 private:
     // Look up the dit/dah pattern for one character.

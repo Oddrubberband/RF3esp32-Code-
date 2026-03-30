@@ -49,7 +49,7 @@ constexpr uint32_t kPayloadBitsPerSecond =
     kPacketsPerSecond * AudioPacket::kPacketBytes * 8;
 constexpr const char* kSpiffsRoot = "/spiffs";
 constexpr const char* kDefaultTrack = "song.u8";
-constexpr uint32_t kDefaultMorseDotMs = 100;
+constexpr uint32_t kDefaultMorseDotMs = 120;
 constexpr uint8_t kDefaultMorsePowerLevel = 3;
 constexpr TickType_t kLoopWorkerPeriod = pdMS_TO_TICKS(20);
 constexpr TickType_t kLoopStopPollPeriod = pdMS_TO_TICKS(20);
@@ -84,6 +84,7 @@ struct LoopConfig {
     std::string morse_text;
     uint32_t cw_on_ms = 0;
     uint32_t cw_off_ms = 0;
+    uint32_t cw_report_every = 0;
     uint8_t channel = 76;
     uint8_t power_level = 3;
 };
@@ -439,7 +440,16 @@ bool sendU8Song(RadioManager& manager,
 
         if (!manager.sendPayload(packet, packet_len)) {
             std::fclose(fp);
-            ESP_LOGE(TAG, "Transmit failed at packet %u", sequence);
+            const RadioStatus status = manager.status();
+            ESP_LOGE(TAG,
+                     "Transmit failed at packet %u, STATUS=0x%02X FIFO=0x%02X OBSERVE_TX=0x%02X IRQ=%s tx_irq_seen=%s timeout=%s",
+                     sequence,
+                     static_cast<unsigned>(status.last_status),
+                     static_cast<unsigned>(status.last_fifo_status),
+                     static_cast<unsigned>(status.last_observe_tx),
+                     !status.irq_connected ? "disabled" : (status.irq_asserted ? "low" : "high"),
+                     status.last_tx_saw_irq ? "true" : "false",
+                     status.last_tx_timed_out ? "true" : "false");
             return false;
         }
 
@@ -635,12 +645,12 @@ private:
             "\nCommands:\n"
             "  HELP                 Show this command list\n"
             "  STATUS               Show radio state and selected file\n"
+            "  STOP                 Stop any active TX/CW/Morse/RX and return to standby\n"
             "  FILES                List available .u8 tracks in SPIFFS\n"
             "  SELECT <file>        Choose which SPIFFS track TX will send\n"
             "  TX [file]            Start sending the selected or named track\n"
             "  TX LOOP [n|INF] [f]  Repeatedly send the selected or named track\n"
-            "  TX STOP              Stop an active TX send or loop\n"
-            "  MORSE <text>         Key A-Z/0-9/spaces as Morse; use CW STOP to abort\n"
+            "  MORSE <text>         Key A-Z/0-9/spaces as Morse; use STOP to abort\n"
             "  RX                   Enter receive/listen mode\n"
             "  STANDBY              Leave RX/CW/sleep and return to standby\n"
             "  SLEEP                Put the radio into sleep mode\n"
@@ -648,8 +658,7 @@ private:
             "  POWERDOWN            Fully power down the radio\n"
             "  CHANNEL <0-125>      Reinitialize the radio on a new channel\n"
             "  CW START [ch] [0-3]  Start a continuous-wave test on a channel/power level\n"
-            "  CW LOOP <on> <off>   Repeat CW bursts until stopped\n"
-            "  CW STOP              Stop the continuous-wave test\n"
+            "  CW LOOP <on> <off>   Repeat CW bursts; optional [ch] [pwr] [EVERY <loops>]\n"
             "\nPrepare new tracks on the host with the PlatformIO 'Prepare Demo Audio' target\n"
             "or by running: python tools/prepare_demo_audio.py <path-to-song.mp3>\n");
     }
@@ -703,28 +712,6 @@ private:
         const bool active = loop_config_.active;
         giveLoop();
         return active;
-    }
-
-    bool isLoopModeActive(LoopMode mode)
-    {
-        if (!takeLoop(pdMS_TO_TICKS(50))) {
-            return false;
-        }
-
-        const bool active = loop_config_.active && loop_config_.mode == mode;
-        giveLoop();
-        return active;
-    }
-
-    bool requestLoopStop()
-    {
-        if (!isLoopActive()) {
-            loop_stop_requested_ = false;
-            return false;
-        }
-
-        loop_stop_requested_ = true;
-        return true;
     }
 
     bool stopLoopAndWait(TickType_t timeout = kLoopStopTimeout)
@@ -815,25 +802,39 @@ private:
 
     void printStatus()
     {
-        // STATUS combines the cached RadioStatus snapshot with a live
-        // hasPendingRx() check when receive (RX) mode is active.
+        // STATUS refreshes the live radio snapshot, then adds a live hasPendingRx()
+        // check when receive (RX) mode is active.
         if (!takeRadio(pdMS_TO_TICKS(50))) {
             std::printf("Could not read radio status right now.\n");
             return;
         }
 
-        const RadioStatus status = manager_.status();
+        manager_.refreshSnapshot();
         const bool rx_pending =
-            status.state == RadioState::RxListening ? manager_.hasPendingRx() : false;
+            manager_.status().state == RadioState::RxListening ? manager_.hasPendingRx() : false;
+        const RadioStatus status = manager_.status();
         giveRadio();
         const LoopConfig loop = loopSnapshot();
+        const char* irq_state =
+            !status.irq_connected ? "disabled" : (status.irq_asserted ? "low" : "high");
 
-        std::printf("State=%s channel=%u selected=%s last_status=0x%02X tx_ok=%s rx_len=%u fault=%d",
+        std::printf("State=%s channel=%u ",
                     RadioManager::stateName(status.state),
-                    static_cast<unsigned>(status.channel),
+                    static_cast<unsigned>(status.channel));
+        if (status.power_level >= 0) {
+            std::printf("power=%d ", status.power_level);
+        } else {
+            std::printf("power=unknown ");
+        }
+        std::printf("selected=%s last_status=0x%02X fifo=0x%02X observe=0x%02X irq=%s tx_irq_seen=%s tx_ok=%s tx_timeout=%s rx_len=%u fault=%d",
                     selected_track_.c_str(),
                     static_cast<unsigned>(status.last_status),
+                    static_cast<unsigned>(status.last_fifo_status),
+                    static_cast<unsigned>(status.last_observe_tx),
+                    irq_state,
+                    status.last_tx_saw_irq ? "true" : "false",
                     status.last_tx_ok ? "true" : "false",
+                    status.last_tx_timed_out ? "true" : "false",
                     static_cast<unsigned>(status.last_rx_len),
                     status.last_fault);
         if (status.state == RadioState::RxListening) {
@@ -856,6 +857,10 @@ private:
                             static_cast<unsigned>(loop.cw_on_ms),
                             static_cast<unsigned>(loop.cw_off_ms),
                             static_cast<unsigned>(loop.power_level));
+                if (loop.cw_report_every > 0) {
+                    std::printf(" loop_report_every=%u",
+                                static_cast<unsigned>(loop.cw_report_every));
+                }
             } else if (loop.mode == LoopMode::Morse) {
                 std::printf(" loop_text=%s", loop.morse_text.c_str());
             }
@@ -896,14 +901,8 @@ private:
         if (words.size() >= 2) {
             const std::string action = uppercaseCopy(words[1]);
             if (action == "STOP") {
-                if (!isLoopModeActive(LoopMode::Tx)) {
-                    std::printf("No TX send is active.\n");
-                    return false;
-                }
-
-                requestLoopStop();
-                std::printf("TX stop requested.\n");
-                return true;
+                std::printf("Use STOP to abort TX.\n");
+                return false;
             }
 
             if (action == "LOOP") {
@@ -993,33 +992,90 @@ private:
         loop_config_.track_name = track.name;
         giveLoop();
 
-        std::printf("TX started for %s. Use TX STOP to abort.\n", track.name.c_str());
+        std::printf("TX started for %s. Use STOP to abort.\n", track.name.c_str());
         return true;
     }
 
     bool keyMorseEventsLocked(const std::vector<KeyEvent>& events,
                               uint8_t channel,
                               uint8_t power_level,
-                              const volatile bool* stop_requested = nullptr)
+                              const volatile bool* stop_requested = nullptr,
+                              std::string_view live_render = {})
     {
         if (events.empty()) {
             return false;
         }
 
         const uint8_t rf_power_bits = static_cast<uint8_t>(power_level << 1);
+        size_t render_cursor = 0;
+        const bool show_preview = !live_render.empty();
+        const auto flushPreviewSeparators = [&]() {
+            bool printed = false;
+            while (render_cursor < live_render.size()) {
+                const char ch = live_render[render_cursor];
+                if (ch != ' ' && ch != '/') {
+                    break;
+                }
+
+                std::putchar(ch);
+                ++render_cursor;
+                printed = true;
+            }
+
+            if (printed) {
+                std::fflush(stdout);
+            }
+        };
+        const auto flushPreviewSymbol = [&]() {
+            flushPreviewSeparators();
+            while (render_cursor < live_render.size()) {
+                const char ch = live_render[render_cursor];
+                if (ch != '.' && ch != '-') {
+                    ++render_cursor;
+                    continue;
+                }
+
+                std::putchar(ch);
+                ++render_cursor;
+                std::fflush(stdout);
+                return;
+            }
+        };
+        const auto finishPreview = [&]() {
+            if (!show_preview) {
+                return;
+            }
+
+            flushPreviewSeparators();
+            std::putchar('\n');
+            std::fflush(stdout);
+        };
+
+        if (show_preview) {
+            std::printf("Morse TX: ");
+            std::fflush(stdout);
+        }
+
         for (const KeyEvent& event : events) {
             if (stop_requested && *stop_requested) {
                 if (manager_.status().state == RadioState::CwTest) {
                     manager_.stopCw();
                 }
+                finishPreview();
                 return false;
             }
 
             bool ok = true;
 
             if (event.key_down) {
+                if (show_preview) {
+                    flushPreviewSymbol();
+                }
                 ok = manager_.startCw(channel, rf_power_bits);
             } else if (manager_.status().state == RadioState::CwTest) {
+                if (show_preview) {
+                    flushPreviewSeparators();
+                }
                 ok = manager_.stopCw();
             }
 
@@ -1027,6 +1083,7 @@ private:
                 if (manager_.status().state == RadioState::CwTest) {
                     manager_.stopCw();
                 }
+                finishPreview();
                 return false;
             }
 
@@ -1035,6 +1092,7 @@ private:
                     if (manager_.status().state == RadioState::CwTest) {
                         manager_.stopCw();
                     }
+                    finishPreview();
                     return false;
                 }
             } else {
@@ -1043,9 +1101,12 @@ private:
         }
 
         if (manager_.status().state == RadioState::CwTest) {
-            return manager_.stopCw();
+            const bool ok = manager_.stopCw();
+            finishPreview();
+            return ok;
         }
 
+        finishPreview();
         return manager_.status().state == RadioState::Standby;
     }
 
@@ -1105,9 +1166,54 @@ private:
         last_morse_text_ = text;
         giveLoop();
 
-        std::printf("Morse started on channel %u at dot=%u ms. Use CW STOP to abort.\n",
+        std::printf("Morse started on channel %u at dot=%u ms. Use STOP to abort.\n",
                     static_cast<unsigned>(channel),
                     static_cast<unsigned>(kDefaultMorseDotMs));
+        return true;
+    }
+
+    bool commandStop()
+    {
+        const LoopConfig loop = loopSnapshot();
+
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+
+        const RadioStatus before = manager_.status();
+        const bool ok = ensureStandbyLocked();
+        const RadioStatus after = manager_.status();
+        giveRadio();
+
+        if (!ok) {
+            std::printf("Could not stop activity. state=%s fault=%d\n",
+                        RadioManager::stateName(after.state),
+                        after.last_fault);
+            return false;
+        }
+
+        const bool had_activity =
+            loop.active ||
+            before.state == RadioState::Boot ||
+            before.state == RadioState::RxListening ||
+            before.state == RadioState::CwTest ||
+            before.state == RadioState::Sleep ||
+            before.state == RadioState::PowerDown ||
+            before.state == RadioState::TxBusy ||
+            before.state == RadioState::Fault;
+
+        if (had_activity) {
+            std::printf("Stop complete. Radio is in standby.\n");
+        } else {
+            std::printf("Radio is already in standby.\n");
+        }
+
         return true;
     }
 
@@ -1314,33 +1420,19 @@ private:
         // for verifying channel/power output without sending normal packet
         // payloads.
         if (words.size() < 2) {
-            std::printf("Usage: CW START [channel] [power0-3] | CW LOOP <on_ms> <off_ms> [channel] [power0-3] | CW STOP\n");
+            std::printf("Usage: CW START [channel] [power0-3] | CW LOOP <on_ms> <off_ms> [channel] [power0-3] [EVERY <loops>]\n");
             return false;
         }
 
         const std::string action = uppercaseCopy(words[1]);
         if (action == "STOP") {
-            const bool loop_was_active =
-                isLoopModeActive(LoopMode::Cw) || isLoopModeActive(LoopMode::Morse);
-            if (loop_was_active) {
-                if (!stopLoopAndWait()) {
-                    std::printf("Could not stop CW mode right now.\n");
-                    return false;
-                }
-            }
-
-            if (!stopCurrentCwIfNeeded()) {
-                std::printf("Could not stop CW mode right now.\n");
-                return false;
-            }
-
-            std::printf("CW mode stopped.\n");
-            return true;
+            std::printf("Use STOP to abort CW.\n");
+            return false;
         }
 
         if (action == "LOOP") {
-            if (words.size() < 4 || words.size() > 6) {
-                std::printf("Usage: CW LOOP <on_ms> <off_ms> [channel] [power0-3]\n");
+            if (words.size() < 4) {
+                std::printf("Usage: CW LOOP <on_ms> <off_ms> [channel] [power0-3] [EVERY <loops>]\n");
                 return false;
             }
 
@@ -1359,14 +1451,41 @@ private:
 
             uint8_t channel = manager_.status().channel;
             uint8_t power_level = 3;
+            uint32_t report_every = 0;
+            bool parsed_channel = false;
+            bool parsed_power = false;
 
-            if (words.size() >= 5 && !parseUint8Arg(words[4], 0, 125, channel)) {
-                std::printf("CW channel must be in the range 0-125.\n");
-                return false;
-            }
+            for (size_t i = 4; i < words.size(); ++i) {
+                const std::string token = uppercaseCopy(words[i]);
+                if (token == "EVERY") {
+                    if (i + 1 >= words.size() ||
+                        !parseUint32Arg(words[i + 1], 1, UINT32_MAX, report_every)) {
+                        std::printf("CW loop report interval must be a positive loop count.\n");
+                        return false;
+                    }
+                    ++i;
+                    continue;
+                }
 
-            if (words.size() >= 6 && !parseUint8Arg(words[5], 0, 3, power_level)) {
-                std::printf("CW power level must be in the range 0-3.\n");
+                if (!parsed_channel) {
+                    if (!parseUint8Arg(words[i], 0, 125, channel)) {
+                        std::printf("CW channel must be in the range 0-125.\n");
+                        return false;
+                    }
+                    parsed_channel = true;
+                    continue;
+                }
+
+                if (!parsed_power) {
+                    if (!parseUint8Arg(words[i], 0, 3, power_level)) {
+                        std::printf("CW power level must be in the range 0-3.\n");
+                        return false;
+                    }
+                    parsed_power = true;
+                    continue;
+                }
+
+                std::printf("Usage: CW LOOP <on_ms> <off_ms> [channel] [power0-3] [EVERY <loops>]\n");
                 return false;
             }
 
@@ -1387,20 +1506,25 @@ private:
             loop_config_.infinite = true;
             loop_config_.cw_on_ms = on_ms;
             loop_config_.cw_off_ms = off_ms;
+            loop_config_.cw_report_every = report_every;
             loop_config_.channel = channel;
             loop_config_.power_level = power_level;
             giveLoop();
 
-            std::printf("CW loop active: %u ms on, %u ms off, channel %u, power %u\n",
-                        static_cast<unsigned>(on_ms),
-                        static_cast<unsigned>(off_ms),
+            std::printf("CW mode active on channel %u at power level %u (%u ms on, %u ms off)",
                         static_cast<unsigned>(channel),
-                        static_cast<unsigned>(power_level));
+                        static_cast<unsigned>(power_level),
+                        static_cast<unsigned>(on_ms),
+                        static_cast<unsigned>(off_ms));
+            if (report_every > 0) {
+                std::printf(", reporting every %u loops", static_cast<unsigned>(report_every));
+            }
+            std::printf(". Use STOP to abort.\n");
             return true;
         }
 
         if (action != "START") {
-            std::printf("Usage: CW START [channel] [power0-3] | CW LOOP <on_ms> <off_ms> [channel] [power0-3] | CW STOP\n");
+            std::printf("Usage: CW START [channel] [power0-3] | CW LOOP <on_ms> <off_ms> [channel] [power0-3] [EVERY <loops>]\n");
             return false;
         }
 
@@ -1446,10 +1570,34 @@ private:
             return false;
         }
 
-        std::printf("CW mode active on channel %u at power level %u\n",
+        std::printf("CW mode active on channel %u at power level %u. Use STOP to abort.\n",
                     static_cast<unsigned>(status.channel),
                     static_cast<unsigned>(power_level));
         return true;
+    }
+
+    void printCwLoopReport(const LoopConfig& loop, uint32_t completed_iterations)
+    {
+        if (!takeRadio(pdMS_TO_TICKS(50))) {
+            return;
+        }
+
+        manager_.refreshSnapshot();
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        const unsigned channel = static_cast<unsigned>(status.channel);
+        const unsigned power_level = status.power_level >= 0
+            ? static_cast<unsigned>(status.power_level)
+            : static_cast<unsigned>(loop.power_level);
+
+        std::printf("CW mode active on channel %u at power level %u (%u ms on, %u ms off, loop %u)\n",
+                    channel,
+                    power_level,
+                    static_cast<unsigned>(loop.cw_on_ms),
+                    static_cast<unsigned>(loop.cw_off_ms),
+                    static_cast<unsigned>(completed_iterations));
+        std::fflush(stdout);
     }
 
     void runTxLoopIteration(const LoopConfig& loop)
@@ -1534,9 +1682,17 @@ private:
         }
 
         const bool stopped = loop_stop_requested_;
+        bool should_report = false;
+        uint32_t completed_iterations = 0;
         if (takeLoop(pdMS_TO_TICKS(50))) {
             if (loop_config_.active && loop_config_.mode == LoopMode::Cw) {
                 ++loop_config_.completed_iterations;
+                completed_iterations = loop_config_.completed_iterations;
+                should_report =
+                    !stopped &&
+                    loop.cw_report_every > 0 &&
+                    completed_iterations > 0 &&
+                    (completed_iterations % loop.cw_report_every) == 0;
                 if (stopped) {
                     clearLoopLocked();
                 }
@@ -1546,6 +1702,10 @@ private:
 
         if (stopped) {
             return;
+        }
+
+        if (should_report) {
+            printCwLoopReport(loop, completed_iterations);
         }
 
         waitForLoopStopOrTimeout(loop.cw_off_ms);
@@ -1561,6 +1721,7 @@ private:
     void runMorseIteration(const LoopConfig& loop)
     {
         const std::vector<KeyEvent> events = Morse::encode(loop.morse_text, kDefaultMorseDotMs);
+        const std::string morse_line = Morse::render(loop.morse_text);
         if (events.empty()) {
             if (takeLoop(pdMS_TO_TICKS(50))) {
                 if (loop_config_.active && loop_config_.mode == LoopMode::Morse) {
@@ -1581,7 +1742,11 @@ private:
             ESP_LOGI(TAG, "Starting Morse on channel %u: %s",
                      static_cast<unsigned>(loop.channel),
                      loop.morse_text.c_str());
-            ok = keyMorseEventsLocked(events, loop.channel, loop.power_level, &loop_stop_requested_);
+            ok = keyMorseEventsLocked(events,
+                                      loop.channel,
+                                      loop.power_level,
+                                      &loop_stop_requested_,
+                                      morse_line);
             status = manager_.status();
         }
         giveRadio();
@@ -1700,6 +1865,9 @@ private:
             printHelp();
             return true;
         }
+        if (command == "STOP") {
+            return commandStop();
+        }
         if (command == "STATUS") {
             printStatus();
             return true;
@@ -1764,12 +1932,13 @@ void app_main(void)
     // declared in Esp32Nrf24Config.
     Esp32Nrf24Config config{};
     ESP_LOGI(TAG,
-             "nRF24 pins: SCK=%d MISO=%d MOSI=%d CE=%d CSN=%d",
+             "nRF24 pins: SCK=%d MISO=%d MOSI=%d CE=%d CSN=%d IRQ=%d",
              static_cast<int>(config.sck_pin),
              static_cast<int>(config.miso_pin),
              static_cast<int>(config.mosi_pin),
              static_cast<int>(config.ce_pin),
-             static_cast<int>(config.csn_pin));
+             static_cast<int>(config.csn_pin),
+             static_cast<int>(config.irq_pin));
 
     Esp32Nrf24Hal hal(config);
     Nrf24 radio(hal);

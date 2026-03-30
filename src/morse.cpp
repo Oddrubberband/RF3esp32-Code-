@@ -84,6 +84,35 @@ std::vector<KeyEvent> Morse::encode(const std::string& text, uint32_t dot_ms)
     return events;
 }
 
+std::string Morse::render(const std::string& text)
+{
+    std::string out;
+    bool pending_word_gap = false;
+
+    for (char c : text) {
+        if (c == ' ') {
+            if (!out.empty()) {
+                pending_word_gap = true;
+            }
+            continue;
+        }
+
+        const std::string symbols = symbolFor(c);
+        if (symbols.empty()) {
+            continue;
+        }
+
+        if (!out.empty()) {
+            out += pending_word_gap ? " / " : " ";
+        }
+
+        out += symbols;
+        pending_word_gap = false;
+    }
+
+    return out;
+}
+
 std::string Morse::symbolFor(char c)
 {
     // Lookup uses compact indexed tables for letters and digits.
