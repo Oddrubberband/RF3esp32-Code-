@@ -29,6 +29,7 @@ The default nRF24 wiring in the firmware is:
 - `MOSI = GPIO23`
 - `CE = GPIO27`
 - `CSN = GPIO5`
+- `IRQ = GPIO26` (set `irq_pin` to `kNoIrqPin` if you do not wire it)
 - plus `3.3V` and `GND`
 
 ## Build and Flash
@@ -59,8 +60,8 @@ If you are using the ESP-IDF extension or terminal:
 
 ```powershell
 idf.py build
-idf.py -p COM3 flash
-idf.py -p COM3 monitor
+idf.py -p COM4 flash
+idf.py -p COM4 monitor
 ```
 
 ## Audio Workflow
@@ -102,6 +103,7 @@ monitor exposes commands such as:
 - `CHANNEL <0-125>`
 - `CW START [channel] [power0-3]`
 - `CW LOOP <on_ms> <off_ms> [channel] [power0-3] [EVERY <loops>]`
+- `CW STOP`
 
 ## Notes
 

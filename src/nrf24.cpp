@@ -276,21 +276,26 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
 
     const bool irq_connected = hal_.irqConnected();
     const uint64_t start = hal_.nowUs();
+    uint64_t last_status_poll = start;
 
     // Poll the STATUS register until the chip reports transmit (TX) success,
-    // maximum retries, or timeout. When IRQ is wired, treat it as the primary
-    // hint that the radio has a completion event ready.
+    // maximum retries, or timeout. When IRQ is wired, use it as the primary
+    // hint that a completion event is ready, but still fall back to periodic
+    // STATUS reads in case the interrupt edge is missed.
     while ((hal_.nowUs() - start) < timeoutUs) {
         bool should_read_status = !irq_connected;
         if (irq_connected) {
+            const uint64_t now = hal_.nowUs();
             const bool irq_now = hal_.irqAsserted();
             last_tx_saw_irq_ = last_tx_saw_irq_ || irq_now;
-            should_read_status = irq_now;
+            should_read_status = irq_now || ((now - last_status_poll) >= 200);
         }
 
         if (!should_read_status) {
             continue;
         }
+
+        last_status_poll = hal_.nowUs();
 
         const uint8_t status = getStatus();
 

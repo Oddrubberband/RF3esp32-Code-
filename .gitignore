@@ -1,4 +1,5 @@
 .pio/
+.pio-core/
 .pio-home/
 .venv/
 build/
@@ -6,6 +7,7 @@ build-idf/
 sdkconfig
 sdkconfig.old
 sdkconfig.esp32wroom32d
+sdkconfig.esp32wroom32d_manual_boot
 native-test-results.txt
 __pycache__/
 *.pyc

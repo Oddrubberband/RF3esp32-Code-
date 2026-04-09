@@ -22,7 +22,7 @@ struct Esp32Nrf24Config {
 
     gpio_num_t ce_pin   = GPIO_NUM_27;   // Chip enable: controls receive/transmit state transitions.
     gpio_num_t csn_pin  = GPIO_NUM_5;    // SPI chip select for register and payload access.
-    gpio_num_t irq_pin  = GPIO_NUM_26;   // Active-low interrupt pin from the nRF24.
+    gpio_num_t irq_pin  = GPIO_NUM_26;   // Active-low interrupt pin from the nRF24; set to kNoIrqPin if your module does not wire IRQ.
 
     int spi_clock_hz = 1000000;          // Conservative bus speed for reliable module bring-up.
 };

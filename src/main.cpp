@@ -1426,8 +1426,7 @@ private:
 
         const std::string action = uppercaseCopy(words[1]);
         if (action == "STOP") {
-            std::printf("Use STOP to abort CW.\n");
-            return false;
+            return commandStop();
         }
 
         if (action == "LOOP") {
