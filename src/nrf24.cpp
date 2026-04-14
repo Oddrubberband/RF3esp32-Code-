@@ -2,6 +2,10 @@
 
 #include <array>
 
+namespace {
+constexpr std::array<uint8_t, 5> kDemoAddress = {0x52, 0x46, 0x33, 0x24, 0x01};
+}
+
 Nrf24::Nrf24(Nrf24Hal& hal)
     : hal_(hal),
       static_payload_size_(32)
@@ -49,7 +53,15 @@ bool Nrf24::initDefaults(uint8_t channel)
     writeReg(0x04, 0x00);
     writeReg(0x05, channel);
     writeReg(0x06, 0x06);
+    writeRegs(0x0A, kDemoAddress.data(), kDemoAddress.size());
+    writeRegs(0x10, kDemoAddress.data(), kDemoAddress.size());
     writeReg(0x11, static_payload_size_);
+    writeReg(0x1C, 0x00);
+    writeReg(0x1D, 0x00);
+
+    if (readReg(0x05) != channel) {
+        return false;
+    }
 
     clearIrq();
     flushTx();
@@ -85,6 +97,13 @@ uint8_t Nrf24::readRfPowerLevel()
 {
     // RF_SETUP bits 2:1 encode the output power level as a small 0-3 value.
     return static_cast<uint8_t>((readReg(0x06) >> 1) & 0x03);
+}
+
+uint8_t Nrf24::readRpd()
+{
+    // The nRF24 Received Power Detector (RPD) latches when in RX mode and the
+    // input exceeds the chip's coarse sensitivity threshold.
+    return static_cast<uint8_t>(readReg(0x09) & 0x01);
 }
 
 void Nrf24::readRegs(uint8_t reg, uint8_t* out, size_t len)
@@ -239,98 +258,127 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
         return false;
     }
 
-    last_tx_status_ = getStatus();
-    last_tx_fifo_status_ = readReg(0x17);
-    last_tx_observe_ = readReg(0x08);
-    last_tx_timed_out_ = false;
-    last_tx_saw_irq_ = false;
+    auto attempt_transmit = [&](bool rearm_radio) {
+        if (rearm_radio) {
+            const uint8_t channel = readReg(0x05);
 
-    // Force transmit (TX) mode, queue one payload, then keep Chip Enable (CE)
-    // asserted while we wait for the radio to report completion. A short pulse
-    // is sufficient per the datasheet, but some modules appear more reliable
-    // when CE stays high through the standby-to-transmit settling window.
-    hal_.ce(false);
-
-    uint8_t config = readReg(0x00);
-    config |= (1 << 1);
-    config &= static_cast<uint8_t>(~(1 << 0));
-    writeReg(0x00, config);
-
-    clearIrq();
-    flushTx();
-
-    uint8_t tx[33] = {0};
-    uint8_t rx[33] = {0};
-
-    tx[0] = 0xA0;
-    for (size_t i = 0; i < len; ++i) {
-        tx[i + 1] = payload[i];
-    }
-
-    hal_.spiTxRx(tx, rx, len + 1);
-
-    // Leave extra time between the payload write and CE assertion. Nordic's
-    // minimum is short, but clone modules can be noticeably less tolerant.
-    hal_.delayUs(150);
-    hal_.ce(true);
-
-    const bool irq_connected = hal_.irqConnected();
-    const uint64_t start = hal_.nowUs();
-    uint64_t last_status_poll = start;
-
-    // Poll the STATUS register until the chip reports transmit (TX) success,
-    // maximum retries, or timeout. When IRQ is wired, use it as the primary
-    // hint that a completion event is ready, but still fall back to periodic
-    // STATUS reads in case the interrupt edge is missed.
-    while ((hal_.nowUs() - start) < timeoutUs) {
-        bool should_read_status = !irq_connected;
-        if (irq_connected) {
-            const uint64_t now = hal_.nowUs();
-            const bool irq_now = hal_.irqAsserted();
-            last_tx_saw_irq_ = last_tx_saw_irq_ || irq_now;
-            should_read_status = irq_now || ((now - last_status_poll) >= 200);
-        }
-
-        if (!should_read_status) {
-            continue;
-        }
-
-        last_status_poll = hal_.nowUs();
-
-        const uint8_t status = getStatus();
-
-        if (status & (1 << 5)) {
-            last_tx_status_ = status;
-            last_tx_fifo_status_ = readReg(0x17);
-            last_tx_observe_ = readReg(0x08);
-            last_tx_timed_out_ = false;
             hal_.ce(false);
-            clearIrq(false, true, false);
-            return true;
-        }
-
-        if (status & (1 << 4)) {
-            last_tx_status_ = status;
-            last_tx_fifo_status_ = readReg(0x17);
-            last_tx_observe_ = readReg(0x08);
-            last_tx_timed_out_ = false;
-            hal_.ce(false);
-            clearIrq(false, false, true);
+            writeReg(0x00, 0x0C);
+            writeReg(0x01, 0x00);
+            writeReg(0x02, 0x01);
+            writeReg(0x03, 0x03);
+            writeReg(0x04, 0x00);
+            writeReg(0x05, channel);
+            writeReg(0x06, 0x06);
+            writeRegs(0x0A, kDemoAddress.data(), kDemoAddress.size());
+            writeRegs(0x10, kDemoAddress.data(), kDemoAddress.size());
+            writeReg(0x11, static_payload_size_);
+            writeReg(0x1C, 0x00);
+            writeReg(0x1D, 0x00);
+            clearIrq();
             flushTx();
-            return false;
+            flushRx();
+            powerUp();
         }
+
+        last_tx_status_ = getStatus();
+        last_tx_fifo_status_ = readReg(0x17);
+        last_tx_observe_ = readReg(0x08);
+        last_tx_timed_out_ = false;
+        last_tx_saw_irq_ = false;
+
+        // Force transmit (TX) mode, queue one payload, then keep Chip Enable
+        // (CE) asserted while we wait for the radio to report completion. A
+        // short pulse is sufficient per the datasheet, but some modules appear
+        // more reliable when CE stays high through the standby-to-transmit
+        // settling window.
+        hal_.ce(false);
+
+        uint8_t config = readReg(0x00);
+        config |= (1 << 1);
+        config &= static_cast<uint8_t>(~(1 << 0));
+        writeReg(0x00, config);
+
+        clearIrq();
+        flushTx();
+
+        uint8_t tx[33] = {0};
+        uint8_t rx[33] = {0};
+
+        tx[0] = 0xA0;
+        for (size_t i = 0; i < len; ++i) {
+            tx[i + 1] = payload[i];
+        }
+
+        hal_.spiTxRx(tx, rx, len + 1);
+
+        // Leave extra time between the payload write and CE assertion.
+        hal_.delayUs(150);
+        hal_.ce(true);
+
+        const bool irq_connected = hal_.irqConnected();
+        const uint64_t start = hal_.nowUs();
+        uint64_t last_status_poll = start;
+
+        while ((hal_.nowUs() - start) < timeoutUs) {
+            bool should_read_status = !irq_connected;
+            if (irq_connected) {
+                const uint64_t now = hal_.nowUs();
+                const bool irq_now = hal_.irqAsserted();
+                last_tx_saw_irq_ = last_tx_saw_irq_ || irq_now;
+                should_read_status = irq_now || ((now - last_status_poll) >= 200);
+            }
+
+            if (!should_read_status) {
+                continue;
+            }
+
+            last_status_poll = hal_.nowUs();
+
+            const uint8_t status = getStatus();
+
+            if (status & (1 << 5)) {
+                last_tx_status_ = status;
+                last_tx_fifo_status_ = readReg(0x17);
+                last_tx_observe_ = readReg(0x08);
+                last_tx_timed_out_ = false;
+                hal_.ce(false);
+                clearIrq(false, true, false);
+                return true;
+            }
+
+            if (status & (1 << 4)) {
+                last_tx_status_ = status;
+                last_tx_fifo_status_ = readReg(0x17);
+                last_tx_observe_ = readReg(0x08);
+                last_tx_timed_out_ = false;
+                hal_.ce(false);
+                clearIrq(false, false, true);
+                flushTx();
+                return false;
+            }
+        }
+
+        if (irq_connected) {
+            last_tx_saw_irq_ = last_tx_saw_irq_ || hal_.irqAsserted();
+        }
+        last_tx_status_ = getStatus();
+        last_tx_fifo_status_ = readReg(0x17);
+        last_tx_observe_ = readReg(0x08);
+        last_tx_timed_out_ = true;
+        hal_.ce(false);
+        flushTx();
+        return false;
+    };
+
+    if (attempt_transmit(false)) {
+        return true;
     }
 
-    if (irq_connected) {
-        last_tx_saw_irq_ = last_tx_saw_irq_ || hal_.irqAsserted();
-    }
-    last_tx_status_ = getStatus();
-    last_tx_fifo_status_ = readReg(0x17);
-    last_tx_observe_ = readReg(0x08);
-    last_tx_timed_out_ = true;
-    hal_.ce(false);
-    flushTx();
-    return false;
+    // Some clone modules and long-wire bench setups need a stronger re-prime
+    // after cold start or a stalled first transmit. Re-apply the known packet
+    // configuration and try once more before reporting failure to the app.
+    return attempt_transmit(true);
 }
 
 bool Nrf24::readOnePacket(uint8_t* out, size_t capacity, size_t& outLen)

@@ -28,7 +28,9 @@ struct RadioStatus {
     bool last_tx_ok = false;  // Whether the most recent one-shot transmit (TX) succeeded.
     bool last_tx_timed_out = false;  // Whether the last TX failure was a poll timeout instead of MAX_RT.
     bool last_tx_saw_irq = false;  // Whether IRQ went low at any point during the most recent TX attempt.
+    bool carrier_detected = false;  // Whether the nRF24 RPD bit sees energy above its threshold while in RX.
     size_t last_rx_len = 0;   // Number of bytes returned by the last receive (RX) read.
+    uint32_t rx_packets = 0;  // Count of successfully received payloads since the most recent boot/probe.
     int last_fault = 0;       // Small numeric breadcrumb describing the failure point.
     uint8_t channel = 76;     // Current radio-frequency (RF) channel the app believes the radio uses.
     int power_level = -1;     // Decoded nRF24 output power level from RF_SETUP, or -1 if unknown.
@@ -76,4 +78,6 @@ private:
 
     Nrf24& radio_;
     RadioStatus status_{};
+    uint8_t channel_before_cw_ = 76;  // Packet/rx channel to restore after temporary CW tests.
+    bool cw_channel_restore_valid_ = false;
 };

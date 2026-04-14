@@ -4,6 +4,34 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 
+#ifndef NRF24_SCK_PIN
+#define NRF24_SCK_PIN 18
+#endif
+
+#ifndef NRF24_MOSI_PIN
+#define NRF24_MOSI_PIN 23
+#endif
+
+#ifndef NRF24_MISO_PIN
+#define NRF24_MISO_PIN 19
+#endif
+
+#ifndef NRF24_CE_PIN
+#define NRF24_CE_PIN 17
+#endif
+
+#ifndef NRF24_CSN_PIN
+#define NRF24_CSN_PIN 27
+#endif
+
+#ifndef NRF24_IRQ_PIN
+#define NRF24_IRQ_PIN 16
+#endif
+
+#ifndef NRF24_PINSET_NAME
+#define NRF24_PINSET_NAME "pcb"
+#endif
+
 // Esp32Nrf24Config collects the board-specific wiring choices for the radio.
 //
 // The defaults assume the ESP32's common Serial Peripheral Interface (SPI) bus
@@ -16,13 +44,13 @@ struct Esp32Nrf24Config {
 
     spi_host_device_t host = SPI3_HOST;  // ESP-IDF Serial Peripheral Interface (SPI) host used to talk to the radio.
 
-    gpio_num_t sck_pin  = GPIO_NUM_18;   // SPI clock driven by the ESP32.
-    gpio_num_t mosi_pin = GPIO_NUM_23;   // Master-out, slave-in data line.
-    gpio_num_t miso_pin = GPIO_NUM_19;   // Master-in, slave-out data line.
+    gpio_num_t sck_pin  = static_cast<gpio_num_t>(NRF24_SCK_PIN);   // SPI clock driven by the ESP32.
+    gpio_num_t mosi_pin = static_cast<gpio_num_t>(NRF24_MOSI_PIN);  // Master-out, slave-in data line.
+    gpio_num_t miso_pin = static_cast<gpio_num_t>(NRF24_MISO_PIN);  // Master-in, slave-out data line.
 
-    gpio_num_t ce_pin   = GPIO_NUM_27;   // Chip enable: controls receive/transmit state transitions.
-    gpio_num_t csn_pin  = GPIO_NUM_5;    // SPI chip select for register and payload access.
-    gpio_num_t irq_pin  = GPIO_NUM_26;   // Active-low interrupt pin from the nRF24; set to kNoIrqPin if your module does not wire IRQ.
+    gpio_num_t ce_pin   = static_cast<gpio_num_t>(NRF24_CE_PIN);    // Chip enable: controls receive/transmit state transitions.
+    gpio_num_t csn_pin  = static_cast<gpio_num_t>(NRF24_CSN_PIN);   // SPI chip select for register and payload access.
+    gpio_num_t irq_pin  = static_cast<gpio_num_t>(NRF24_IRQ_PIN);   // Active-low interrupt pin from the nRF24; set to kNoIrqPin if your module does not wire IRQ.
 
     int spi_clock_hz = 1000000;          // Conservative bus speed for reliable module bring-up.
 };

@@ -21,10 +21,14 @@ bool RadioManager::boot(uint8_t channel)
     status_.last_tx_ok = false;
     status_.last_tx_timed_out = false;
     status_.last_tx_saw_irq = false;
+    status_.carrier_detected = false;
     status_.last_rx_len = 0;
+    status_.rx_packets = 0;
     status_.power_level = -1;
     status_.irq_connected = false;
     status_.irq_asserted = false;
+    channel_before_cw_ = channel;
+    cw_channel_restore_valid_ = false;
 
     if (!radio_.probe()) {
         status_.state = RadioState::Fault;
@@ -58,17 +62,23 @@ void RadioManager::refreshSnapshot()
     status_.last_observe_tx = radio_.readReg(0x08);
     status_.irq_connected = radio_.irqConnected();
     status_.irq_asserted = radio_.irqAsserted();
-    status_.channel = radio_.readReg(0x05);
     if (status_.last_status == 0x00 || status_.last_status == 0xFF) {
+        status_.carrier_detected = false;
         status_.power_level = -1;
         return;
     }
 
+    status_.carrier_detected =
+        status_.state == RadioState::RxListening && radio_.readRpd() != 0;
     refreshPowerLevel();
 }
 
 bool RadioManager::enterRx()
 {
+    status_.last_rx_len = 0;
+    status_.rx_packets = 0;
+    status_.carrier_detected = false;
+
     if (radio_.startRx()) {
         status_.state = RadioState::RxListening;
         status_.last_status = radio_.getStatus();
@@ -117,7 +127,6 @@ bool RadioManager::sendPayload(const uint8_t* payload, size_t len)
         status_.last_observe_tx = radio_.lastTxObserve();
         status_.irq_connected = radio_.irqConnected();
         status_.irq_asserted = radio_.irqAsserted();
-        status_.channel = radio_.readReg(0x05);
         refreshPowerLevel();
         status_.state = RadioState::Standby;
         return true;
@@ -132,7 +141,6 @@ bool RadioManager::sendPayload(const uint8_t* payload, size_t len)
     status_.last_observe_tx = radio_.lastTxObserve();
     status_.irq_connected = radio_.irqConnected();
     status_.irq_asserted = radio_.irqAsserted();
-    status_.channel = radio_.readReg(0x05);
     refreshPowerLevel();
     status_.last_fault = 3;  // Transmit (TX) operation failed or timed out.
     return false;
@@ -146,6 +154,7 @@ bool RadioManager::receivePayload(uint8_t* out, size_t capacity, size_t& outLen)
     // continue polling.
     if (radio_.readOnePacket(out, capacity, outLen)) {
         status_.last_rx_len = outLen;
+        ++status_.rx_packets;
         status_.last_status = radio_.getStatus();
         status_.state = RadioState::RxListening;
         return true;
@@ -195,6 +204,8 @@ bool RadioManager::powerDown()
 bool RadioManager::startCw(uint8_t channel, uint8_t rfPowerBits)
 {
     if (radio_.startContinuousCarrier(channel, rfPowerBits)) {
+        channel_before_cw_ = status_.channel;
+        cw_channel_restore_valid_ = true;
         status_.channel = channel;
         status_.state = RadioState::CwTest;
         refreshSnapshot();
@@ -211,6 +222,10 @@ bool RadioManager::stopCw()
     // stopContinuousCarrier does not currently report failure, so this wrapper
     // always returns true after restoring the app-facing state.
     radio_.stopContinuousCarrier();
+    if (cw_channel_restore_valid_) {
+        status_.channel = channel_before_cw_;
+        cw_channel_restore_valid_ = false;
+    }
     status_.state = RadioState::Standby;
     refreshSnapshot();
     return true;

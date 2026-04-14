@@ -813,6 +813,9 @@ private:
         const bool rx_pending =
             manager_.status().state == RadioState::RxListening ? manager_.hasPendingRx() : false;
         const RadioStatus status = manager_.status();
+        const uint32_t carrier_events = carrier_event_count_;
+        const uint32_t decoded_packets = decoded_rx_packet_count_;
+        const uint32_t raw_packets = raw_rx_packet_count_;
         giveRadio();
         const LoopConfig loop = loopSnapshot();
         const char* irq_state =
@@ -826,7 +829,7 @@ private:
         } else {
             std::printf("power=unknown ");
         }
-        std::printf("selected=%s last_status=0x%02X fifo=0x%02X observe=0x%02X irq=%s tx_irq_seen=%s tx_ok=%s tx_timeout=%s rx_len=%u fault=%d",
+        std::printf("selected=%s last_status=0x%02X fifo=0x%02X observe=0x%02X irq=%s tx_irq_seen=%s tx_ok=%s tx_timeout=%s rx_len=%u rx_packets=%u rx_audio=%u rx_raw=%u carrier_events=%u fault=%d",
                     selected_track_.c_str(),
                     static_cast<unsigned>(status.last_status),
                     static_cast<unsigned>(status.last_fifo_status),
@@ -836,9 +839,15 @@ private:
                     status.last_tx_ok ? "true" : "false",
                     status.last_tx_timed_out ? "true" : "false",
                     static_cast<unsigned>(status.last_rx_len),
+                    static_cast<unsigned>(status.rx_packets),
+                    static_cast<unsigned>(decoded_packets),
+                    static_cast<unsigned>(raw_packets),
+                    static_cast<unsigned>(carrier_events),
                     status.last_fault);
         if (status.state == RadioState::RxListening) {
-            std::printf(" rx_pending=%s", rx_pending ? "true" : "false");
+            std::printf(" rx_pending=%s rpd=%s",
+                        rx_pending ? "true" : "false",
+                        status.carrier_detected ? "true" : "false");
         }
         if (!last_morse_text_.empty()) {
             std::printf(" last_morse=\"%s\"", last_morse_text_.c_str());
@@ -1246,6 +1255,11 @@ private:
                         status.last_fault);
             return false;
         }
+
+        last_carrier_detected_ = false;
+        carrier_event_count_ = 0;
+        decoded_rx_packet_count_ = 0;
+        raw_rx_packet_count_ = 0;
 
         std::printf("RX listening on channel %u\n", static_cast<unsigned>(status.channel));
         return true;
@@ -1812,6 +1826,7 @@ private:
         AudioPacket::Header header{};
         const uint8_t* audio = nullptr;
         if (AudioPacket::decode(payload, len, header, audio)) {
+            ++decoded_rx_packet_count_;
             ESP_LOGI(TAG, "RX packet seq=%u audio=%u flags=0x%02X",
                      static_cast<unsigned>(header.sequence),
                      static_cast<unsigned>(header.audio_len),
@@ -1819,6 +1834,7 @@ private:
             return;
         }
 
+        ++raw_rx_packet_count_;
         ESP_LOGI(TAG, "RX payload len=%u (fixed-width frame)", static_cast<unsigned>(len));
     }
 
@@ -1832,16 +1848,30 @@ private:
 
         while (true) {
             if (takeRadio(pdMS_TO_TICKS(10))) {
-                if (manager_.status().state == RadioState::RxListening && manager_.hasPendingRx()) {
-                    size_t out_len = 0;
-                    if (manager_.receivePayload(payload.data(), payload.size(), out_len)) {
-                        logRxPacket(payload.data(), out_len);
-                    } else {
-                        const RadioStatus status = manager_.status();
-                        ESP_LOGW(TAG, "RX read failed, state=%s fault=%d",
-                                 RadioManager::stateName(status.state),
-                                 status.last_fault);
+                if (manager_.status().state == RadioState::RxListening) {
+                    manager_.refreshSnapshot();
+                    const RadioStatus snapshot = manager_.status();
+
+                    if (snapshot.carrier_detected && !last_carrier_detected_) {
+                        ++carrier_event_count_;
+                        ESP_LOGI(TAG, "Carrier detect (RPD) high on channel %u",
+                                 static_cast<unsigned>(snapshot.channel));
                     }
+                    last_carrier_detected_ = snapshot.carrier_detected;
+
+                    if (manager_.hasPendingRx()) {
+                        size_t out_len = 0;
+                        if (manager_.receivePayload(payload.data(), payload.size(), out_len)) {
+                            logRxPacket(payload.data(), out_len);
+                        } else {
+                            const RadioStatus status = manager_.status();
+                            ESP_LOGW(TAG, "RX read failed, state=%s fault=%d",
+                                     RadioManager::stateName(status.state),
+                                     status.last_fault);
+                        }
+                    }
+                } else {
+                    last_carrier_detected_ = false;
                 }
                 giveRadio();
             }
@@ -1916,6 +1946,10 @@ private:
     TaskHandle_t loop_task_ = nullptr;         // Background TX/CW loop worker.
     std::string selected_track_ = kDefaultTrack;  // Default file used by transmit (TX).
     std::string last_morse_text_;              // Most recent MORSE text for STATUS output.
+    bool last_carrier_detected_ = false;      // Edge detector for RPD logging while in RX.
+    uint32_t carrier_event_count_ = 0;        // Number of distinct RPD-high events seen while listening.
+    uint32_t decoded_rx_packet_count_ = 0;    // Payloads that matched the AudioPacket format.
+    uint32_t raw_rx_packet_count_ = 0;        // Payloads that were received but did not match AudioPacket.
     LoopConfig loop_config_{};
     volatile bool loop_stop_requested_ = false;
 };
@@ -1931,7 +1965,8 @@ void app_main(void)
     // declared in Esp32Nrf24Config.
     Esp32Nrf24Config config{};
     ESP_LOGI(TAG,
-             "nRF24 pins: SCK=%d MISO=%d MOSI=%d CE=%d CSN=%d IRQ=%d",
+             "nRF24 pinset=%s pins: SCK=%d MISO=%d MOSI=%d CE=%d CSN=%d IRQ=%d",
+             NRF24_PINSET_NAME,
              static_cast<int>(config.sck_pin),
              static_cast<int>(config.miso_pin),
              static_cast<int>(config.mosi_pin),

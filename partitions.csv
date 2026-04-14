@@ -12,4 +12,6 @@ phy_init, data, phy,     0xe000,   0x1000,
 # Main application image flashed by idf.py / PlatformIO upload.
 factory,  app,  factory, 0x10000,  0x180000,
 # SPIFFS image built from data/ and uploaded with the uploadfs target.
-spiffs,   data, spiffs,  0x190000, 0x270000,
+# This custom ESP32-WROOM-32UE-N16 module has 16 MB of flash, so let SPIFFS
+# consume the remainder of flash after the factory app partition.
+spiffs,   data, spiffs,  0x190000, 0xE70000,

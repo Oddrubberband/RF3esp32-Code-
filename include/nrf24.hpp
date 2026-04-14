@@ -23,6 +23,7 @@ public:
     uint8_t getStatus();
     uint8_t readReg(uint8_t reg);
     uint8_t readRfPowerLevel();
+    uint8_t readRpd();
     void readRegs(uint8_t reg, uint8_t* out, size_t len);
     void writeReg(uint8_t reg, uint8_t value);
     void writeRegs(uint8_t reg, const uint8_t* data, size_t len);
