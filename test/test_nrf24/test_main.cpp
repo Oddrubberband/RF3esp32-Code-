@@ -22,6 +22,37 @@ void tearDown(void)
 {
 }
 
+class TimeoutHal : public FakeHal {
+public:
+    void ce(bool level) override
+    {
+        const bool rising = !ce_level && level;
+        ce_level = level;
+
+        const bool prim_rx = (regs[0x00] & (1 << 0)) != 0;
+        const bool power_up = (regs[0x00] & (1 << 1)) != 0;
+
+        // Count attempted TX launches, but never raise TX_DS or MAX_RT.
+        // This forces transmitOnce() down its timeout path.
+        if (rising && power_up && !prim_rx && !tx_fifo.empty()) {
+            ++tx_trigger_count;
+        }
+    }
+};
+
+class ProbeFailHal : public FakeHal {
+public:
+    void spiTxRx(const uint8_t* tx, uint8_t* rx, size_t n) override
+    {
+        const uint8_t old_rf_ch = regs[0x05];
+        FakeHal::spiTxRx(tx, rx, n);
+
+        // Make RF_CH writes appear to fail so probe() cannot read back the test value.
+        if (n > 0 && (tx[0] & 0xE0) == 0x20 && (tx[0] & 0x1F) == 0x05) {
+            regs[0x05] = old_rf_ch;
+        }
+    }
+};
 // Small helper so the individual tests stay focused on behavior instead of loop boilerplate.
 static void assertBytes(const std::vector<uint8_t>& actual, std::initializer_list<uint8_t> expected)
 {
@@ -649,6 +680,159 @@ void test_radioManager_receivePayload_reads_fifo_backlog_after_irq_clear(void)
     TEST_ASSERT_EQUAL(static_cast<int>(RadioState::RxListening), static_cast<int>(status.state));
 }
 
+void test_audioPacket_decode_accepts_every_valid_audio_len_as_padded_packet(void)
+{
+    for (size_t len = 1; len <= AudioPacket::kAudioBytesPerPacket; ++len) {
+        std::vector<uint8_t> audio(len);
+        for (size_t i = 0; i < len; ++i) {
+            audio[i] = static_cast<uint8_t>(i + 1);
+        }
+
+        uint8_t packet[AudioPacket::kPacketBytes] = {};
+        size_t packet_len = 0;
+
+        TEST_ASSERT_TRUE(AudioPacket::encode(42,
+                                             audio.data(),
+                                             audio.size(),
+                                             len == 1,
+                                             len == AudioPacket::kAudioBytesPerPacket,
+                                             packet,
+                                             packet_len));
+        TEST_ASSERT_EQUAL_UINT32(AudioPacket::kPacketBytes, static_cast<uint32_t>(packet_len));
+
+        AudioPacket::Header header;
+        const uint8_t* decoded_audio = nullptr;
+
+        TEST_ASSERT_TRUE(AudioPacket::decode(packet, packet_len, header, decoded_audio));
+        TEST_ASSERT_EQUAL_UINT16(42, header.sequence);
+        TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(len), header.audio_len);
+
+        for (size_t i = 0; i < len; ++i) {
+            TEST_ASSERT_EQUAL_UINT8(audio[i], decoded_audio[i]);
+        }
+    }
+}
+
+void test_audioPacket_decode_rejects_zero_audio_len(void)
+{
+    uint8_t packet[AudioPacket::kPacketBytes] = {};
+    packet[0] = 0x01;
+    packet[1] = 0x00;
+    packet[2] = 0x00; // audio_len = 0
+    packet[3] = 0x00;
+
+    AudioPacket::Header header;
+    const uint8_t* decoded_audio = nullptr;
+
+    TEST_ASSERT_FALSE(AudioPacket::decode(packet, AudioPacket::kPacketBytes, header, decoded_audio));
+}
+
+void test_audioReassembler_accepts_padded_packets_in_order(void)
+{
+    uint8_t packet0[AudioPacket::kPacketBytes] = {};
+    uint8_t packet1[AudioPacket::kPacketBytes] = {};
+    size_t len0 = 0;
+    size_t len1 = 0;
+
+    TEST_ASSERT_TRUE(AudioPacket::encode(0,
+                                         reinterpret_cast<const uint8_t*>("abc"),
+                                         3,
+                                         true,
+                                         false,
+                                         packet0,
+                                         len0));
+    TEST_ASSERT_TRUE(AudioPacket::encode(1,
+                                         reinterpret_cast<const uint8_t*>("de"),
+                                         2,
+                                         false,
+                                         true,
+                                         packet1,
+                                         len1));
+
+    TEST_ASSERT_EQUAL_UINT32(AudioPacket::kPacketBytes, static_cast<uint32_t>(len0));
+    TEST_ASSERT_EQUAL_UINT32(AudioPacket::kPacketBytes, static_cast<uint32_t>(len1));
+
+    AudioReassembler reassembler;
+    TEST_ASSERT_TRUE(reassembler.acceptPacket(packet0, len0));
+    TEST_ASSERT_TRUE(reassembler.acceptPacket(packet1, len1));
+
+    TEST_ASSERT_TRUE(reassembler.started());
+    TEST_ASSERT_TRUE(reassembler.complete());
+    TEST_ASSERT_EQUAL_UINT16(2, reassembler.nextSequence());
+    assertBytes(reassembler.audio(), {'a', 'b', 'c', 'd', 'e'});
+}
+
+void test_readOnePacket_returns_false_when_no_pending_data(void)
+{
+    FakeHal hal;
+    Nrf24 radio(hal);
+    radio.setStaticPayloadSize(4);
+
+    hal.regs[0x07] &= static_cast<uint8_t>(~(1 << 6)); // RX_DR clear
+    hal.regs[0x17] |= 0x01;                            // RX_EMPTY set
+
+    uint8_t out[4] = {};
+    size_t out_len = 0;
+
+    TEST_ASSERT_FALSE(radio.readOnePacket(out, sizeof(out), out_len));
+    TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(out_len));
+}
+
+void test_radioManager_receivePayload_without_data_sets_fault(void)
+{
+    FakeHal hal;
+    Nrf24 radio(hal);
+    radio.setStaticPayloadSize(4);
+    RadioManager manager(radio);
+
+    hal.regs[0x07] &= static_cast<uint8_t>(~(1 << 6)); // RX_DR clear
+    hal.regs[0x17] |= 0x01;                            // RX_EMPTY set
+
+    uint8_t out[4] = {};
+    size_t out_len = 0;
+
+    TEST_ASSERT_FALSE(manager.receivePayload(out, sizeof(out), out_len));
+
+    const RadioStatus status = manager.status();
+    TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(out_len));
+    TEST_ASSERT_EQUAL(static_cast<int>(RadioState::Fault), static_cast<int>(status.state));
+    TEST_ASSERT_EQUAL_INT(4, status.last_fault);
+}
+
+void test_transmitOnce_timeout_without_irq_returns_false_and_sets_timeout(void)
+{
+    TimeoutHal hal;
+    hal.irq_connected = false;
+    hal.now_step_us = 200;
+
+    Nrf24 radio(hal);
+    const uint8_t payload[] = {0x11, 0x22, 0x33};
+
+    const bool ok = radio.transmitOnce(payload, sizeof(payload), 1000);
+
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_EQUAL(2, hal.tx_trigger_count);
+    TEST_ASSERT_TRUE(radio.lastTxTimedOut());
+    TEST_ASSERT_FALSE(radio.lastTxSawIrq());
+    TEST_ASSERT_TRUE(hal.tx_fifo.empty());
+}
+
+void test_radioManager_boot_probe_failure_sets_fault_code_1(void)
+{
+    ProbeFailHal hal;
+    hal.regs[0x05] = 76;
+
+    Nrf24 radio(hal);
+    RadioManager manager(radio);
+
+    const bool ok = manager.boot(40);
+    const RadioStatus status = manager.status();
+
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_EQUAL(static_cast<int>(RadioState::Fault), static_cast<int>(status.state));
+    TEST_ASSERT_EQUAL_INT(1, status.last_fault);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -688,5 +872,12 @@ int main(void)
     RUN_TEST(test_readOnePacket_reads_fifo_backlog_even_if_rx_dr_is_clear);
     RUN_TEST(test_radioManager_hasPendingRx_reports_fifo_backlog_even_after_irq_clear);
     RUN_TEST(test_radioManager_receivePayload_reads_fifo_backlog_after_irq_clear);
+    RUN_TEST(test_audioPacket_decode_accepts_every_valid_audio_len_as_padded_packet);
+    RUN_TEST(test_audioPacket_decode_rejects_zero_audio_len);
+    RUN_TEST(test_audioReassembler_accepts_padded_packets_in_order);
+    RUN_TEST(test_readOnePacket_returns_false_when_no_pending_data);
+    RUN_TEST(test_radioManager_receivePayload_without_data_sets_fault);
+    RUN_TEST(test_transmitOnce_timeout_without_irq_returns_false_and_sets_timeout);
+    RUN_TEST(test_radioManager_boot_probe_failure_sets_fault_code_1);
     return UNITY_END();
 }
