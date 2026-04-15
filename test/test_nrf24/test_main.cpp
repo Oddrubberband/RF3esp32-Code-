@@ -13,6 +13,7 @@
 #include "nrf24.hpp"
 #include "radio_manager.hpp"
 #include "validation.hpp"
+#include "stream_sync.hpp"
 
 void setUp(void)
 {
@@ -833,6 +834,259 @@ void test_radioManager_boot_probe_failure_sets_fault_code_1(void)
     TEST_ASSERT_EQUAL_INT(1, status.last_fault);
 }
 
+void test_streamSync_start_round_trip(void)
+{
+    uint8_t packet[AudioPacket::kPacketBytes] = {};
+    size_t packet_len = 0;
+
+    TEST_ASSERT_TRUE(StreamSync::encodeStart(0x1234, packet, packet_len));
+    TEST_ASSERT_EQUAL_UINT32(AudioPacket::kPacketBytes, static_cast<uint32_t>(packet_len));
+
+    StreamSync::ControlFrame frame;
+    TEST_ASSERT_TRUE(StreamSync::decodeStart(packet, packet_len, frame));
+    TEST_ASSERT_EQUAL_UINT16(0x1234, frame.stream_id);
+}
+
+void test_streamSync_stop_round_trip(void)
+{
+    uint8_t packet[AudioPacket::kPacketBytes] = {};
+    size_t packet_len = 0;
+
+    TEST_ASSERT_TRUE(StreamSync::encodeStop(0x4321, packet, packet_len));
+    TEST_ASSERT_EQUAL_UINT32(AudioPacket::kPacketBytes, static_cast<uint32_t>(packet_len));
+
+    StreamSync::ControlFrame frame;
+    TEST_ASSERT_TRUE(StreamSync::decodeStop(packet, packet_len, frame));
+    TEST_ASSERT_EQUAL_UINT16(0x4321, frame.stream_id);
+}
+
+void test_streamSync_gate_ignores_nonzero_audio_before_sync(void)
+{
+    uint8_t packet[AudioPacket::kPacketBytes] = {};
+    size_t packet_len = 0;
+
+    TEST_ASSERT_TRUE(AudioPacket::encode(1,
+                                         reinterpret_cast<const uint8_t*>("abc"),
+                                         3,
+                                         false,
+                                         false,
+                                         packet,
+                                         packet_len));
+
+    StreamSync::ReceiverGate gate;
+    AudioPacket::Header header{};
+    const uint8_t* audio = nullptr;
+
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::Ignore),
+                      static_cast<int>(gate.accept(packet, packet_len, &header, &audio)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::State::WaitingForStart),
+                      static_cast<int>(gate.state()));
+}
+
+void test_streamSync_gate_accepts_legacy_seq0_without_start(void)
+{
+    uint8_t packet[AudioPacket::kPacketBytes] = {};
+    size_t packet_len = 0;
+
+    TEST_ASSERT_TRUE(AudioPacket::encode(0,
+                                         reinterpret_cast<const uint8_t*>("abc"),
+                                         3,
+                                         true,
+                                         false,
+                                         packet,
+                                         packet_len));
+
+    StreamSync::ReceiverGate gate;
+    AudioPacket::Header header{};
+    const uint8_t* audio = nullptr;
+
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::AudioAccepted),
+                      static_cast<int>(gate.accept(packet, packet_len, &header, &audio)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::State::Streaming),
+                      static_cast<int>(gate.state()));
+    TEST_ASSERT_EQUAL_UINT16(0, header.sequence);
+    TEST_ASSERT_EQUAL_UINT8(3, header.audio_len);
+}
+
+void test_streamSync_gate_accepts_start_then_seq0(void)
+{
+    uint8_t start_packet[AudioPacket::kPacketBytes] = {};
+    size_t start_len = 0;
+    TEST_ASSERT_TRUE(StreamSync::encodeStart(7, start_packet, start_len));
+
+    uint8_t audio_packet[AudioPacket::kPacketBytes] = {};
+    size_t audio_len = 0;
+    TEST_ASSERT_TRUE(AudioPacket::encode(0,
+                                         reinterpret_cast<const uint8_t*>("abc"),
+                                         3,
+                                         true,
+                                         false,
+                                         audio_packet,
+                                         audio_len));
+
+    StreamSync::ReceiverGate gate;
+    AudioPacket::Header header{};
+    const uint8_t* audio = nullptr;
+
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::StartAccepted),
+                      static_cast<int>(gate.accept(start_packet, start_len)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::State::WaitingForSeq0),
+                      static_cast<int>(gate.state()));
+    TEST_ASSERT_EQUAL_UINT16(7, gate.currentStreamId());
+
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::AudioAccepted),
+                      static_cast<int>(gate.accept(audio_packet, audio_len, &header, &audio)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::State::Streaming),
+                      static_cast<int>(gate.state()));
+    TEST_ASSERT_EQUAL_UINT16(0, header.sequence);
+    TEST_ASSERT_EQUAL_UINT8(3, header.audio_len);
+}
+
+void test_streamSync_gate_ignores_packet_one_until_seq0_arrives(void)
+{
+    uint8_t start_packet[AudioPacket::kPacketBytes] = {};
+    size_t start_len = 0;
+    TEST_ASSERT_TRUE(StreamSync::encodeStart(8, start_packet, start_len));
+
+    uint8_t packet1[AudioPacket::kPacketBytes] = {};
+    size_t packet1_len = 0;
+    TEST_ASSERT_TRUE(AudioPacket::encode(1,
+                                         reinterpret_cast<const uint8_t*>("def"),
+                                         3,
+                                         false,
+                                         false,
+                                         packet1,
+                                         packet1_len));
+
+    uint8_t packet0[AudioPacket::kPacketBytes] = {};
+    size_t packet0_len = 0;
+    TEST_ASSERT_TRUE(AudioPacket::encode(0,
+                                         reinterpret_cast<const uint8_t*>("abc"),
+                                         3,
+                                         true,
+                                         false,
+                                         packet0,
+                                         packet0_len));
+
+    StreamSync::ReceiverGate gate;
+
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::StartAccepted),
+                      static_cast<int>(gate.accept(start_packet, start_len)));
+
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::Ignore),
+                      static_cast<int>(gate.accept(packet1, packet1_len)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::State::WaitingForSeq0),
+                      static_cast<int>(gate.state()));
+
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::AudioAccepted),
+                      static_cast<int>(gate.accept(packet0, packet0_len)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::State::Streaming),
+                      static_cast<int>(gate.state()));
+}
+
+void test_streamSync_gate_ignores_duplicate_seq0_after_stream_starts(void)
+{
+    uint8_t start_packet[AudioPacket::kPacketBytes] = {};
+    size_t start_len = 0;
+    TEST_ASSERT_TRUE(StreamSync::encodeStart(9, start_packet, start_len));
+
+    uint8_t packet0[AudioPacket::kPacketBytes] = {};
+    size_t packet0_len = 0;
+    TEST_ASSERT_TRUE(AudioPacket::encode(0,
+                                         reinterpret_cast<const uint8_t*>("abc"),
+                                         3,
+                                         true,
+                                         false,
+                                         packet0,
+                                         packet0_len));
+
+    StreamSync::ReceiverGate gate;
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::StartAccepted),
+                      static_cast<int>(gate.accept(start_packet, start_len)));
+
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::AudioAccepted),
+                      static_cast<int>(gate.accept(packet0, packet0_len)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::Ignore),
+                      static_cast<int>(gate.accept(packet0, packet0_len)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::State::Streaming),
+                      static_cast<int>(gate.state()));
+}
+
+void test_streamSync_gate_new_start_resets_current_stream(void)
+{
+    uint8_t start_a[AudioPacket::kPacketBytes] = {};
+    size_t start_a_len = 0;
+    TEST_ASSERT_TRUE(StreamSync::encodeStart(10, start_a, start_a_len));
+
+    uint8_t packet0[AudioPacket::kPacketBytes] = {};
+    size_t packet0_len = 0;
+    TEST_ASSERT_TRUE(AudioPacket::encode(0,
+                                         reinterpret_cast<const uint8_t*>("abc"),
+                                         3,
+                                         true,
+                                         false,
+                                         packet0,
+                                         packet0_len));
+    uint8_t start_b[AudioPacket::kPacketBytes] = {};
+    size_t start_b_len = 0;
+    TEST_ASSERT_TRUE(StreamSync::encodeStart(11, start_b, start_b_len));
+
+    uint8_t packet1[AudioPacket::kPacketBytes] = {};
+    size_t packet1_len = 0;
+    TEST_ASSERT_TRUE(AudioPacket::encode(1,
+                                         reinterpret_cast<const uint8_t*>("def"),
+                                         3,
+                                         false,
+                                         false,
+                                         packet1,
+                                         packet1_len));
+
+    StreamSync::ReceiverGate gate;
+     TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::StartAccepted),
+                      static_cast<int>(gate.accept(start_a, start_a_len)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::AudioAccepted),
+                      static_cast<int>(gate.accept(packet0, packet0_len)));
+    TEST_ASSERT_EQUAL_UINT16(10, gate.currentStreamId());
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::StartAccepted),
+                      static_cast<int>(gate.accept(start_b, start_b_len)));
+    TEST_ASSERT_EQUAL_UINT16(11, gate.currentStreamId());
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::State::WaitingForSeq0),
+                      static_cast<int>(gate.state()));
+
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::Ignore),
+                      static_cast<int>(gate.accept(packet1, packet1_len)));
+}
+
+void test_streamSync_gate_stop_returns_to_waiting_for_start(void)
+{
+    uint8_t start_packet[AudioPacket::kPacketBytes] = {};
+    size_t start_len = 0;
+    TEST_ASSERT_TRUE(StreamSync::encodeStart(12, start_packet, start_len));
+
+    uint8_t packet0[AudioPacket::kPacketBytes] = {};
+    size_t packet0_len = 0;
+    TEST_ASSERT_TRUE(AudioPacket::encode(0,
+                                         reinterpret_cast<const uint8_t*>("abc"),
+                                         3,
+                                         true,
+                                         false,
+                                         packet0,
+                                         packet0_len));
+    uint8_t stop_packet[AudioPacket::kPacketBytes] = {};
+    size_t stop_len = 0;
+    TEST_ASSERT_TRUE(StreamSync::encodeStop(12, stop_packet, stop_len));
+
+    StreamSync::ReceiverGate gate;
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::StartAccepted),
+                      static_cast<int>(gate.accept(start_packet, start_len)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::AudioAccepted),
+                      static_cast<int>(gate.accept(packet0, packet0_len)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::Action::StopAccepted),
+                      static_cast<int>(gate.accept(stop_packet, stop_len)));
+    TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::State::WaitingForStart),
+                      static_cast<int>(gate.state()));
+}                 
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -879,5 +1133,14 @@ int main(void)
     RUN_TEST(test_radioManager_receivePayload_without_data_sets_fault);
     RUN_TEST(test_transmitOnce_timeout_without_irq_returns_false_and_sets_timeout);
     RUN_TEST(test_radioManager_boot_probe_failure_sets_fault_code_1);
+    RUN_TEST(test_streamSync_start_round_trip);
+    RUN_TEST(test_streamSync_stop_round_trip);
+    RUN_TEST(test_streamSync_gate_ignores_nonzero_audio_before_sync);
+    RUN_TEST(test_streamSync_gate_accepts_legacy_seq0_without_start);
+    RUN_TEST(test_streamSync_gate_accepts_start_then_seq0);
+    RUN_TEST(test_streamSync_gate_ignores_packet_one_until_seq0_arrives);
+    RUN_TEST(test_streamSync_gate_ignores_duplicate_seq0_after_stream_starts);
+    RUN_TEST(test_streamSync_gate_new_start_resets_current_stream);
+    RUN_TEST(test_streamSync_gate_stop_returns_to_waiting_for_start);
     return UNITY_END();
 }

@@ -24,6 +24,7 @@
 #include "nrf24.hpp"
 #include "radio_manager.hpp"
 #include "validation.hpp"
+#include "stream_sync.hpp"
 
 // main.cpp owns the top-level demo flow:
 // - mount the Serial Peripheral Interface Flash File System (SPIFFS) partition
@@ -402,6 +403,47 @@ bool sendU8Song(RadioManager& manager,
         return false;
     }
 
+    static uint16_t next_stream_id = 0;
+    next_stream_id = static_cast<uint16_t>(next_stream_id + 1u);
+    if (next_stream_id == 0) {
+        next_stream_id = 1;
+    }
+    const uint16_t stream_id = next_stream_id;
+
+    uint8_t control_packet[AudioPacket::kPacketBytes] = {};
+    size_t control_len = 0;
+    if (!StreamSync::encodeStart(stream_id, control_packet, control_len)) {
+        std::fclose(fp);
+        ESP_LOGE(TAG, "Failed to build START packet for stream %u", stream_id);
+        return false;
+    }
+
+    for (uint8_t i = 0; i < StreamSync::kRecommendedStartRepeats; ++i) {
+        if (stop_requested && *stop_requested) {
+            std::fclose(fp);
+            ESP_LOGI(TAG, "Stopped TX before audio start for stream %u", stream_id);
+            return false;
+        }
+
+        if (!manager.sendPayload(control_packet, control_len)) {
+            std::fclose(fp);
+            const RadioStatus status = manager.status();
+            ESP_LOGE(TAG,
+                     "START transmit failed for stream %u, STATUS=0x%02X FIFO=0x%02X OBSERVE_TX=0x%02X",
+                     stream_id,
+                     static_cast<unsigned>(status.last_status),
+                     static_cast<unsigned>(status.last_fifo_status),
+                     static_cast<unsigned>(status.last_observe_tx));
+            return false;
+        }
+
+        if ((i + 1) < StreamSync::kRecommendedStartRepeats) {
+            delayAtLeastMs(StreamSync::kRecommendedStartGapMs);
+        }
+    }
+
+    delayAtLeastMs(StreamSync::kRecommendedPostStartGapMs);
+
     uint8_t audio_chunk[AudioPacket::kAudioBytesPerPacket];
     uint8_t packet[AudioPacket::kPacketBytes];
     uint16_t sequence = 0;
@@ -410,7 +452,7 @@ bool sendU8Song(RadioManager& manager,
     while (true) {
         if (stop_requested && *stop_requested) {
             std::fclose(fp);
-            ESP_LOGI(TAG, "Stopped TX at packet %u", sequence);
+            ESP_LOGI(TAG, "Stopped TX at packet %u for stream %u", sequence, stream_id);
             return false;
         }
 
@@ -452,6 +494,31 @@ bool sendU8Song(RadioManager& manager,
             return false;
         }
 
+        if (sequence == 0) {
+            if (stop_requested && *stop_requested) {
+                std::fclose(fp);
+                ESP_LOGI(TAG, "Stopped TX during sequence 0 duplication for stream %u", stream_id);
+                return false;
+            }
+
+            uint8_t duplicate_packet[AudioPacket::kPacketBytes];
+            std::copy(packet, packet + AudioPacket::kPacketBytes, duplicate_packet);
+            duplicate_packet[AudioPacket::kPacketBytes - 1] ^= 0xA5;
+
+            delayAtLeastMs(StreamSync::kRecommendedSeq0DuplicateGapMs);
+
+            if (!manager.sendPayload(duplicate_packet, AudioPacket::kPacketBytes)) {
+                std::fclose(fp);
+                const RadioStatus status = manager.status();
+                ESP_LOGE(TAG,
+                         "Sequence 0 duplicate failed, STATUS=0x%02X FIFO=0x%02X OBSERVE_TX=0x%02X",
+                         static_cast<unsigned>(status.last_status),
+                         static_cast<unsigned>(status.last_fifo_status),
+                         static_cast<unsigned>(status.last_observe_tx));
+                return false;
+            }
+        }
+
         ++sequence;
 
         const uint32_t chunk_total_us =
@@ -468,8 +535,12 @@ bool sendU8Song(RadioManager& manager,
         }
     }
 
+    if (StreamSync::encodeStop(stream_id, control_packet, control_len)) {
+        (void)manager.sendPayload(control_packet, control_len);
+    }
+
     std::fclose(fp);
-    ESP_LOGI(TAG, "Finished sending %u packets", sequence);
+    ESP_LOGI(TAG, "Finished sending %u packets for stream %u", sequence, stream_id);
     return true;
 }
 
@@ -1264,7 +1335,7 @@ private:
         carrier_event_count_ = 0;
         decoded_rx_packet_count_ = 0;
         raw_rx_packet_count_ = 0;
-
+        sync_gate_.reset();
         std::printf("RX listening on channel %u\n", static_cast<unsigned>(status.channel));
         return true;
     }
@@ -1823,24 +1894,41 @@ private:
     }
 
     void logRxPacket(const uint8_t* payload, size_t len)
-    {
-        // Receive (RX) logging tries to interpret the bytes as the project's
-        // packet format first, then falls back to reporting a raw fixed-width
-        // frame.
-        AudioPacket::Header header{};
-        const uint8_t* audio = nullptr;
-        if (AudioPacket::decode(payload, len, header, audio)) {
+{
+    AudioPacket::Header header{};
+    const uint8_t* audio = nullptr;
+
+    switch (sync_gate_.accept(payload, len, &header, &audio)) {
+        case StreamSync::ReceiverGate::Action::StartAccepted:
+            ESP_LOGI(TAG, "RX START stream=%u",
+                     static_cast<unsigned>(sync_gate_.currentStreamId()));
+            return;
+        case StreamSync::ReceiverGate::Action::StopAccepted:
+            ESP_LOGI(TAG, "RX STOP");
+            return;
+
+        case StreamSync::ReceiverGate::Action::AudioAccepted:
             ++decoded_rx_packet_count_;
-            ESP_LOGI(TAG, "RX packet seq=%u audio=%u flags=0x%02X",
+            ESP_LOGI(TAG,
+                     "RX packet stream=%u seq=%u audio=%u flags=0x%02X",
+                     static_cast<unsigned>(sync_gate_.currentStreamId()),
                      static_cast<unsigned>(header.sequence),
                      static_cast<unsigned>(header.audio_len),
                      static_cast<unsigned>(header.flags));
             return;
-        }
+            case StreamSync::ReceiverGate::Action::Ignore:
+            ++raw_rx_packet_count_;
+            ESP_LOGI(TAG, "RX packet ignored while waiting for sync");
+            return;
 
-        ++raw_rx_packet_count_;
-        ESP_LOGI(TAG, "RX payload len=%u (fixed-width frame)", static_cast<unsigned>(len));
+        case StreamSync::ReceiverGate::Action::Invalid:
+        default:
+            ++raw_rx_packet_count_;
+            ESP_LOGI(TAG, "RX payload len=%u (unrecognized frame)",
+                     static_cast<unsigned>(len));
+            return;
     }
+}
 
     void rxTask()
     {
