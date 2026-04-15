@@ -40,6 +40,7 @@ constexpr const char* TAG = "APP";
 // 8 kHz, so one byte is consumed per sample.
 constexpr uint32_t kSampleRateHz = 8000;
 constexpr uint32_t kAudioBytesPerSecond = kSampleRateHz;
+constexpr uint32_t kSampleBytePeriodUs = 1000000u / kSampleRateHz;
 // Packet rate is derived from the packet payload budget.
 constexpr uint32_t kPacketsPerSecond =
     (kAudioBytesPerSecond + AudioPacket::kAudioBytesPerPacket - 1) /
@@ -54,13 +55,16 @@ constexpr uint8_t kDefaultMorsePowerLevel = 3;
 constexpr TickType_t kLoopWorkerPeriod = pdMS_TO_TICKS(20);
 constexpr TickType_t kLoopStopPollPeriod = pdMS_TO_TICKS(20);
 constexpr TickType_t kLoopStopTimeout = pdMS_TO_TICKS(2000);
-constexpr TickType_t kRxPollPeriod = pdMS_TO_TICKS(20);
+// The nRF24 RX FIFO is only three packets deep, so polling much slower than
+// the packet cadence will overrun the queue during live audio traffic.
+constexpr TickType_t kRxPollPeriod = pdMS_TO_TICKS(2) > 0 ? pdMS_TO_TICKS(2) : 1;
 constexpr size_t kConsoleLineBytes = 160;
 
 // These compile-time checks keep the audio format aligned with nRF24 hardware
 // limits instead of failing later at runtime.
 static_assert(AudioPacket::kPacketBytes <= 32, "nRF24 payload limit exceeded");
 static_assert(kPayloadBitsPerSecond < 250000, "Audio stream exceeds the nRF24 250 kbps mode");
+static_assert((1000000u % kSampleRateHz) == 0, "Sample timing must be an integer number of microseconds");
 
 struct TrackInfo {
     std::string name;
@@ -392,11 +396,6 @@ bool sendU8Song(RadioManager& manager,
                 const char* path,
                 const volatile bool* stop_requested = nullptr)
 {
-    // Stream one audio file to the radio by:
-    // 1. reading fixed-size chunks from SPIFFS
-// 2. wrapping each chunk in the AudioPacket format
-// 3. sending each packet through RadioManager
-// 4. delaying long enough to preserve the original sample timing
     std::FILE* fp = std::fopen(path, "rb");
     if (!fp) {
         ESP_LOGE(TAG, "Could not open %s. Use the Prepare Demo Audio task and upload the filesystem image.", path);
@@ -406,6 +405,7 @@ bool sendU8Song(RadioManager& manager,
     uint8_t audio_chunk[AudioPacket::kAudioBytesPerPacket];
     uint8_t packet[AudioPacket::kPacketBytes];
     uint16_t sequence = 0;
+    uint32_t pacing_remainder_us = 0;
 
     while (true) {
         if (stop_requested && *stop_requested) {
@@ -414,8 +414,6 @@ bool sendU8Song(RadioManager& manager,
             return false;
         }
 
-        // Read one packet's worth of pulse-code modulation (PCM) data from
-        // disk.
         const size_t bytes_read =
             std::fread(audio_chunk, 1, AudioPacket::kAudioBytesPerPacket, fp);
         if (bytes_read == 0) {
@@ -423,9 +421,10 @@ bool sendU8Song(RadioManager& manager,
         }
 
         size_t packet_len = 0;
-        // A short read means we reached the tail of the file and should mark
-        // the packet as the final one in the stream.
         const bool is_last = bytes_read < AudioPacket::kAudioBytesPerPacket;
+
+        std::fill(packet, packet + AudioPacket::kPacketBytes, 0);
+
         if (!AudioPacket::encode(sequence,
                                  audio_chunk,
                                  bytes_read,
@@ -438,7 +437,7 @@ bool sendU8Song(RadioManager& manager,
             return false;
         }
 
-        if (!manager.sendPayload(packet, packet_len)) {
+        if (!manager.sendPayload(packet, AudioPacket::kPacketBytes)) {
             std::fclose(fp);
             const RadioStatus status = manager.status();
             ESP_LOGE(TAG,
@@ -454,10 +453,15 @@ bool sendU8Song(RadioManager& manager,
         }
 
         ++sequence;
-        // Rate-limit transmission so the receiver sees roughly real-time audio
-        // pacing instead of a burst of packets all at once.
-        const uint32_t chunk_ms = static_cast<uint32_t>((bytes_read * 1000u) / kSampleRateHz);
-        vTaskDelay(pdMS_TO_TICKS(chunk_ms > 0 ? chunk_ms : 1));
+
+        const uint32_t chunk_total_us =
+            static_cast<uint32_t>(bytes_read) * 125u + pacing_remainder_us;
+        const uint32_t chunk_ms = chunk_total_us / 1000u;
+        pacing_remainder_us = chunk_total_us % 1000u;
+
+        if (chunk_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(chunk_ms));
+        }
 
         if (is_last) {
             break;
@@ -1843,6 +1847,7 @@ private:
         // This background task is intentionally conservative:
         // - it tries to grab the mutex briefly
         // - it only touches the radio when receive (RX) mode is active
+        // - it drains any queued packets before releasing the radio again
         // - it logs received packets but does not otherwise mutate app state
         std::array<uint8_t, AudioPacket::kPacketBytes> payload{};
 
@@ -1859,7 +1864,7 @@ private:
                     }
                     last_carrier_detected_ = snapshot.carrier_detected;
 
-                    if (manager_.hasPendingRx()) {
+                    while (manager_.hasPendingRx()) {
                         size_t out_len = 0;
                         if (manager_.receivePayload(payload.data(), payload.size(), out_len)) {
                             logRxPacket(payload.data(), out_len);
@@ -1868,6 +1873,7 @@ private:
                             ESP_LOGW(TAG, "RX read failed, state=%s fault=%d",
                                      RadioManager::stateName(status.state),
                                      status.last_fault);
+                            break;
                         }
                     }
                 } else {

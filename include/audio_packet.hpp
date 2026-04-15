@@ -31,9 +31,12 @@ struct Header {
 // format.
 //
 // The caller provides one slice of audio and two framing booleans. The function
-// writes the packed packet into out_packet and reports how many bytes are valid.
-// The output length may be less than 32 because the final packet is allowed to
-// carry a partial audio chunk.
+// writes the packed packet into out_packet and reports how many bytes should be
+// sent over the radio.
+//
+// The firmware uses fixed-width nRF24 payloads, so every encoded packet
+// occupies the full 32-byte on-air frame. The header's audio_len field tells
+// the receiver how many of the trailing bytes are meaningful PCM data.
 bool encode(uint16_t sequence,
             const uint8_t* audio,
             size_t audio_len,
@@ -46,7 +49,8 @@ bool encode(uint16_t sequence,
 //
 // This validates the packet shape before exposing the payload pointer so higher
 // layers can safely append the recovered pulse-code modulation (PCM) bytes to a
-// reassembly buffer.
+// reassembly buffer. Both compact packets and fixed-width padded packets are
+// accepted so host-side tests and radio reads can use the same decoder.
 bool decode(const uint8_t* packet,
             size_t packet_len,
             Header& out_header,

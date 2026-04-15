@@ -106,10 +106,11 @@ bool RadioManager::leaveRx()
 
 bool RadioManager::hasPendingRx()
 {
-    // Mirror the latest STATUS register back into the public status snapshot so
-    // STATUS output remains informative even when no payload is read.
     status_.last_status = radio_.getStatus();
-    return (status_.last_status & (1 << 6)) != 0;
+    status_.last_fifo_status = radio_.readReg(0x17);
+
+    return (status_.last_status & (1 << 6)) != 0 ||
+           (status_.last_fifo_status & 0x01) == 0;
 }
 
 bool RadioManager::sendPayload(const uint8_t* payload, size_t len)
@@ -150,18 +151,19 @@ bool RadioManager::receivePayload(uint8_t* out, size_t capacity, size_t& outLen)
 {
     outLen = 0;
 
-    // Successful reads keep the manager in receive (RX) mode so callers can
-    // continue polling.
     if (radio_.readOnePacket(out, capacity, outLen)) {
         status_.last_rx_len = outLen;
         ++status_.rx_packets;
         status_.last_status = radio_.getStatus();
+        status_.last_fifo_status = radio_.readReg(0x17);
         status_.state = RadioState::RxListening;
         return true;
     }
 
     status_.state = RadioState::Fault;
-    status_.last_fault = 4;  // Receive (RX) read failed while data was expected.
+    status_.last_fault = 4;
+    status_.last_status = radio_.getStatus();
+    status_.last_fifo_status = radio_.readReg(0x17);
     return false;
 }
 

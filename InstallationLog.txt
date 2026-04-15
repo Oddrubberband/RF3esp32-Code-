@@ -1,0 +1,63 @@
+************************************* Invoked: Tue Apr 14 22:08:22 2026
+[0] Arguments: C:\Users\dman2\AppData\Local\Temp\WinGet\MSYS2.MSYS2.20251213\msys2-x86_64-20251213.exe, install, --confirm-command, --root, C:\msys64
+[12] Operations sanity check succeeded.
+[56] Using metadata cache from "C:/Users/dman2/AppData/Local/cache\\qt-installer-framework\\d75f1c19-3379-3717-ae8d-1404b51494a9"
+[56] Found 0 cached items.
+[63] Loaded control script ":/metadata/installer-config/control_js"
+[64] TargetDirectoryInUse : Error : The directory you selected already exists and contains an installation. Choose a different target for installation.
+************************************* Invoked: Tue Apr 14 22:09:11 2026
+[0] Arguments: C:\Users\dman2\AppData\Local\Temp\WinGet\MSYS2.MSYS2.20251213\msys2-x86_64-20251213.exe, install, --confirm-command, --root, C:\msys64
+[6] Operations sanity check succeeded.
+[10] Using metadata cache from "C:/Users/dman2/AppData/Local/cache\\qt-installer-framework\\d75f1c19-3379-3717-ae8d-1404b51494a9"
+[10] Found 0 cached items.
+[14] Loaded control script ":/metadata/installer-config/control_js"
+[15] TargetDirectoryInUse : Error : The directory you selected already exists and contains an installation. Choose a different target for installation.
+************************************* Invoked: Tue Apr 14 22:10:59 2026
+[0] Arguments: C:\Users\dman2\AppData\Local\Temp\WinGet\MSYS2.MSYS2.20251213\msys2-x86_64-20251213.exe, install, --confirm-command, --accept-messages, --accept-licenses, --root, C:\msys64, -d
+[0] Resource tree:
+[1]      :/qt
+[1]      :/qt/etc
+[2]      :/qt/etc/qt.conf
+[2]      :/uninstall.png
+[2]      :/search@2x.png
+[2]      :/installer.png
+[2]      :/installer.ico
+[2]      :/keepinstalled.png
+[2]      :/Notification-Type@2x.png
+[2]      :/installer.icns
+[2]      :/search.png
+[2]      :/install.png
+[2]      :/keepuninstalled.png
+[2]      :/Notification-Type.png
+[9]      :/qpdf
+[9]      :/qpdf/sRGB2014.icc
+[21] Operations sanity check succeeded.
+[27] Using metadata cache from "C:/Users/dman2/AppData/Local/cache\\qt-installer-framework\\d75f1c19-3379-3717-ae8d-1404b51494a9"
+[27] Found 0 cached items.
+[56] Loaded control script ":/metadata/installer-config/control_js"
+[57] TargetDirectoryInUse : Error : The directory you selected already exists and contains an installation. Choose a different target for installation.
+[57] Answer: "Ok"
+************************************* Invoked: Tue Apr 14 22:12:41 2026
+[0] Arguments: C:\Users\dman2\AppData\Local\Temp\WinGet\MSYS2.MSYS2.20251213\msys2-x86_64-20251213.exe, update, --confirm-command, --accept-messages, --accept-licenses, --root, C:\msys64, -d
+[1] Resource tree:
+[2]      :/qt
+[2]      :/qt/etc
+[2]      :/qt/etc/qt.conf
+[2]      :/uninstall.png
+[2]      :/search@2x.png
+[2]      :/installer.png
+[2]      :/installer.ico
+[2]      :/keepinstalled.png
+[2]      :/Notification-Type@2x.png
+[2]      :/installer.icns
+[2]      :/search.png
+[2]      :/install.png
+[2]      :/keepuninstalled.png
+[2]      :/Notification-Type.png
+[8]      :/qpdf
+[8]      :/qpdf/sRGB2014.icc
+[25] Operations sanity check succeeded.
+[32] Using metadata cache from "C:/Users/dman2/AppData/Local/cache\\qt-installer-framework\\d75f1c19-3379-3717-ae8d-1404b51494a9"
+[32] Found 0 cached items.
+[57] Loaded control script ":/metadata/installer-config/control_js"
+[57] Warning: Cannot update packages with installer.

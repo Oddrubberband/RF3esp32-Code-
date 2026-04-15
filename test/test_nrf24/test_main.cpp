@@ -66,7 +66,10 @@ void test_audioPacket_encode_decode_round_trip(void)
 
     const bool encoded = AudioPacket::encode(7, audio, sizeof(audio), true, false, packet, packet_len);
     TEST_ASSERT_TRUE(encoded);
-    TEST_ASSERT_EQUAL_UINT32(AudioPacket::kHeaderBytes + sizeof(audio), static_cast<uint32_t>(packet_len));
+    TEST_ASSERT_EQUAL_UINT32(AudioPacket::kPacketBytes, static_cast<uint32_t>(packet_len));
+    for (size_t i = AudioPacket::kHeaderBytes + sizeof(audio); i < AudioPacket::kPacketBytes; ++i) {
+        TEST_ASSERT_EQUAL_UINT8(0, packet[i]);
+    }
 
     AudioPacket::Header header;
     const uint8_t* decoded_audio = nullptr;
@@ -182,6 +185,7 @@ void test_initDefaults_programs_expected_registers(void)
     TEST_ASSERT_EQUAL_UINT8(0x00, hal.regs[0x04]);
     TEST_ASSERT_EQUAL_UINT8(0x01, hal.regs[0x02]);
     TEST_ASSERT_EQUAL_UINT8(40, hal.regs[0x05]);
+    TEST_ASSERT_EQUAL_UINT8(0x26, hal.regs[0x06]);
     TEST_ASSERT_EQUAL_UINT8(32, hal.regs[0x11]);
     TEST_ASSERT_FALSE(hal.ce_level);
 }
@@ -267,8 +271,37 @@ void test_readOnePacket_reads_payload_and_clears_rx_flag(void)
     TEST_ASSERT_EQUAL_UINT8(0x20, out[1]);
     TEST_ASSERT_EQUAL_UINT8(0x30, out[2]);
     TEST_ASSERT_EQUAL_UINT8(0x40, out[3]);
-    TEST_ASSERT_TRUE(hal.rx_fifo.empty());
+    TEST_ASSERT_TRUE(hal.rx_fifo_packets.empty());
     TEST_ASSERT_EQUAL_UINT8(0, static_cast<uint8_t>(hal.regs[0x07] & (1 << 6)));
+}
+
+void test_readOnePacket_preserves_following_rx_payloads(void)
+{
+    FakeHal hal;
+    Nrf24 radio(hal);
+    radio.setStaticPayloadSize(4);
+    hal.queueRxPayload({0x10, 0x20, 0x30, 0x40});
+    hal.queueRxPayload({0x50, 0x60, 0x70, 0x80});
+
+    uint8_t out[4] = {};
+    size_t out_len = 0;
+
+    TEST_ASSERT_TRUE(radio.readOnePacket(out, sizeof(out), out_len));
+    TEST_ASSERT_EQUAL_UINT32(4, static_cast<uint32_t>(out_len));
+    TEST_ASSERT_EQUAL_UINT8(0x10, out[0]);
+    TEST_ASSERT_EQUAL_UINT8(0x20, out[1]);
+    TEST_ASSERT_EQUAL_UINT8(0x30, out[2]);
+    TEST_ASSERT_EQUAL_UINT8(0x40, out[3]);
+    TEST_ASSERT_EQUAL(1, static_cast<int>(hal.rx_fifo_packets.size()));
+    TEST_ASSERT_EQUAL_UINT8(0, static_cast<uint8_t>(hal.regs[0x17] & (1 << 0)));
+
+    TEST_ASSERT_TRUE(radio.readOnePacket(out, sizeof(out), out_len));
+    TEST_ASSERT_EQUAL_UINT8(0x50, out[0]);
+    TEST_ASSERT_EQUAL_UINT8(0x60, out[1]);
+    TEST_ASSERT_EQUAL_UINT8(0x70, out[2]);
+    TEST_ASSERT_EQUAL_UINT8(0x80, out[3]);
+    TEST_ASSERT_TRUE(hal.rx_fifo_packets.empty());
+    TEST_ASSERT_TRUE((hal.regs[0x17] & (1 << 0)) != 0);
 }
 
 void test_radioManager_boot_success_transitions_to_standby(void)
@@ -356,6 +389,23 @@ void test_radioManager_receivePayload_updates_rx_length(void)
     TEST_ASSERT_EQUAL(static_cast<int>(RadioState::RxListening), static_cast<int>(status.state));
 }
 
+void test_radioManager_hasPendingRx_reports_fifo_backlog_after_irq_clear(void)
+{
+    FakeHal hal;
+    Nrf24 radio(hal);
+    radio.setStaticPayloadSize(4);
+    RadioManager manager(radio);
+    hal.queueRxPayload({0x21, 0x22, 0x23, 0x24});
+    hal.queueRxPayload({0x31, 0x32, 0x33, 0x34});
+
+    uint8_t out[4] = {};
+    size_t out_len = 0;
+
+    TEST_ASSERT_TRUE(manager.receivePayload(out, sizeof(out), out_len));
+    TEST_ASSERT_EQUAL_UINT8(0, static_cast<uint8_t>(hal.regs[0x07] & (1 << 6)));
+    TEST_ASSERT_TRUE(manager.hasPendingRx());
+}
+
 void test_radioManager_startCw_updates_output_power(void)
 {
     FakeHal hal;
@@ -437,7 +487,7 @@ void test_stopContinuousCarrier_restores_demo_rf_setup(void)
     radio.stopContinuousCarrier();
 
     TEST_ASSERT_FALSE(hal.ce_level);
-    TEST_ASSERT_EQUAL_UINT8(0x06, hal.regs[0x06]);
+    TEST_ASSERT_EQUAL_UINT8(0x26, hal.regs[0x06]);
     TEST_ASSERT_TRUE((hal.regs[0x00] & (1 << 1)) != 0);
 }
 
@@ -451,7 +501,7 @@ void test_startContinuousCarrier_uses_cont_wave_when_supported(void)
 
     TEST_ASSERT_TRUE(hal.ce_level);
     TEST_ASSERT_EQUAL_UINT8(40, hal.regs[0x05]);
-    TEST_ASSERT_EQUAL_UINT8(0x96, hal.regs[0x06]);
+    TEST_ASSERT_EQUAL_UINT8(0xB6, hal.regs[0x06]);
     TEST_ASSERT_TRUE(hal.last_payload_write.empty());
 }
 
@@ -472,7 +522,7 @@ void test_startContinuousCarrier_falls_back_to_payload_reuse_when_needed(void)
 
     TEST_ASSERT_TRUE(hal.ce_level);
     TEST_ASSERT_EQUAL_UINT8(33, hal.regs[0x05]);
-    TEST_ASSERT_EQUAL_UINT8(0x14, hal.regs[0x06]);
+    TEST_ASSERT_EQUAL_UINT8(0x34, hal.regs[0x06]);
     TEST_ASSERT_EQUAL(32, static_cast<int>(hal.last_payload_write.size()));
     TEST_ASSERT_EQUAL(2, hal.tx_trigger_count);
     TEST_ASSERT_TRUE(hal.tx_reuse);
@@ -487,7 +537,7 @@ void test_startContinuousCarrier_falls_back_to_payload_reuse_when_needed(void)
     radio.stopContinuousCarrier();
 
     TEST_ASSERT_FALSE(hal.ce_level);
-    TEST_ASSERT_EQUAL_UINT8(0x06, hal.regs[0x06]);
+    TEST_ASSERT_EQUAL_UINT8(0x26, hal.regs[0x06]);
     TEST_ASSERT_EQUAL_UINT8(1, hal.regs[0x10]);
     TEST_ASSERT_EQUAL_UINT8(2, hal.regs[0x11]);
     TEST_ASSERT_EQUAL_UINT8(3, hal.regs[0x12]);
@@ -513,11 +563,13 @@ int main(void)
     RUN_TEST(test_transmitOnce_failure_clears_fifo_and_returns_false);
     RUN_TEST(test_transmitOnce_without_irq_wire_still_uses_status_polling);
     RUN_TEST(test_readOnePacket_reads_payload_and_clears_rx_flag);
+    RUN_TEST(test_readOnePacket_preserves_following_rx_payloads);
     RUN_TEST(test_radioManager_boot_success_transitions_to_standby);
     RUN_TEST(test_radioManager_boot_invalid_channel_sets_fault_code);
     RUN_TEST(test_radioManager_sendPayload_success_updates_status);
     RUN_TEST(test_radioManager_refreshSnapshot_reports_live_irq_state);
     RUN_TEST(test_radioManager_receivePayload_updates_rx_length);
+    RUN_TEST(test_radioManager_hasPendingRx_reports_fifo_backlog_after_irq_clear);
     RUN_TEST(test_radioManager_startCw_updates_output_power);
     RUN_TEST(test_frame_io_round_trip_preserves_record);
     RUN_TEST(test_validation_rejects_oversized_payload);

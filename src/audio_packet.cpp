@@ -1,8 +1,8 @@
 #include "audio_packet.hpp"
 
-// The implementation here mirrors the compact on-air packet format documented
-// in the header: a tiny fixed header plus a variable-length pulse-code
-// modulation (PCM) body.
+// The implementation here mirrors the on-air packet format documented in the
+// header: a tiny fixed header plus up to 28 meaningful pulse-code modulation
+// (PCM) bytes inside one 32-byte radio payload.
 namespace AudioPacket {
 bool encode(uint16_t sequence,
             const uint8_t* audio,
@@ -18,6 +18,10 @@ bool encode(uint16_t sequence,
 
     if (!audio || !out_packet || audio_len == 0 || audio_len > kAudioBytesPerPacket) {
         return false;
+    }
+
+    for (size_t i = 0; i < kPacketBytes; ++i) {
+        out_packet[i] = 0;
     }
 
     // Header layout is sequence (little-endian), audio length, then bit flags.
@@ -37,7 +41,7 @@ bool encode(uint16_t sequence,
         out_packet[kHeaderBytes + i] = audio[i];
     }
 
-    out_packet_len = kHeaderBytes + audio_len;
+    out_packet_len = kPacketBytes;
     return true;
 }
 
@@ -46,8 +50,6 @@ bool decode(const uint8_t* packet,
             Header& out_header,
             const uint8_t*& out_audio)
 {
-    // Clear the outputs first so callers can safely inspect them only on
-    // success.
     out_audio = nullptr;
     out_header = {};
 
@@ -55,7 +57,6 @@ bool decode(const uint8_t* packet,
         return false;
     }
 
-    // Reject malformed packets before exposing a payload pointer to the caller.
     out_header.sequence = static_cast<uint16_t>(packet[0]) |
                           static_cast<uint16_t>(packet[1] << 8);
     out_header.audio_len = packet[2];
@@ -65,9 +66,12 @@ bool decode(const uint8_t* packet,
         return false;
     }
 
-    // The packet is only valid when the declared audio size matches the actual
-    // number of bytes supplied by the transport.
-    if (packet_len != kHeaderBytes + out_header.audio_len) {
+    const size_t exact_len = kHeaderBytes + out_header.audio_len;
+
+    // Accept either:
+    // 1. an exact-length packet, or
+    // 2. a full fixed-width padded packet
+    if (packet_len != exact_len && packet_len != kPacketBytes) {
         return false;
     }
 

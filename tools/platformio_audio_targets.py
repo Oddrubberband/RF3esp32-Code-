@@ -5,25 +5,32 @@ import subprocess
 
 from SCons.Script import ARGUMENTS
 
-# This helper script teaches PlatformIO about the project's custom audio-prep
-# step. The resulting target shows up in the user interface (UI) as
-# "Prepare Demo Audio".
 PROJECT_DIR = Path(env["PROJECT_DIR"])
 SCRIPT_PATH = PROJECT_DIR / "tools" / "prepare_demo_audio.py"
 PYTHON = env.subst("$PYTHONEXE")
 
 
+def resolve_partitions_path() -> Path:
+    # Keep the audio-fit check aligned with the selected PlatformIO environment.
+    try:
+        configured = env.GetProjectOption("board_build.partitions")
+    except Exception:
+        configured = "partitions.csv"
+
+    if not configured:
+        configured = "partitions.csv"
+
+    return PROJECT_DIR / configured
+
+
 def build_command():
-    # Build the command line for the standalone audio conversion helper. The
-    # command is assembled here so both the default UI flow and optional custom
-    # arguments go through exactly the same path.
     command = [
         PYTHON,
         str(SCRIPT_PATH),
         "--data-dir",
         str(PROJECT_DIR / "data"),
         "--partitions",
-        str(PROJECT_DIR / "partitions.csv"),
+        str(resolve_partitions_path()),
     ]
 
     if ARGUMENTS.get("audio"):
@@ -41,8 +48,6 @@ def build_command():
 
 
 def prepare_demo_audio(source, target, env_):
-    # PlatformIO custom targets execute inside SCons. This function bridges that
-    # world to the normal Python helper script and forwards its exit status.
     print("Preparing demo audio...")
     result = subprocess.run(build_command(), cwd=str(PROJECT_DIR))
     if result.returncode != 0:
@@ -51,8 +56,6 @@ def prepare_demo_audio(source, target, env_):
 
 
 env.AddCustomTarget(
-    # The custom target itself does not depend on normal build outputs; it just
-    # prepares files in data/ for the later SPIFFS image upload.
     name="prepare_demo_audio",
     dependencies=None,
     actions=[prepare_demo_audio],

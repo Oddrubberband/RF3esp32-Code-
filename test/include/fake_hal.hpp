@@ -14,13 +14,14 @@ public:
     FakeHal()
     {
         regs[0x07] = 0x0E;
+        syncFifoStatus();
     }
 
     std::array<uint8_t, 0x20> regs{};
     std::vector<uint8_t> last_tx;
     std::vector<std::vector<uint8_t>> tx_log;
     std::vector<uint8_t> tx_fifo;
-    std::vector<uint8_t> rx_fifo;
+    std::vector<std::vector<uint8_t>> rx_fifo_packets;
     std::vector<uint8_t> last_payload_write;
     bool ce_level = false;
     bool irq_connected = true;
@@ -33,9 +34,37 @@ public:
 
     void loadRxPayload(std::initializer_list<uint8_t> payload)
     {
+        rx_fifo_packets.clear();
+        queueRxPayload(payload);
+    }
+
+    void queueRxPayload(std::initializer_list<uint8_t> payload)
+    {
         // Queue one fixed payload and raise RX_DR so the driver sees data ready.
-        rx_fifo.assign(payload.begin(), payload.end());
+        rx_fifo_packets.emplace_back(payload.begin(), payload.end());
         regs[0x07] |= (1 << 6);
+        syncFifoStatus();
+    }
+
+    void syncFifoStatus()
+    {
+        if (rx_fifo_packets.empty()) {
+            regs[0x17] |= (1 << 0);
+        } else {
+            regs[0x17] &= static_cast<uint8_t>(~(1 << 0));
+        }
+
+        if (tx_fifo.empty()) {
+            regs[0x17] |= (1 << 4);
+        } else {
+            regs[0x17] &= static_cast<uint8_t>(~(1 << 4));
+        }
+
+        if (tx_reuse) {
+            regs[0x17] |= (1 << 6);
+        } else {
+            regs[0x17] &= static_cast<uint8_t>(~(1 << 6));
+        }
     }
 
     void spiTxRx(const uint8_t* tx, uint8_t* rx, size_t n) override
@@ -98,19 +127,26 @@ public:
         switch (cmd) {
             case 0x61:
                 for (size_t i = 1; i < n; ++i) {
-                    if (i - 1 < rx_fifo.size() && rx) {
-                        rx[i] = rx_fifo[i - 1];
+                    if (!rx_fifo_packets.empty() &&
+                        i - 1 < rx_fifo_packets.front().size() &&
+                        rx) {
+                        rx[i] = rx_fifo_packets.front()[i - 1];
                     }
                 }
-                if (!rx_fifo.empty()) {
-                    rx_fifo.clear();
+                if (!rx_fifo_packets.empty()) {
+                    rx_fifo_packets.erase(rx_fifo_packets.begin());
                 }
+                if (rx_fifo_packets.empty()) {
+                    regs[0x07] &= static_cast<uint8_t>(~(1 << 6));
+                }
+                syncFifoStatus();
                 break;
 
             case 0xA0:
                 last_payload_write.assign(tx + 1, tx + n);
                 tx_fifo = last_payload_write;
                 tx_reuse = false;
+                syncFifoStatus();
                 break;
 
             case 0xE3:
@@ -124,16 +160,19 @@ public:
                         regs[0x07] |= (1 << 4);
                     }
                 }
+                syncFifoStatus();
                 break;
 
             case 0xE1:
                 tx_fifo.clear();
                 tx_reuse = false;
+                syncFifoStatus();
                 break;
 
             case 0xE2:
-                rx_fifo.clear();
+                rx_fifo_packets.clear();
                 regs[0x07] &= static_cast<uint8_t>(~(1 << 6));
+                syncFifoStatus();
                 break;
 
             default:
@@ -160,6 +199,7 @@ public:
             } else {
                 regs[0x07] |= (1 << 4);
             }
+            syncFifoStatus();
         }
     }
 

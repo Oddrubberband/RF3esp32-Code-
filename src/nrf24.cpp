@@ -4,6 +4,7 @@
 
 namespace {
 constexpr std::array<uint8_t, 5> kDemoAddress = {0x52, 0x46, 0x33, 0x24, 0x01};
+constexpr uint8_t kDemoRfSetup = 0x26;  // 250 kbps, 0 dBm, LNA enabled.
 }
 
 Nrf24::Nrf24(Nrf24Hal& hal)
@@ -52,7 +53,7 @@ bool Nrf24::initDefaults(uint8_t channel)
     writeReg(0x03, 0x03);
     writeReg(0x04, 0x00);
     writeReg(0x05, channel);
-    writeReg(0x06, 0x06);
+    writeReg(0x06, kDemoRfSetup);
     writeRegs(0x0A, kDemoAddress.data(), kDemoAddress.size());
     writeRegs(0x10, kDemoAddress.data(), kDemoAddress.size());
     writeReg(0x11, static_payload_size_);
@@ -269,7 +270,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
             writeReg(0x03, 0x03);
             writeReg(0x04, 0x00);
             writeReg(0x05, channel);
-            writeReg(0x06, 0x06);
+            writeReg(0x06, kDemoRfSetup);
             writeRegs(0x0A, kDemoAddress.data(), kDemoAddress.size());
             writeRegs(0x10, kDemoAddress.data(), kDemoAddress.size());
             writeReg(0x11, static_payload_size_);
@@ -389,15 +390,13 @@ bool Nrf24::readOnePacket(uint8_t* out, size_t capacity, size_t& outLen)
         return false;
     }
 
-    // The receive-data-ready flag (RX_DR) indicates at least one payload is
-    // waiting in the receive first-in, first-out queue (RX FIFO).
+    // Treat either RX_DR asserted or RX FIFO not empty as pending data.
     const uint8_t status = getStatus();
-    if ((status & (1 << 6)) == 0) {
+    const uint8_t fifo_status = readReg(0x17);
+    if ((status & (1 << 6)) == 0 && (fifo_status & 0x01) != 0) {
         return false;
     }
 
-    // The project currently uses fixed-width payloads, so read the configured
-    // number of bytes.
     uint8_t tx[33] = {0};
     uint8_t rx[33] = {0};
 
@@ -414,7 +413,6 @@ bool Nrf24::readOnePacket(uint8_t* out, size_t capacity, size_t& outLen)
 
     outLen = static_payload_size_;
     clearIrq(true, false, false);
-    flushRx();
     return true;
 }
 
@@ -534,7 +532,7 @@ void Nrf24::stopContinuousCarrier()
     flushTx();
 
     if (!cw_restore_.valid) {
-        writeReg(0x06, 0x06);
+        writeReg(0x06, kDemoRfSetup);
         cw_mode_ = CwMode::None;
         return;
     }
