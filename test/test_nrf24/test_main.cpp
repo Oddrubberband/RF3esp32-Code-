@@ -893,6 +893,24 @@ void test_streamSync_remote_command_rejects_oversized_text(void)
     TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(packet_len));
 }
 
+void test_streamSync_remote_response_round_trip(void)
+{
+    static constexpr char kText[] = "[peer] State=RxListening\n";
+    uint8_t packet[AudioPacket::kPacketBytes] = {};
+    size_t packet_len = 0;
+
+    TEST_ASSERT_TRUE(StreamSync::encodeRemoteResponse(kText,
+                                                      sizeof(kText) - 1,
+                                                      packet,
+                                                      packet_len));
+    TEST_ASSERT_EQUAL_UINT32(AudioPacket::kPacketBytes, static_cast<uint32_t>(packet_len));
+
+    std::string_view text;
+    TEST_ASSERT_TRUE(StreamSync::decodeRemoteResponse(packet, packet_len, text));
+    TEST_ASSERT_EQUAL_UINT32(sizeof(kText) - 1, static_cast<uint32_t>(text.size()));
+    TEST_ASSERT_EQUAL_MEMORY(kText, text.data(), sizeof(kText) - 1);
+}
+
 void test_streamSync_gate_ignores_nonzero_audio_before_sync(void)
 {
     uint8_t packet[AudioPacket::kPacketBytes] = {};

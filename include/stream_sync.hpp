@@ -11,6 +11,7 @@ namespace StreamSync {
 constexpr uint8_t kControlStart = 0x81;
 constexpr uint8_t kControlStop = 0x82;
 constexpr uint8_t kControlRemoteCommand = 0x83;
+constexpr uint8_t kControlRemoteResponse = 0x84;
 
 constexpr uint8_t kMagic0 = 'R';
 constexpr uint8_t kMagic1 = 'F';
@@ -194,6 +195,81 @@ inline bool decodeRemoteCommand(const uint8_t* packet,
     out_command = std::string_view(
         reinterpret_cast<const char*>(packet + kRemoteCommandHeaderBytes),
         command_len);
+    return true;
+}
+
+inline bool encodeRemoteResponse(const char* text,
+                                 size_t text_len,
+                                 uint8_t* out_packet,
+                                 size_t& out_packet_len)
+{
+    out_packet_len = 0;
+
+    if (!text || !out_packet || text_len == 0 || text_len > kRemoteCommandMaxBytes) {
+        return false;
+    }
+
+    clearPacket(out_packet);
+    out_packet[0] = kMagic0;
+    out_packet[1] = kMagic1;
+    out_packet[2] = kMagic2;
+    out_packet[3] = kControlRemoteResponse;
+    out_packet[4] = kVersion;
+    out_packet[5] = static_cast<uint8_t>(text_len);
+
+    for (size_t i = 0; i < text_len; ++i) {
+        const uint8_t ch = static_cast<uint8_t>(text[i]);
+        if (!(ch == '\n' || ch == '\r' || ch == '\t' || (ch >= 0x20 && ch <= 0x7E))) {
+            return false;
+        }
+        out_packet[kRemoteCommandHeaderBytes + i] = ch;
+    }
+
+    out_packet_len = AudioPacket::kPacketBytes;
+    return true;
+}
+
+inline bool decodeRemoteResponse(const uint8_t* packet,
+                                 size_t packet_len,
+                                 std::string_view& out_text)
+{
+    out_text = {};
+
+    if (!packet || packet_len != AudioPacket::kPacketBytes) {
+        return false;
+    }
+
+    if (packet[0] != kMagic0 ||
+        packet[1] != kMagic1 ||
+        packet[2] != kMagic2 ||
+        packet[3] != kControlRemoteResponse ||
+        packet[4] != kVersion) {
+        return false;
+    }
+
+    const size_t text_len = packet[5];
+    if (text_len == 0 || text_len > kRemoteCommandMaxBytes) {
+        return false;
+    }
+
+    for (size_t i = 0; i < text_len; ++i) {
+        const uint8_t ch = packet[kRemoteCommandHeaderBytes + i];
+        if (!(ch == '\n' || ch == '\r' || ch == '\t' || (ch >= 0x20 && ch <= 0x7E))) {
+            return false;
+        }
+    }
+
+    for (size_t i = kRemoteCommandHeaderBytes + text_len;
+         i < AudioPacket::kPacketBytes;
+         ++i) {
+        if (packet[i] != 0) {
+            return false;
+        }
+    }
+
+    out_text = std::string_view(
+        reinterpret_cast<const char*>(packet + kRemoteCommandHeaderBytes),
+        text_len);
     return true;
 }
 

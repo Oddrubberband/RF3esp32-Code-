@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -13,10 +14,17 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_event.h"
+#include "esp_http_server.h"
+#include "esp_netif.h"
+#include "esp_netif_ip_addr.h"
 #include "esp_spiffs.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
 
 #include "audio_packet.hpp"
 #include "esp32_nrf24_hal.hpp"
@@ -25,6 +33,7 @@
 #include "radio_manager.hpp"
 #include "validation.hpp"
 #include "stream_sync.hpp"
+#include "wifi_control_config.hpp"
 
 #ifndef WIRELESS_CONTROL_ENABLED
 #define WIRELESS_CONTROL_ENABLED 0
@@ -64,12 +73,17 @@ constexpr uint8_t kDefaultMorsePowerLevel = 3;
 constexpr TickType_t kLoopWorkerPeriod = pdMS_TO_TICKS(20);
 constexpr TickType_t kLoopStopPollPeriod = pdMS_TO_TICKS(20);
 constexpr TickType_t kLoopStopTimeout = pdMS_TO_TICKS(2000);
+constexpr TickType_t kWifiControlPollPeriod = pdMS_TO_TICKS(100);
 // The nRF24 RX FIFO is only three packets deep, so polling much slower than
 // the packet cadence will overrun the queue during live audio traffic.
 constexpr TickType_t kRxPollPeriod = pdMS_TO_TICKS(2) > 0 ? pdMS_TO_TICKS(2) : 1;
+constexpr TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(15000);
 constexpr size_t kConsoleLineBytes = 160;
 constexpr bool kWirelessControlEnabled = WIRELESS_CONTROL_ENABLED != 0;
 constexpr bool kWirelessControlAutoRx = WIRELESS_CONTROL_AUTO_RX != 0;
+constexpr EventBits_t kWifiConnectedBit = BIT0;
+constexpr char kWifiPlaceholderSsid[] = "YOUR_WIFI_SSID";
+constexpr char kWifiPlaceholderPassword[] = "YOUR_WIFI_PASSWORD";
 
 // These compile-time checks keep the audio format aligned with nRF24 hardware
 // limits instead of failing later at runtime.
@@ -91,7 +105,8 @@ enum class LoopMode {
 
 enum class CommandOrigin {
     Local,
-    Remote
+    Remote,
+    Http
 };
 
 struct LoopConfig {
@@ -108,6 +123,19 @@ struct LoopConfig {
     uint32_t cw_report_every = 0;
     uint8_t channel = 76;
     uint8_t power_level = 3;
+};
+
+struct HttpStatusSnapshot {
+    const char* node_name = WifiControlConfig::kNodeName;
+    const char* hostname = WifiControlConfig::kNodeName;
+    const char* state_name = "Boot";
+    uint8_t channel = 76;
+    bool tx_ok = false;
+    bool tx_timeout = false;
+    uint32_t rx_packets = 0;
+    uint32_t rx_audio = 0;
+    uint32_t rx_raw = 0;
+    int last_fault = 0;
 };
 
 const char* loopModeName(LoopMode mode)
@@ -276,6 +304,28 @@ void delayAtLeastMs(uint32_t duration_ms)
 {
     const TickType_t ticks = pdMS_TO_TICKS(duration_ms);
     vTaskDelay(ticks > 0 ? ticks : 1);
+}
+
+void appendFormat(std::string& out, const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+
+    va_list copy;
+    va_copy(copy, args);
+    const int needed = std::vsnprintf(nullptr, 0, format, copy);
+    va_end(copy);
+
+    if (needed > 0) {
+        const size_t start = out.size();
+        out.resize(start + static_cast<size_t>(needed));
+        std::vsnprintf(out.data() + start,
+                       static_cast<size_t>(needed) + 1,
+                       format,
+                       args);
+    }
+
+    va_end(args);
 }
 
 // ---- SPIFFS track discovery helpers --------------------------------------
@@ -657,6 +707,10 @@ public:
             tryResumeWirelessRx("Wireless control armed");
         }
 
+        if (!startWifiControlPlane()) {
+            ESP_LOGW(TAG, "Wi-Fi control plane not available. Serial console remains active.");
+        }
+
         ESP_LOGI(TAG, "Audio stream: %u bytes/sec, ~%u packets/sec, ~%u payload bits/sec",
                  static_cast<unsigned>(kAudioBytesPerSecond),
                  static_cast<unsigned>(kPacketsPerSecond),
@@ -733,6 +787,349 @@ private:
         static_cast<DemoConsoleApp*>(ctx)->loopTask();
     }
 
+    static void wifiControlTaskEntry(void* ctx)
+    {
+        static_cast<DemoConsoleApp*>(ctx)->wifiControlTask();
+    }
+
+    static void wifiEventHandlerEntry(void* arg,
+                                      esp_event_base_t event_base,
+                                      int32_t event_id,
+                                      void* event_data)
+    {
+        static_cast<DemoConsoleApp*>(arg)->handleWifiEvent(event_base, event_id, event_data);
+    }
+
+    static esp_err_t httpStatusHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpStatus(req);
+    }
+
+    static esp_err_t httpRxStartHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpRxStart(req);
+    }
+
+    static esp_err_t httpTxStartHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpTxStart(req);
+    }
+
+    static esp_err_t httpStopHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpStop(req);
+    }
+
+    static esp_err_t httpChannelHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpChannel(req);
+    }
+
+    esp_err_t sendHttpJson(httpd_req_t* req,
+                           const std::string& json,
+                           const char* status = "200 OK") const
+    {
+        httpd_resp_set_status(req, status);
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_send(req, json.c_str(), HTTPD_RESP_USE_STRLEN);
+    }
+
+    esp_err_t sendHttpStatusResponse(httpd_req_t* req, const char* status = "200 OK")
+    {
+        const std::string json = buildStatusJson();
+        return sendHttpJson(req, json, status);
+    }
+
+    bool startHttpServer()
+    {
+        if (http_server_) {
+            return true;
+        }
+
+        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+        config.server_port = WifiControlConfig::kHttpPort;
+
+        esp_err_t err = httpd_start(&http_server_, &config);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "HTTP server start failed: %s", esp_err_to_name(err));
+            http_server_ = nullptr;
+            return false;
+        }
+
+        httpd_uri_t status_uri{};
+        status_uri.uri = "/status";
+        status_uri.method = HTTP_GET;
+        status_uri.handler = &DemoConsoleApp::httpStatusHandlerEntry;
+        status_uri.user_ctx = this;
+
+        httpd_uri_t rx_uri{};
+        rx_uri.uri = "/rx/start";
+        rx_uri.method = HTTP_POST;
+        rx_uri.handler = &DemoConsoleApp::httpRxStartHandlerEntry;
+        rx_uri.user_ctx = this;
+
+        httpd_uri_t tx_uri{};
+        tx_uri.uri = "/tx/start";
+        tx_uri.method = HTTP_POST;
+        tx_uri.handler = &DemoConsoleApp::httpTxStartHandlerEntry;
+        tx_uri.user_ctx = this;
+
+        httpd_uri_t stop_uri{};
+        stop_uri.uri = "/stop";
+        stop_uri.method = HTTP_POST;
+        stop_uri.handler = &DemoConsoleApp::httpStopHandlerEntry;
+        stop_uri.user_ctx = this;
+
+        httpd_uri_t channel_uri{};
+        channel_uri.uri = "/channel";
+        channel_uri.method = HTTP_POST;
+        channel_uri.handler = &DemoConsoleApp::httpChannelHandlerEntry;
+        channel_uri.user_ctx = this;
+
+        err = httpd_register_uri_handler(http_server_, &status_uri);
+        if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &rx_uri);
+        if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &tx_uri);
+        if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &stop_uri);
+        if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &channel_uri);
+
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "HTTP route registration failed: %s", esp_err_to_name(err));
+            httpd_stop(http_server_);
+            http_server_ = nullptr;
+            return false;
+        }
+
+        ESP_LOGI(TAG, "HTTP control server listening on port %u",
+                 static_cast<unsigned>(WifiControlConfig::kHttpPort));
+        return true;
+    }
+
+    bool startWifiControlPlane()
+    {
+        if (std::strcmp(WifiControlConfig::kSsid, kWifiPlaceholderSsid) == 0 ||
+            std::strcmp(WifiControlConfig::kPassword, kWifiPlaceholderPassword) == 0 ||
+            WifiControlConfig::kSsid[0] == '\0') {
+            ESP_LOGW(TAG,
+                     "Wi-Fi credentials not configured. Update include/wifi_control_config.hpp or define RF3_WIFI_SSID/RF3_WIFI_PASSWORD at build time.");
+            return false;
+        }
+
+        esp_err_t err = nvs_flash_init();
+        if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            ESP_ERROR_CHECK(nvs_flash_erase());
+            err = nvs_flash_init();
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "NVS init failed for Wi-Fi: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        err = esp_netif_init();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        err = esp_event_loop_create_default();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "esp_event_loop_create_default failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        wifi_event_group_ = xEventGroupCreate();
+        if (!wifi_event_group_) {
+            ESP_LOGE(TAG, "Could not allocate Wi-Fi event group");
+            return false;
+        }
+
+        if (!wifi_control_task_) {
+            if (xTaskCreate(&DemoConsoleApp::wifiControlTaskEntry,
+                            "wifi_ctrl",
+                            4096,
+                            this,
+                            4,
+                            &wifi_control_task_) != pdPASS) {
+                ESP_LOGE(TAG, "Failed to start Wi-Fi control task");
+                return false;
+            }
+        }
+
+        wifi_netif_ = esp_netif_create_default_wifi_sta();
+        if (!wifi_netif_) {
+            ESP_LOGE(TAG, "Could not create default Wi-Fi station interface");
+            return false;
+        }
+
+        err = esp_netif_set_hostname(wifi_netif_, WifiControlConfig::kNodeName);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Could not set hostname '%s': %s",
+                     WifiControlConfig::kNodeName,
+                     esp_err_to_name(err));
+        }
+
+        wifi_init_config_t wifi_init = WIFI_INIT_CONFIG_DEFAULT();
+        err = esp_wifi_init(&wifi_init);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        err = esp_event_handler_instance_register(WIFI_EVENT,
+                                                  ESP_EVENT_ANY_ID,
+                                                  &DemoConsoleApp::wifiEventHandlerEntry,
+                                                  this,
+                                                  &wifi_event_handler_);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Wi-Fi event handler register failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        err = esp_event_handler_instance_register(IP_EVENT,
+                                                  IP_EVENT_STA_GOT_IP,
+                                                  &DemoConsoleApp::wifiEventHandlerEntry,
+                                                  this,
+                                                  &ip_event_handler_);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "IP event handler register failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        wifi_config_t wifi_config{};
+        std::snprintf(reinterpret_cast<char*>(wifi_config.sta.ssid),
+                      sizeof(wifi_config.sta.ssid),
+                      "%s",
+                      WifiControlConfig::kSsid);
+        std::snprintf(reinterpret_cast<char*>(wifi_config.sta.password),
+                      sizeof(wifi_config.sta.password),
+                      "%s",
+                      WifiControlConfig::kPassword);
+        wifi_config.sta.pmf_cfg.capable = true;
+        wifi_config.sta.pmf_cfg.required = false;
+
+        err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (err == ESP_OK) {
+            err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+        }
+        if (err == ESP_OK) {
+            err = esp_wifi_start();
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Wi-Fi start failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        const EventBits_t bits = xEventGroupWaitBits(wifi_event_group_,
+                                                     kWifiConnectedBit,
+                                                     pdFALSE,
+                                                     pdFALSE,
+                                                     kWifiConnectTimeout);
+        if ((bits & kWifiConnectedBit) == 0) {
+            ESP_LOGW(TAG,
+                     "Wi-Fi did not connect within %u ms for hostname=%s",
+                     static_cast<unsigned>(pdTICKS_TO_MS(kWifiConnectTimeout)),
+                     WifiControlConfig::kNodeName);
+        }
+
+        return true;
+    }
+
+    void handleWifiEvent(esp_event_base_t event_base, int32_t event_id, void* event_data)
+    {
+        if (event_base == WIFI_EVENT) {
+            if (event_id == WIFI_EVENT_STA_START) {
+                ESP_LOGI(TAG, "Wi-Fi STA starting, hostname=%s", WifiControlConfig::kNodeName);
+                (void)esp_wifi_connect();
+                return;
+            }
+
+            if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+                xEventGroupClearBits(wifi_event_group_, kWifiConnectedBit);
+                wifi_connected_ = false;
+                const auto* disconnected = static_cast<wifi_event_sta_disconnected_t*>(event_data);
+                ESP_LOGW(TAG,
+                         "Wi-Fi disconnected: reason=%u, retrying...",
+                         disconnected ? static_cast<unsigned>(disconnected->reason) : 0u);
+                (void)esp_wifi_connect();
+                return;
+            }
+        }
+
+        if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+            const auto* got_ip = static_cast<ip_event_got_ip_t*>(event_data);
+            xEventGroupSetBits(wifi_event_group_, kWifiConnectedBit);
+            wifi_connected_ = true;
+            ESP_LOGI(TAG,
+                     "Wi-Fi connected: hostname=%s ip=" IPSTR,
+                     WifiControlConfig::kNodeName,
+                     IP2STR(&got_ip->ip_info.ip));
+        }
+    }
+
+    void wifiControlTask()
+    {
+        while (true) {
+            const EventBits_t bits = xEventGroupWaitBits(wifi_event_group_,
+                                                         kWifiConnectedBit,
+                                                         pdFALSE,
+                                                         pdFALSE,
+                                                         kWifiControlPollPeriod);
+            if ((bits & kWifiConnectedBit) != 0 && !http_server_) {
+                (void)startHttpServer();
+            }
+        }
+    }
+
+    esp_err_t handleHttpStatus(httpd_req_t* req)
+    {
+        return sendHttpStatusResponse(req);
+    }
+
+    esp_err_t handleHttpRxStart(httpd_req_t* req)
+    {
+        const bool ok = dispatchHttpCommand("RX");
+        return sendHttpStatusResponse(req, ok ? "200 OK" : "500 Internal Server Error");
+    }
+
+    esp_err_t handleHttpTxStart(httpd_req_t* req)
+    {
+        const bool ok = dispatchHttpCommand("TX");
+        return sendHttpStatusResponse(req, ok ? "200 OK" : "500 Internal Server Error");
+    }
+
+    esp_err_t handleHttpStop(httpd_req_t* req)
+    {
+        const bool ok = dispatchHttpCommand("STOP");
+        return sendHttpStatusResponse(req, ok ? "200 OK" : "500 Internal Server Error");
+    }
+
+    esp_err_t handleHttpChannel(httpd_req_t* req)
+    {
+        const size_t query_len = httpd_req_get_url_query_len(req);
+        if (query_len == 0) {
+            return sendHttpJson(req, "{\"error\":\"missing_value\"}", "400 Bad Request");
+        }
+
+        std::string query(query_len + 1, '\0');
+        if (httpd_req_get_url_query_str(req, query.data(), query.size()) != ESP_OK) {
+            return sendHttpJson(req, "{\"error\":\"invalid_query\"}", "400 Bad Request");
+        }
+
+        char value_buf[8] = {};
+        if (httpd_query_key_value(query.c_str(), "value", value_buf, sizeof(value_buf)) != ESP_OK) {
+            return sendHttpJson(req, "{\"error\":\"missing_value\"}", "400 Bad Request");
+        }
+
+        uint8_t channel = 0;
+        if (!parseUint8Arg(value_buf, 0, 125, channel)) {
+            return sendHttpJson(req, "{\"error\":\"invalid_channel\"}", "400 Bad Request");
+        }
+
+        std::string command = "CHANNEL ";
+        command += value_buf;
+        const bool ok = dispatchHttpCommand(command);
+        return sendHttpStatusResponse(req, ok ? "200 OK" : "500 Internal Server Error");
+    }
+
     void printPrompt() const
     {
         std::printf("\nrf24> ");
@@ -753,7 +1150,6 @@ private:
             "  TX [file]            Start sending the selected or named track\n"
             "  TX LOOP [n|INF] [f]  Repeatedly send the selected or named track\n"
             "  MORSE <text>         Key A-Z/0-9/spaces as Morse; use STOP to abort\n"
-            "  REMOTE <cmd>         Send a short wireless command to a listening peer\n"
             "  RX                   Enter receive/listen mode\n"
             "  STANDBY              Leave RX/CW/sleep and return to standby\n"
             "  SLEEP                Put the radio into sleep mode\n"
@@ -764,6 +1160,10 @@ private:
             "  CW LOOP <on> <off>   Repeat CW bursts; optional [ch] [pwr] [EVERY <loops>]\n"
             "\nPrepare new tracks on the host with the PlatformIO 'Prepare Demo Audio' target\n"
             "or by running: python tools/prepare_demo_audio.py <path-to-song.mp3>\n");
+
+        if (kWirelessControlEnabled) {
+            std::printf("  REMOTE <cmd>         Send a short wireless command to a listening peer\n");
+        }
     }
 
     bool takeRadio(TickType_t timeout = portMAX_DELAY)
@@ -1074,6 +1474,58 @@ private:
         std::printf("\n");
     }
 
+    bool captureHttpStatus(HttpStatusSnapshot& out)
+    {
+        if (!takeRadio(pdMS_TO_TICKS(50))) {
+            return false;
+        }
+
+        manager_.refreshSnapshot();
+        const RadioStatus status = manager_.status();
+        out.node_name = WifiControlConfig::kNodeName;
+        out.hostname = WifiControlConfig::kNodeName;
+        out.state_name = RadioManager::stateName(status.state);
+        out.channel = status.channel;
+        out.tx_ok = status.last_tx_ok;
+        out.tx_timeout = status.last_tx_timed_out;
+        out.rx_packets = status.rx_packets;
+        out.rx_audio = decoded_rx_packet_count_;
+        out.rx_raw = raw_rx_packet_count_;
+        out.last_fault = status.last_fault;
+        giveRadio();
+        return true;
+    }
+
+    std::string buildStatusJson()
+    {
+        HttpStatusSnapshot snapshot{};
+        if (!captureHttpStatus(snapshot)) {
+            snapshot.state_name = "Unavailable";
+        }
+
+        std::string json;
+        appendFormat(json,
+                     "{\"node_name\":\"%s\",\"hostname\":\"%s\",\"state\":\"%s\",\"channel\":%u,"
+                     "\"tx_ok\":%s,\"tx_timeout\":%s,\"rx_packets\":%u,"
+                     "\"rx_audio\":%u,\"rx_raw\":%u,\"last_fault\":%d}",
+                     snapshot.node_name,
+                     snapshot.hostname,
+                     snapshot.state_name,
+                     static_cast<unsigned>(snapshot.channel),
+                     snapshot.tx_ok ? "true" : "false",
+                     snapshot.tx_timeout ? "true" : "false",
+                     static_cast<unsigned>(snapshot.rx_packets),
+                     static_cast<unsigned>(snapshot.rx_audio),
+                     static_cast<unsigned>(snapshot.rx_raw),
+                     snapshot.last_fault);
+        return json;
+    }
+
+    bool dispatchHttpCommand(const std::string& line)
+    {
+        return dispatchCommand(line, CommandOrigin::Http);
+    }
+
     bool commandFiles()
     {
         printTrackTable(listTracks(), selected_track_);
@@ -1207,6 +1659,11 @@ private:
 
     bool commandRemote(const std::string& line)
     {
+        if (!kWirelessControlEnabled) {
+            std::printf("REMOTE is disabled in this build. Use the Wi-Fi HTTP endpoints instead.\n");
+            return false;
+        }
+
         const size_t separator = line.find_first_of(" \t");
         if (separator == std::string::npos) {
             std::printf("Usage: REMOTE <command...>\n");
@@ -2142,7 +2599,8 @@ private:
                         size_t out_len = 0;
                         if (manager_.receivePayload(payload.data(), payload.size(), out_len)) {
                             std::string_view remote_view;
-                            if (StreamSync::decodeRemoteCommand(payload.data(), out_len, remote_view)) {
+                            if (kWirelessControlEnabled &&
+                                StreamSync::decodeRemoteCommand(payload.data(), out_len, remote_view)) {
                                 remote_command.assign(remote_view.data(), remote_view.size());
                                 break;
                             }
@@ -2262,6 +2720,7 @@ private:
     TaskHandle_t rx_task_ = nullptr;           // Background receive (RX) polling task.
     SemaphoreHandle_t loop_mutex_ = nullptr;   // Guards background TX/CW loop configuration.
     TaskHandle_t loop_task_ = nullptr;         // Background TX/CW loop worker.
+    TaskHandle_t wifi_control_task_ = nullptr; // Starts HTTP control off the event-task stack.
     SemaphoreHandle_t command_mutex_ = nullptr;  // Serializes local and remote command dispatch.
     std::string selected_track_ = kDefaultTrack;  // Default file used by transmit (TX).
     std::string last_morse_text_;              // Most recent MORSE text for STATUS output.
@@ -2272,6 +2731,12 @@ private:
     uint32_t raw_rx_packet_count_ = 0;        // Payloads that were received but did not match AudioPacket.
     LoopConfig loop_config_{};
     volatile bool loop_stop_requested_ = false;
+    EventGroupHandle_t wifi_event_group_ = nullptr;
+    esp_netif_t* wifi_netif_ = nullptr;
+    httpd_handle_t http_server_ = nullptr;
+    esp_event_handler_instance_t wifi_event_handler_ = nullptr;
+    esp_event_handler_instance_t ip_event_handler_ = nullptr;
+    bool wifi_connected_ = false;
 };
 }  // namespace
 
