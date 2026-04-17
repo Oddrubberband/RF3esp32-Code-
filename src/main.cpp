@@ -26,6 +26,14 @@
 #include "validation.hpp"
 #include "stream_sync.hpp"
 
+#ifndef WIRELESS_CONTROL_ENABLED
+#define WIRELESS_CONTROL_ENABLED 0
+#endif
+
+#ifndef WIRELESS_CONTROL_AUTO_RX
+#define WIRELESS_CONTROL_AUTO_RX 0
+#endif
+
 // main.cpp owns the top-level demo flow:
 // - mount the Serial Peripheral Interface Flash File System (SPIFFS) partition
 //   that stores converted audio
@@ -60,6 +68,8 @@ constexpr TickType_t kLoopStopTimeout = pdMS_TO_TICKS(2000);
 // the packet cadence will overrun the queue during live audio traffic.
 constexpr TickType_t kRxPollPeriod = pdMS_TO_TICKS(2) > 0 ? pdMS_TO_TICKS(2) : 1;
 constexpr size_t kConsoleLineBytes = 160;
+constexpr bool kWirelessControlEnabled = WIRELESS_CONTROL_ENABLED != 0;
+constexpr bool kWirelessControlAutoRx = WIRELESS_CONTROL_AUTO_RX != 0;
 
 // These compile-time checks keep the audio format aligned with nRF24 hardware
 // limits instead of failing later at runtime.
@@ -79,10 +89,16 @@ enum class LoopMode {
     Morse
 };
 
+enum class CommandOrigin {
+    Local,
+    Remote
+};
+
 struct LoopConfig {
     LoopMode mode = LoopMode::None;
     bool active = false;
     bool infinite = false;
+    bool restore_rx_after_completion = false;
     uint32_t remaining_iterations = 0;
     uint32_t completed_iterations = 0;
     std::string track_name;
@@ -572,6 +588,12 @@ public:
             return false;
         }
 
+        command_mutex_ = xSemaphoreCreateMutex();
+        if (!command_mutex_) {
+            ESP_LOGE(TAG, "Failed to allocate command mutex");
+            return false;
+        }
+
         std::setvbuf(stdin, nullptr, _IONBF, 0);
         std::setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -630,6 +652,11 @@ public:
         } else {
             ESP_LOGI(TAG, "Radio unavailable, console running in filesystem-only mode.");
         }
+
+        if (boot_ok && kWirelessControlEnabled && kWirelessControlAutoRx) {
+            tryResumeWirelessRx("Wireless control armed");
+        }
+
         ESP_LOGI(TAG, "Audio stream: %u bytes/sec, ~%u packets/sec, ~%u payload bits/sec",
                  static_cast<unsigned>(kAudioBytesPerSecond),
                  static_cast<unsigned>(kPacketsPerSecond),
@@ -669,7 +696,7 @@ public:
                 const std::string command_line = trimAscii(pending_line);
                 pending_line.clear();
                 if (!command_line.empty()) {
-                    handleCommand(command_line);
+                    dispatchCommand(command_line, CommandOrigin::Local);
                 }
                 prompt_visible = false;
                 continue;
@@ -726,6 +753,7 @@ private:
             "  TX [file]            Start sending the selected or named track\n"
             "  TX LOOP [n|INF] [f]  Repeatedly send the selected or named track\n"
             "  MORSE <text>         Key A-Z/0-9/spaces as Morse; use STOP to abort\n"
+            "  REMOTE <cmd>         Send a short wireless command to a listening peer\n"
             "  RX                   Enter receive/listen mode\n"
             "  STANDBY              Leave RX/CW/sleep and return to standby\n"
             "  SLEEP                Put the radio into sleep mode\n"
@@ -749,6 +777,16 @@ private:
     void giveRadio()
     {
         xSemaphoreGive(radio_mutex_);
+    }
+
+    bool takeCommand(TickType_t timeout = portMAX_DELAY)
+    {
+        return xSemaphoreTake(command_mutex_, timeout) == pdTRUE;
+    }
+
+    void giveCommand()
+    {
+        xSemaphoreGive(command_mutex_);
     }
 
     bool takeLoop(TickType_t timeout = portMAX_DELAY)
@@ -776,6 +814,15 @@ private:
     void clearLoopLocked()
     {
         loop_config_ = LoopConfig{};
+    }
+
+    void resetRxSession()
+    {
+        last_carrier_detected_ = false;
+        carrier_event_count_ = 0;
+        decoded_rx_packet_count_ = 0;
+        raw_rx_packet_count_ = 0;
+        sync_gate_.reset();
     }
 
     bool isLoopActive()
@@ -875,6 +922,74 @@ private:
         return manager_.status().state == RadioState::Standby;
     }
 
+    bool startRxLocked()
+    {
+        bool ok = ensureStandbyLocked();
+        if (ok) {
+            ok = manager_.enterRx();
+        }
+        if (ok) {
+            resetRxSession();
+        }
+        return ok;
+    }
+
+    bool isRemoteCommandAllowed(const std::vector<std::string>& words) const
+    {
+        if (words.empty()) {
+            return false;
+        }
+
+        const std::string command = uppercaseCopy(words.front());
+        return command == "HELP" ||
+               command == "?" ||
+               command == "STATUS" ||
+               command == "FILES" ||
+               command == "LS" ||
+               command == "SELECT" ||
+               command == "TX" ||
+               command == "MORSE" ||
+               command == "STOP" ||
+               command == "CHANNEL";
+    }
+
+    void tryResumeWirelessRx(const char* reason)
+    {
+        if (!kWirelessControlEnabled || !kWirelessControlAutoRx || isLoopActive()) {
+            return;
+        }
+
+        if (!takeRadio(pdMS_TO_TICKS(100))) {
+            ESP_LOGW(TAG, "%s: radio busy, could not resume RX", reason);
+            return;
+        }
+
+        const RadioStatus before = manager_.status();
+        bool ok = true;
+        if (before.state == RadioState::Standby) {
+            ok = manager_.enterRx();
+            if (ok) {
+                resetRxSession();
+            }
+        }
+
+        const RadioStatus after = manager_.status();
+        giveRadio();
+
+        if (before.state == RadioState::Standby) {
+            if (ok) {
+                ESP_LOGI(TAG, "%s on channel %u",
+                         reason,
+                         static_cast<unsigned>(after.channel));
+            } else {
+                ESP_LOGW(TAG, "%s failed, state=%s fault=%d",
+                         reason,
+                         RadioManager::stateName(after.state),
+                         after.last_fault);
+            }
+        }
+    }
+
     void printStatus()
     {
         // STATUS refreshes the live radio snapshot, then adds a live hasPendingRx()
@@ -919,6 +1034,12 @@ private:
                     static_cast<unsigned>(raw_packets),
                     static_cast<unsigned>(carrier_events),
                     status.last_fault);
+        if (kWirelessControlEnabled) {
+            std::printf(" remote=enabled");
+            if (kWirelessControlAutoRx) {
+                std::printf(" remote_auto_rx=true");
+            }
+        }
         if (status.state == RadioState::RxListening) {
             std::printf(" rx_pending=%s rpd=%s",
                         rx_pending ? "true" : "false",
@@ -980,7 +1101,7 @@ private:
         return true;
     }
 
-    bool commandTx(const std::vector<std::string>& words)
+    bool commandTx(const std::vector<std::string>& words, CommandOrigin origin)
     {
         if (words.size() >= 2) {
             const std::string action = uppercaseCopy(words[1]);
@@ -1031,6 +1152,8 @@ private:
                 loop_config_.mode = LoopMode::Tx;
                 loop_config_.active = true;
                 loop_config_.infinite = infinite;
+                loop_config_.restore_rx_after_completion =
+                    origin == CommandOrigin::Remote && kWirelessControlEnabled && kWirelessControlAutoRx;
                 loop_config_.remaining_iterations = loop_count;
                 loop_config_.track_name = track.name;
                 giveLoop();
@@ -1072,11 +1195,66 @@ private:
         loop_config_.mode = LoopMode::Tx;
         loop_config_.active = true;
         loop_config_.infinite = false;
+        loop_config_.restore_rx_after_completion =
+            origin == CommandOrigin::Remote && kWirelessControlEnabled && kWirelessControlAutoRx;
         loop_config_.remaining_iterations = 1;
         loop_config_.track_name = track.name;
         giveLoop();
 
         std::printf("TX started for %s. Use STOP to abort.\n", track.name.c_str());
+        return true;
+    }
+
+    bool commandRemote(const std::string& line)
+    {
+        const size_t separator = line.find_first_of(" \t");
+        if (separator == std::string::npos) {
+            std::printf("Usage: REMOTE <command...>\n");
+            return false;
+        }
+
+        const std::string request = trimAscii(line.substr(separator + 1));
+        if (request.empty()) {
+            std::printf("Usage: REMOTE <command...>\n");
+            return false;
+        }
+
+        const std::vector<std::string> request_words = splitWords(request);
+        if (!isRemoteCommandAllowed(request_words)) {
+            std::printf("Remote commands support HELP, STATUS, FILES, SELECT, TX, MORSE, STOP, and CHANNEL.\n");
+            return false;
+        }
+
+        uint8_t packet[AudioPacket::kPacketBytes] = {};
+        size_t packet_len = 0;
+        if (!StreamSync::encodeRemoteCommand(request.c_str(), request.size(), packet, packet_len)) {
+            std::printf("Remote command is too long or has non-ASCII bytes. Limit is %u characters.\n",
+                        static_cast<unsigned>(StreamSync::kRemoteCommandMaxBytes));
+            return false;
+        }
+
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+
+        bool ok = ensureStandbyLocked();
+        if (ok) {
+            ok = manager_.sendPayload(packet, packet_len);
+        }
+
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        if (!ok) {
+            std::printf("Could not send remote command. state=%s fault=%d\n",
+                        RadioManager::stateName(status.state),
+                        status.last_fault);
+            return false;
+        }
+
+        tryResumeWirelessRx("Remote command transmit complete");
+        std::printf("Sent remote command: %s\n", request.c_str());
         return true;
     }
 
@@ -1194,7 +1372,7 @@ private:
         return manager_.status().state == RadioState::Standby;
     }
 
-    bool commandMorse(const std::string& line)
+    bool commandMorse(const std::string& line, CommandOrigin origin)
     {
         const size_t separator = line.find_first_of(" \t");
         if (separator == std::string::npos) {
@@ -1243,6 +1421,8 @@ private:
         loop_config_.mode = LoopMode::Morse;
         loop_config_.active = true;
         loop_config_.infinite = false;
+        loop_config_.restore_rx_after_completion =
+            origin == CommandOrigin::Remote && kWirelessControlEnabled && kWirelessControlAutoRx;
         loop_config_.remaining_iterations = 1;
         loop_config_.morse_text = text;
         loop_config_.channel = channel;
@@ -1316,10 +1496,7 @@ private:
             return false;
         }
 
-        bool ok = ensureStandbyLocked();
-        if (ok) {
-            ok = manager_.enterRx();
-        }
+        const bool ok = startRxLocked();
 
         const RadioStatus status = manager_.status();
         giveRadio();
@@ -1331,11 +1508,6 @@ private:
             return false;
         }
 
-        last_carrier_detected_ = false;
-        carrier_event_count_ = 0;
-        decoded_rx_packet_count_ = 0;
-        raw_rx_packet_count_ = 0;
-        sync_gate_.reset();
         std::printf("RX listening on channel %u\n", static_cast<unsigned>(status.channel));
         return true;
     }
@@ -1704,6 +1876,7 @@ private:
         giveRadio();
 
         const bool stopped = loop_stop_requested_;
+        bool restore_rx = false;
         if (!takeLoop(pdMS_TO_TICKS(50))) {
             return;
         }
@@ -1718,6 +1891,7 @@ private:
 
             const bool finished = ok && !loop_config_.infinite && loop_config_.remaining_iterations == 0;
             if (stopped || !ok || finished) {
+                restore_rx = loop_config_.restore_rx_after_completion;
                 clearLoopLocked();
             }
         }
@@ -1733,6 +1907,10 @@ private:
             ESP_LOGW(TAG, "TX loop stopped, state=%s fault=%d",
                      RadioManager::stateName(status.state),
                      status.last_fault);
+        }
+
+        if (restore_rx) {
+            tryResumeWirelessRx("Remote control RX resumed after TX");
         }
     }
 
@@ -1840,6 +2018,7 @@ private:
         giveRadio();
 
         const bool stopped = loop_stop_requested_;
+        bool restore_rx = false;
         if (takeLoop(pdMS_TO_TICKS(50))) {
             if (loop_config_.active && loop_config_.mode == LoopMode::Morse) {
                 if (ok) {
@@ -1849,6 +2028,7 @@ private:
                     }
                 }
 
+                restore_rx = loop_config_.restore_rx_after_completion;
                 clearLoopLocked();
             }
             giveLoop();
@@ -1862,6 +2042,10 @@ private:
             ESP_LOGW(TAG, "Morse stopped, state=%s fault=%d",
                      RadioManager::stateName(status.state),
                      status.last_fault);
+        }
+
+        if (restore_rx) {
+            tryResumeWirelessRx("Remote control RX resumed after Morse");
         }
     }
 
@@ -1894,41 +2078,41 @@ private:
     }
 
     void logRxPacket(const uint8_t* payload, size_t len)
-{
-    AudioPacket::Header header{};
-    const uint8_t* audio = nullptr;
+    {
+        AudioPacket::Header header{};
+        const uint8_t* audio = nullptr;
 
-    switch (sync_gate_.accept(payload, len, &header, &audio)) {
-        case StreamSync::ReceiverGate::Action::StartAccepted:
-            ESP_LOGI(TAG, "RX START stream=%u",
-                     static_cast<unsigned>(sync_gate_.currentStreamId()));
-            return;
-        case StreamSync::ReceiverGate::Action::StopAccepted:
-            ESP_LOGI(TAG, "RX STOP");
-            return;
+        switch (sync_gate_.accept(payload, len, &header, &audio)) {
+            case StreamSync::ReceiverGate::Action::StartAccepted:
+                ESP_LOGI(TAG, "RX START stream=%u",
+                         static_cast<unsigned>(sync_gate_.currentStreamId()));
+                return;
+            case StreamSync::ReceiverGate::Action::StopAccepted:
+                ESP_LOGI(TAG, "RX STOP");
+                return;
 
-        case StreamSync::ReceiverGate::Action::AudioAccepted:
-            ++decoded_rx_packet_count_;
-            ESP_LOGI(TAG,
-                     "RX packet stream=%u seq=%u audio=%u flags=0x%02X",
-                     static_cast<unsigned>(sync_gate_.currentStreamId()),
-                     static_cast<unsigned>(header.sequence),
-                     static_cast<unsigned>(header.audio_len),
-                     static_cast<unsigned>(header.flags));
-            return;
+            case StreamSync::ReceiverGate::Action::AudioAccepted:
+                ++decoded_rx_packet_count_;
+                ESP_LOGI(TAG,
+                         "RX packet stream=%u seq=%u audio=%u flags=0x%02X",
+                         static_cast<unsigned>(sync_gate_.currentStreamId()),
+                         static_cast<unsigned>(header.sequence),
+                         static_cast<unsigned>(header.audio_len),
+                         static_cast<unsigned>(header.flags));
+                return;
             case StreamSync::ReceiverGate::Action::Ignore:
-            ++raw_rx_packet_count_;
-            ESP_LOGI(TAG, "RX packet ignored while waiting for sync");
-            return;
+                ++raw_rx_packet_count_;
+                ESP_LOGI(TAG, "RX packet ignored while waiting for sync");
+                return;
 
-        case StreamSync::ReceiverGate::Action::Invalid:
-        default:
-            ++raw_rx_packet_count_;
-            ESP_LOGI(TAG, "RX payload len=%u (unrecognized frame)",
-                     static_cast<unsigned>(len));
-            return;
+            case StreamSync::ReceiverGate::Action::Invalid:
+            default:
+                ++raw_rx_packet_count_;
+                ESP_LOGI(TAG, "RX payload len=%u (unrecognized frame)",
+                         static_cast<unsigned>(len));
+                return;
+        }
     }
-}
 
     void rxTask()
     {
@@ -1940,6 +2124,8 @@ private:
         std::array<uint8_t, AudioPacket::kPacketBytes> payload{};
 
         while (true) {
+            std::string remote_command;
+
             if (takeRadio(pdMS_TO_TICKS(10))) {
                 if (manager_.status().state == RadioState::RxListening) {
                     manager_.refreshSnapshot();
@@ -1955,6 +2141,12 @@ private:
                     while (manager_.hasPendingRx()) {
                         size_t out_len = 0;
                         if (manager_.receivePayload(payload.data(), payload.size(), out_len)) {
+                            std::string_view remote_view;
+                            if (StreamSync::decodeRemoteCommand(payload.data(), out_len, remote_view)) {
+                                remote_command.assign(remote_view.data(), remote_view.size());
+                                break;
+                            }
+
                             logRxPacket(payload.data(), out_len);
                         } else {
                             const RadioStatus status = manager_.status();
@@ -1970,17 +2162,27 @@ private:
                 giveRadio();
             }
 
+            if (!remote_command.empty()) {
+                ESP_LOGI(TAG, "RX remote command: %s", remote_command.c_str());
+                dispatchCommand(remote_command, CommandOrigin::Remote);
+            }
+
             vTaskDelay(kRxPollPeriod);
         }
     }
 
-    bool handleCommand(const std::string& line)
+    bool handleCommand(const std::string& line, CommandOrigin origin)
     {
         // Command dispatch is a simple keyword router. Each handler owns its
         // own validation and user-facing error messages.
         const std::vector<std::string> words = splitWords(line);
         if (words.empty()) {
             return true;
+        }
+
+        if (origin == CommandOrigin::Remote && !isRemoteCommandAllowed(words)) {
+            std::printf("Remote command '%s' is not supported.\n", words.front().c_str());
+            return false;
         }
 
         const std::string command = uppercaseCopy(words.front());
@@ -2002,10 +2204,13 @@ private:
             return commandSelect(words);
         }
         if (command == "TX") {
-            return commandTx(words);
+            return commandTx(words, origin);
         }
         if (command == "MORSE") {
-            return commandMorse(line);
+            return commandMorse(line, origin);
+        }
+        if (command == "REMOTE") {
+            return commandRemote(line);
         }
         if (command == "RX") {
             return commandRx();
@@ -2033,15 +2238,36 @@ private:
         return false;
     }
 
+    bool dispatchCommand(const std::string& line, CommandOrigin origin)
+    {
+        if (!takeCommand(pdMS_TO_TICKS(500))) {
+            if (origin == CommandOrigin::Remote) {
+                ESP_LOGW(TAG, "Dropping remote command while another command is active: %s", line.c_str());
+            } else {
+                std::printf("Command system is busy.\n");
+            }
+            return false;
+        }
+
+        const bool ok = handleCommand(line, origin);
+        if (ok && origin == CommandOrigin::Remote) {
+            tryResumeWirelessRx("Remote control RX resumed");
+        }
+        giveCommand();
+        return ok;
+    }
+
     RadioManager& manager_;
     SemaphoreHandle_t radio_mutex_ = nullptr;  // Serializes all radio access.
     TaskHandle_t rx_task_ = nullptr;           // Background receive (RX) polling task.
     SemaphoreHandle_t loop_mutex_ = nullptr;   // Guards background TX/CW loop configuration.
     TaskHandle_t loop_task_ = nullptr;         // Background TX/CW loop worker.
+    SemaphoreHandle_t command_mutex_ = nullptr;  // Serializes local and remote command dispatch.
     std::string selected_track_ = kDefaultTrack;  // Default file used by transmit (TX).
     std::string last_morse_text_;              // Most recent MORSE text for STATUS output.
     bool last_carrier_detected_ = false;      // Edge detector for RPD logging while in RX.
     uint32_t carrier_event_count_ = 0;        // Number of distinct RPD-high events seen while listening.
+    StreamSync::ReceiverGate sync_gate_{};    // RX stream gate for START/STOP/audio synchronization.
     uint32_t decoded_rx_packet_count_ = 0;    // Payloads that matched the AudioPacket format.
     uint32_t raw_rx_packet_count_ = 0;        // Payloads that were received but did not match AudioPacket.
     LoopConfig loop_config_{};

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 
 #include "audio_packet.hpp"
 
@@ -9,11 +10,14 @@ namespace StreamSync {
 
 constexpr uint8_t kControlStart = 0x81;
 constexpr uint8_t kControlStop = 0x82;
+constexpr uint8_t kControlRemoteCommand = 0x83;
 
 constexpr uint8_t kMagic0 = 'R';
 constexpr uint8_t kMagic1 = 'F';
 constexpr uint8_t kMagic2 = '3';
 constexpr uint8_t kVersion = 1;
+constexpr size_t kRemoteCommandHeaderBytes = 6;
+constexpr size_t kRemoteCommandMaxBytes = AudioPacket::kPacketBytes - kRemoteCommandHeaderBytes;
 
 constexpr uint8_t kRecommendedStartRepeats = 3;
 constexpr uint32_t kRecommendedStartGapMs = 10;
@@ -116,6 +120,81 @@ inline bool decodeStart(const uint8_t* packet, size_t packet_len, ControlFrame& 
 inline bool decodeStop(const uint8_t* packet, size_t packet_len, ControlFrame& out_frame)
 {
     return decodeControl(kControlStop, packet, packet_len, out_frame);
+}
+
+inline bool encodeRemoteCommand(const char* command,
+                                size_t command_len,
+                                uint8_t* out_packet,
+                                size_t& out_packet_len)
+{
+    out_packet_len = 0;
+
+    if (!command || !out_packet || command_len == 0 || command_len > kRemoteCommandMaxBytes) {
+        return false;
+    }
+
+    clearPacket(out_packet);
+    out_packet[0] = kMagic0;
+    out_packet[1] = kMagic1;
+    out_packet[2] = kMagic2;
+    out_packet[3] = kControlRemoteCommand;
+    out_packet[4] = kVersion;
+    out_packet[5] = static_cast<uint8_t>(command_len);
+
+    for (size_t i = 0; i < command_len; ++i) {
+        const uint8_t ch = static_cast<uint8_t>(command[i]);
+        if (ch < 0x20 || ch > 0x7E) {
+            return false;
+        }
+        out_packet[kRemoteCommandHeaderBytes + i] = ch;
+    }
+
+    out_packet_len = AudioPacket::kPacketBytes;
+    return true;
+}
+
+inline bool decodeRemoteCommand(const uint8_t* packet,
+                                size_t packet_len,
+                                std::string_view& out_command)
+{
+    out_command = {};
+
+    if (!packet || packet_len != AudioPacket::kPacketBytes) {
+        return false;
+    }
+
+    if (packet[0] != kMagic0 ||
+        packet[1] != kMagic1 ||
+        packet[2] != kMagic2 ||
+        packet[3] != kControlRemoteCommand ||
+        packet[4] != kVersion) {
+        return false;
+    }
+
+    const size_t command_len = packet[5];
+    if (command_len == 0 || command_len > kRemoteCommandMaxBytes) {
+        return false;
+    }
+
+    for (size_t i = 0; i < command_len; ++i) {
+        const uint8_t ch = packet[kRemoteCommandHeaderBytes + i];
+        if (ch < 0x20 || ch > 0x7E) {
+            return false;
+        }
+    }
+
+    for (size_t i = kRemoteCommandHeaderBytes + command_len;
+         i < AudioPacket::kPacketBytes;
+         ++i) {
+        if (packet[i] != 0) {
+            return false;
+        }
+    }
+
+    out_command = std::string_view(
+        reinterpret_cast<const char*>(packet + kRemoteCommandHeaderBytes),
+        command_len);
+    return true;
 }
 
 class ReceiverGate {

@@ -860,6 +860,39 @@ void test_streamSync_stop_round_trip(void)
     TEST_ASSERT_EQUAL_UINT16(0x4321, frame.stream_id);
 }
 
+void test_streamSync_remote_command_round_trip(void)
+{
+    static constexpr char kCommand[] = "TX LOOP 2 song.u8";
+    uint8_t packet[AudioPacket::kPacketBytes] = {};
+    size_t packet_len = 0;
+
+    TEST_ASSERT_TRUE(StreamSync::encodeRemoteCommand(kCommand,
+                                                     sizeof(kCommand) - 1,
+                                                     packet,
+                                                     packet_len));
+    TEST_ASSERT_EQUAL_UINT32(AudioPacket::kPacketBytes, static_cast<uint32_t>(packet_len));
+
+    std::string_view command;
+    TEST_ASSERT_TRUE(StreamSync::decodeRemoteCommand(packet, packet_len, command));
+    TEST_ASSERT_EQUAL_UINT32(sizeof(kCommand) - 1, static_cast<uint32_t>(command.size()));
+    TEST_ASSERT_EQUAL_MEMORY(kCommand, command.data(), sizeof(kCommand) - 1);
+}
+
+void test_streamSync_remote_command_rejects_oversized_text(void)
+{
+    std::array<char, StreamSync::kRemoteCommandMaxBytes + 2> command{};
+    command.fill('A');
+
+    uint8_t packet[AudioPacket::kPacketBytes] = {};
+    size_t packet_len = 99;
+
+    TEST_ASSERT_FALSE(StreamSync::encodeRemoteCommand(command.data(),
+                                                      command.size(),
+                                                      packet,
+                                                      packet_len));
+    TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(packet_len));
+}
+
 void test_streamSync_gate_ignores_nonzero_audio_before_sync(void)
 {
     uint8_t packet[AudioPacket::kPacketBytes] = {};
@@ -1135,6 +1168,8 @@ int main(void)
     RUN_TEST(test_radioManager_boot_probe_failure_sets_fault_code_1);
     RUN_TEST(test_streamSync_start_round_trip);
     RUN_TEST(test_streamSync_stop_round_trip);
+    RUN_TEST(test_streamSync_remote_command_round_trip);
+    RUN_TEST(test_streamSync_remote_command_rejects_oversized_text);
     RUN_TEST(test_streamSync_gate_ignores_nonzero_audio_before_sync);
     RUN_TEST(test_streamSync_gate_accepts_legacy_seq0_without_start);
     RUN_TEST(test_streamSync_gate_accepts_start_then_seq0);

@@ -9,6 +9,7 @@ raw audio in SPIFFS and sends or receives it over an nRF24L01-style radio.
 - Exposes a serial console for selecting tracks and controlling the radio
 - Packs audio into fixed-size nRF24 payloads
 - Supports RX mode, TX mode, standby, sleep, power-down, and CW test mode
+- Lets the custom board send short wireless control commands to the devboard
 - Includes a host-side helper that converts MP3 files into the expected PCM
   format before uploading them to SPIFFS
 
@@ -95,6 +96,7 @@ monitor exposes commands such as:
 - `TX [file]`
 - `TX LOOP [count|INF] [file]`
 - `MORSE <text>`
+- `REMOTE <command...>`
 - `RX`
 - `STANDBY`
 - `SLEEP`
@@ -104,6 +106,27 @@ monitor exposes commands such as:
 - `CW START [channel] [power0-3]`
 - `CW LOOP <on_ms> <off_ms> [channel] [power0-3] [EVERY <loops>]`
 - `CW STOP`
+
+## Wireless Control
+
+Both ESP32 hardware environments (`esp32wroom32d` / `esp32wroom32d_manual_boot`
+for the custom PCB and `esp32wroom32d_devboard` for the older wiring) now
+enable the small nRF24 command channel. After boot they automatically enter RX
+so either board can send short console-style commands such as:
+
+```powershell
+REMOTE SELECT song.u8
+REMOTE TX
+REMOTE MORSE SOS
+REMOTE CHANNEL 90
+REMOTE STOP
+```
+
+Remote commands are limited to 26 ASCII characters and currently support:
+`HELP`, `STATUS`, `FILES`, `SELECT`, `TX`, `MORSE`, `STOP`, and `CHANNEL`.
+
+After a local `REMOTE ...` send, the sender also re-arms RX automatically so
+both boards can stay controllable as wireless peers.
 
 ## Notes
 
