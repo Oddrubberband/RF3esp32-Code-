@@ -70,7 +70,7 @@ constexpr uint32_t kPayloadBytesPerSecond =
 constexpr uint32_t kPayloadBitsPerSecond =
     kPacketsPerSecond * AudioPacket::kPacketBytes * 8;
 constexpr const char* kSpiffsRoot = "/spiffs";
-constexpr const char* kDefaultTrack = "";
+constexpr const char* kDefaultTrack = "payload.bin";
 constexpr const char* kReceivedFilePrefix = "rx_";
 constexpr const char* kReceivedFileExtension = ".bin";
 constexpr const char* kReceivedPartialExtension = ".part";
@@ -197,26 +197,6 @@ std::string uppercaseCopy(std::string_view text)
         return static_cast<char>(std::toupper(ch));
     });
     return out;
-}
-
-bool endsWithIgnoreCase(std::string_view text, std::string_view suffix)
-{
-    // File selection accepts names in any case while still enforcing a
-    // specific suffix when needed.
-    if (text.size() < suffix.size()) {
-        return false;
-    }
-
-    const size_t offset = text.size() - suffix.size();
-    for (size_t i = 0; i < suffix.size(); ++i) {
-        const unsigned char lhs = static_cast<unsigned char>(text[offset + i]);
-        const unsigned char rhs = static_cast<unsigned char>(suffix[i]);
-        if (std::tolower(lhs) != std::tolower(rhs)) {
-            return false;
-        }
-    }
-
-    return true;
 }
 
 std::vector<std::string> splitWords(const std::string& line)
@@ -369,9 +349,6 @@ std::string buildReceivedFileName(uint16_t stream_id, bool partial)
 
 bool resolveTrack(std::string request, TrackInfo& out)
 {
-    // Resolve a user-facing file reference into a verified SPIFFS file.
-    // Directory separators are rejected so commands cannot escape the SPIFFS
-    // root.
     request = trimAscii(request);
     if (request.empty()) {
         return false;
@@ -380,10 +357,6 @@ bool resolveTrack(std::string request, TrackInfo& out)
         request.erase(0, std::strlen("/spiffs/"));
     }
     if (request.find('/') != std::string::npos || request.find('\\') != std::string::npos) {
-        return false;
-    }
-
-    if (endsWithIgnoreCase(request, kReceivedPartialExtension)) {
         return false;
     }
 
@@ -399,8 +372,6 @@ bool resolveTrack(std::string request, TrackInfo& out)
 
 std::vector<TrackInfo> listTracks()
 {
-    // Build a stable, sorted view of the available files so the console can
-    // list them predictably.
     std::vector<TrackInfo> tracks;
     DIR* dir = opendir(kSpiffsRoot);
     if (!dir) {
@@ -413,9 +384,6 @@ std::vector<TrackInfo> listTracks()
         }
 
         const std::string name(entry->d_name);
-        if (endsWithIgnoreCase(name, kReceivedPartialExtension)) {
-            continue;
-        }
 
         size_t bytes = 0;
         if (!statFileSize(buildTrackPath(name), bytes)) {
@@ -434,10 +402,8 @@ std::vector<TrackInfo> listTracks()
 
 void printTrackTable(const std::vector<TrackInfo>& tracks, std::string_view selected_track)
 {
-    // Show every available file and mark the one transmit (TX) will use by
-    // default.
     if (tracks.empty()) {
-        std::printf("No files are available in SPIFFS.\n");
+        std::printf("No staged files are available in SPIFFS.\n");
         return;
     }
 
@@ -733,10 +699,10 @@ public:
             ESP_LOGI(TAG, "Wi-Fi control plane disabled for this build.");
         }
 
-        ESP_LOGI(TAG, "Data transfer pacing: ~%u bytes/sec, ~%u packets/sec, ~%u payload bits/sec",
-                 static_cast<unsigned>(kPayloadBytesPerSecond),
-                 static_cast<unsigned>(kPacketsPerSecond),
-                 static_cast<unsigned>(kPayloadBitsPerSecond));
+        ESP_LOGI(TAG, "Paced file transfer: %u bytes/sec, ~%u packets/sec, ~%u payload bits/sec",
+                 kPayloadBytesPerSecond,
+                 kPacketsPerSecond,
+                 kPayloadBitsPerSecond);
         printHelp();
         printTrackTable(tracks, selected_track_);
         printStatus();
@@ -1169,8 +1135,8 @@ private:
             "  HELP                 Show this command list\n"
             "  STATUS               Show radio state and selected file\n"
             "  STOP                 Stop any active TX/CW/Morse/RX and return to standby\n"
-            "  FILES                List staged SPIFFS files\n"
-            "  SELECT <file>        Choose which SPIFFS file TX will send\n"
+            "  FILES                List staged files in SPIFFS\n"
+            "  SELECT <file>        Choose which staged file TX will send\n"
             "  TX [file]            Start sending the selected or named file\n"
             "  TX LOOP [n|INF] [f]  Repeatedly send the selected or named file\n"
             "  MORSE <text>         Key A-Z/0-9/spaces as Morse; use STOP to abort\n"
@@ -1181,13 +1147,11 @@ private:
             "  POWERDOWN            Fully power down the radio\n"
             "  CHANNEL <0-125>      Reinitialize the radio on a new channel\n"
             "  CW START [ch] [0-3]  Start a continuous-wave test on a channel/power level\n"
-            "  CW LOOP <on> <off>   Repeat CW bursts; optional [ch] [pwr] [EVERY <loops>]\n"
-            "\nStage new files on the host with the PlatformIO 'Stage Demo File' target\n"
-            "or by running: python tools/stage_demo_file.py <path-to-file>\n");
+            "  CW LOOP <on> <off>   Repeat CW bursts; optional [ch] [pwr] [EVERY <loops>]\n");
 
-        if (kWirelessControlEnabled) {
-            std::printf("  REMOTE <cmd>         Send a short wireless command to a listening peer\n");
-        }
+        std::printf(
+            "\nStage a host file with the PlatformIO 'Stage Demo File' target\n"
+            "or by running: python tools/stage_demo_file.py <path-to-file>\n");
     }
 
     bool takeRadio(TickType_t timeout = portMAX_DELAY)
@@ -1739,8 +1703,8 @@ private:
 
         selected_track_ = track.name;
         std::printf("Selected %s (%u bytes)\n",
-                    selected_track_.c_str(),
-                    static_cast<unsigned>(track.bytes));
+            selected_track_.c_str(),
+            static_cast<unsigned>(track.bytes));
         return true;
     }
 
