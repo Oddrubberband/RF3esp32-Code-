@@ -62,7 +62,8 @@ namespace {
 constexpr const char* TAG = "APP";
 // Pace bulk file transfer conservatively so the receiver can drain the nRF24
 // receive (RX) FIFO without relying on acknowledgements or retransmits.
-constexpr uint32_t kDataPacketGapMs = 8;
+constexpr uint32_t kDataPacketGapMs = 20;
+constexpr uint32_t kDataPacketRepeatGapMs = 4;
 constexpr uint32_t kPacketsPerSecond = 1000u / kDataPacketGapMs;
 constexpr uint32_t kPayloadBytesPerSecond =
     kPacketsPerSecond * AudioPacket::kAudioBytesPerPacket;
