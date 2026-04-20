@@ -2882,10 +2882,45 @@ private:
                 ESP_LOGI(TAG, "RX STOP");
                 return;
 
-            case StreamSync::ReceiverGate::Action::AudioAccepted:
-                if (!appendIncomingFileChunk(sync_gate_.currentStreamId(), header, data)) {
+                    case StreamSync::ReceiverGate::Action::AudioAccepted: {
+            const uint16_t stream_id = sync_gate_.currentStreamId();
+
+            if (incoming_file_.active &&
+                incoming_file_.stream_id == stream_id &&
+                incoming_file_.next_sequence > 0 &&
+                header.sequence == static_cast<uint16_t>(incoming_file_.next_sequence - 1u)) {
+                ++raw_rx_packet_count_;
+                return;
+            }
+
+            if (!appendIncomingFileChunk(stream_id, header, data)) {
+                ++raw_rx_packet_count_;
+                return;
+            }
+
+            ++decoded_rx_packet_count_;
+
+            if (header.sequence == 0 ||
+                incoming_file_.packet_count == 1 ||
+                (incoming_file_.packet_count % 64u) == 0 ||
+                (header.flags & AudioPacket::kLast) != 0) {
+                ESP_LOGI(TAG,
+                         "RX data stream=%u seq=%u bytes=%u total=%u flags=0x%02X",
+                         static_cast<unsigned>(stream_id),
+                         static_cast<unsigned>(header.sequence),
+                         static_cast<unsigned>(header.audio_len),
+                         static_cast<unsigned>(incoming_file_.bytes_written),
+                         static_cast<unsigned>(header.flags));
+            }
+
+            if ((header.flags & AudioPacket::kLast) != 0) {
+                if (!finalizeIncomingFileTransfer()) {
                     ++raw_rx_packet_count_;
-                    return;
+                    sync_gate_.reset();
+                }
+            }
+            return;
+        
                 }
                 ++decoded_rx_packet_count_;
                 if (header.sequence == 0 ||
