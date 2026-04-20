@@ -556,23 +556,32 @@ bool sendDataFile(RadioManager& manager,
             return false;
         }
 
+                 uint8_t repeat_count = 0;
         if (sequence == 0) {
+            repeat_count = 2;  // seq0 total = 3 sends
+        } else if (sequence == 1) {
+            repeat_count = 1;  // seq1 total = 2 sends
+        }
+
+        for (uint8_t repeat_index = 0; repeat_index < repeat_count; ++repeat_index) {
             if (stop_requested && *stop_requested) {
                 std::fclose(fp);
-                ESP_LOGI(TAG, "Stopped TX during sequence 0 duplication for stream %u", stream_id);
+                ESP_LOGI(TAG,
+                         "Stopped TX during sequence %u repeat for stream %u",
+                         sequence,
+                         stream_id);
                 return false;
             }
 
-            uint8_t duplicate_packet[AudioPacket::kPacketBytes];
-            std::copy(packet, packet + AudioPacket::kPacketBytes, duplicate_packet);
+            delayAtLeastMs(kDataPacketRepeatGapMs);
 
-            delayAtLeastMs(StreamSync::kRecommendedSeq0DuplicateGapMs);
-
-            if (!manager.sendPayload(duplicate_packet, AudioPacket::kPacketBytes)) {
+            if (!manager.sendPayload(packet, AudioPacket::kPacketBytes)) {
                 std::fclose(fp);
                 const RadioStatus status = manager.status();
                 ESP_LOGE(TAG,
-                         "Sequence 0 repeat failed, STATUS=0x%02X FIFO=0x%02X OBSERVE_TX=0x%02X",
+                         "Sequence %u repeat %u failed, STATUS=0x%02X FIFO=0x%02X OBSERVE_TX=0x%02X",
+                         sequence,
+                         static_cast<unsigned>(repeat_index + 1u),
                          static_cast<unsigned>(status.last_status),
                          static_cast<unsigned>(status.last_fifo_status),
                          static_cast<unsigned>(status.last_observe_tx));
@@ -580,14 +589,8 @@ bool sendDataFile(RadioManager& manager,
             }
         }
 
-        ++sequence;
-
-        if (is_last) {
-            break;
-        }
-
         vTaskDelay(kDataPacketGap);
-    }
+        }
 
     if (StreamSync::encodeStop(stream_id, control_packet, control_len)) {
         (void)manager.sendPayload(control_packet, control_len);
@@ -2885,7 +2888,6 @@ private:
                 return;
             case StreamSync::ReceiverGate::Action::Ignore:
                 ++raw_rx_packet_count_;
-                ESP_LOGI(TAG, "RX packet ignored while waiting for file sync");
                 return;
 
             case StreamSync::ReceiverGate::Action::Invalid:
