@@ -62,8 +62,8 @@ namespace {
 constexpr const char* TAG = "APP";
 // Pace bulk file transfer conservatively so the receiver can drain the nRF24
 // receive (RX) FIFO without relying on acknowledgements or retransmits.
-constexpr uint32_t kDataPacketGapMs = 20;
-constexpr uint32_t kDataPacketRepeatGapMs = 4;
+constexpr uint32_t kDataPacketGapMs = 40;
+constexpr uint32_t kDataPacketRepeatGapMs = 8;
 constexpr uint32_t kPacketsPerSecond = 1000u / kDataPacketGapMs;
 constexpr uint32_t kPayloadBytesPerSecond =
     kPacketsPerSecond * AudioPacket::kAudioBytesPerPacket;
@@ -2871,9 +2871,7 @@ private:
 
         switch (sync_gate_.accept(payload, len, &header, &data)) {
             case StreamSync::ReceiverGate::Action::StartAccepted:
-                ESP_LOGI(TAG,
-                     "RX START armed for stream=%u",
-                     static_cast<unsigned>(sync_gate_.currentStreamId()));
+                ESP_LOGI(TAG, "RX START");
                 return;
             case StreamSync::ReceiverGate::Action::StopAccepted:
                 if (incoming_file_.active && !incoming_file_.saw_last_packet) {
@@ -2974,8 +2972,6 @@ private:
 
                     if (snapshot.carrier_detected && !last_carrier_detected_) {
                         ++carrier_event_count_;
-                        ESP_LOGI(TAG, "Carrier detect (RPD) high on channel %u",
-                                 static_cast<unsigned>(snapshot.channel));
                     }
                     last_carrier_detected_ = snapshot.carrier_detected;
 
