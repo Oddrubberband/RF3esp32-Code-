@@ -517,6 +517,7 @@ bool sendDataFile(RadioManager& manager,
 
         const size_t bytes_read =
             std::fread(file_chunk, 1, AudioPacket::kAudioBytesPerPacket, fp);
+
         if (bytes_read == 0) {
             if (std::ferror(fp)) {
                 std::fclose(fp);
@@ -526,8 +527,8 @@ bool sendDataFile(RadioManager& manager,
             break;
         }
 
-        size_t packet_len = 0;
         const bool is_last = bytes_read < AudioPacket::kAudioBytesPerPacket;
+        size_t packet_len = 0;
 
         std::fill(packet, packet + AudioPacket::kPacketBytes, 0);
 
@@ -558,7 +559,7 @@ bool sendDataFile(RadioManager& manager,
             return false;
         }
 
-                 uint8_t repeat_count = 0;
+        uint8_t repeat_count = 0;
         if (sequence == 0) {
             repeat_count = 2;  // seq0 total = 3 sends
         } else if (sequence == 1) {
@@ -591,8 +592,14 @@ bool sendDataFile(RadioManager& manager,
             }
         }
 
-        vTaskDelay(kDataPacketGap);
+        ++sequence;
+
+        if (is_last) {
+            break;
         }
+
+        vTaskDelay(kDataPacketGap);
+    }
 
     if (StreamSync::encodeStop(stream_id, control_packet, control_len)) {
         (void)manager.sendPayload(control_packet, control_len);
