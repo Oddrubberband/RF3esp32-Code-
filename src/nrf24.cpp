@@ -4,7 +4,17 @@
 
 namespace {
 constexpr std::array<uint8_t, 5> kDemoAddress = {0x52, 0x46, 0x33, 0x24, 0x01};
-constexpr uint8_t kDemoRfSetup = 0x26;  // 250 kbps, 0 dBm, LNA enabled.
+#ifndef RF3_NRF24_RF_SETUP
+#define RF3_NRF24_RF_SETUP 0x06
+#endif
+#ifndef RF3_NRF24_TX_CE_PULSE_US
+#define RF3_NRF24_TX_CE_PULSE_US 15
+#endif
+// Default to 1 Mbps because it is broadly supported across genuine parts and
+// clone modules. Boards that reliably support other rates can override this at
+// build time with RF3_NRF24_RF_SETUP.
+constexpr uint8_t kDemoRfSetup = RF3_NRF24_RF_SETUP;
+constexpr uint32_t kTxCePulseUs = RF3_NRF24_TX_CE_PULSE_US;
 }
 
 Nrf24::Nrf24(Nrf24Hal& hal)
@@ -259,7 +269,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
         return false;
     }
 
-    auto attempt_transmit = [&](bool rearm_radio) {
+    auto attempt_transmit = [&](bool rearm_radio, bool hold_ce_until_done) {
         if (rearm_radio) {
             const uint8_t channel = readReg(0x05);
 
@@ -288,11 +298,9 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
         last_tx_timed_out_ = false;
         last_tx_saw_irq_ = false;
 
-        // Force transmit (TX) mode, queue one payload, then keep Chip Enable
-        // (CE) asserted while we wait for the radio to report completion. A
-        // short pulse is sufficient per the datasheet, but some modules appear
-        // more reliable when CE stays high through the standby-to-transmit
-        // settling window.
+        // Force transmit (TX) mode, queue one payload, then trigger the send
+        // with either the normal short CE pulse or the longer hold-high
+        // fallback used by some clone modules.
         hal_.ce(false);
 
         uint8_t config = readReg(0x00);
@@ -316,6 +324,10 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
         // Leave extra time between the payload write and CE assertion.
         hal_.delayUs(150);
         hal_.ce(true);
+        if (!hold_ce_until_done) {
+            hal_.delayUs(kTxCePulseUs);
+            hal_.ce(false);
+        }
 
         const bool irq_connected = hal_.irqConnected();
         const uint64_t start = hal_.nowUs();
@@ -372,14 +384,16 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
         return false;
     };
 
-    if (attempt_transmit(false)) {
+    // Try the datasheet-style CE pulse first. If that stalls, fall back to the
+    // stronger re-prime-and-hold path that some modules prefer.
+    if (attempt_transmit(false, false)) {
         return true;
     }
 
     // Some clone modules and long-wire bench setups need a stronger re-prime
     // after cold start or a stalled first transmit. Re-apply the known packet
     // configuration and try once more before reporting failure to the app.
-    return attempt_transmit(true);
+    return attempt_transmit(true, true);
 }
 
 bool Nrf24::readOnePacket(uint8_t* out, size_t capacity, size_t& outLen)
@@ -551,7 +565,7 @@ void Nrf24::stopContinuousCarrier()
 void Nrf24::setStaticPayloadSize(uint8_t size)
 {
     // Tests may shrink or expand the fixed payload width. The main firmware
-    // keeps this at 32 bytes to maximize audio bytes per packet.
+    // keeps this at 32 bytes to maximize payload bytes per packet.
     static_payload_size_ = size;
 }
 

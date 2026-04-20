@@ -1,8 +1,8 @@
 #include "audio_packet.hpp"
 
 // The implementation here mirrors the on-air packet format documented in the
-// header: a tiny fixed header plus up to 28 meaningful pulse-code modulation
-// (PCM) bytes inside one 32-byte radio payload.
+// header: a tiny fixed header plus up to 28 meaningful payload bytes inside
+// one 32-byte radio payload.
 namespace AudioPacket {
 bool encode(uint16_t sequence,
             const uint8_t* audio,
@@ -24,7 +24,7 @@ bool encode(uint16_t sequence,
         out_packet[i] = 0;
     }
 
-    // Header layout is sequence (little-endian), audio length, then bit flags.
+    // Header layout is sequence (little-endian), payload length, then bit flags.
     out_packet[0] = static_cast<uint8_t>(sequence & 0xFF);
     out_packet[1] = static_cast<uint8_t>((sequence >> 8) & 0xFF);
     out_packet[2] = static_cast<uint8_t>(audio_len);

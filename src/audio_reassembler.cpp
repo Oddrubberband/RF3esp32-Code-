@@ -37,7 +37,7 @@ bool AudioReassembler::acceptPacket(const uint8_t* packet, size_t packet_len)
         }
     }
 
-    // The original stream is recovered by appending each packet's audio bytes in
+    // The original stream is recovered by appending each packet's payload bytes in
     // order. There is no further compression or framing at this layer.
     audio_.insert(audio_.end(), audio, audio + header.audio_len);
     next_sequence_ = static_cast<uint16_t>(header.sequence + 1);

@@ -10,7 +10,7 @@
 //
 // The class deliberately exposes register helpers and a few high-level radio
 // actions instead of trying to be a complete nRF24L01+ driver. That keeps the
-// code focused on the static-payload audio demo and the associated tests.
+// code focused on the fixed-payload file-transfer demo and the associated tests.
 class Nrf24 {
 public:
     explicit Nrf24(Nrf24Hal& hal);

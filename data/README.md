@@ -1,37 +1,38 @@
-# Audio Upload Workflow
+# Staged File Workflow
 
-1. Prepare an MP3 for the demo.
+1. Stage a file for transfer.
 
 PlatformIO sidebar:
-- Run `Prepare Demo Audio`.
-- Pick an `.mp3` file when prompted.
+- Run `Stage Demo File`.
+- Pick any file when prompted.
 
 CLI:
 
 ```bash
-python tools/prepare_demo_audio.py path/to/input.mp3
+python tools/stage_demo_file.py path/to/input.bin
 ```
 
 The helper script:
-- accepts only `.mp3` input
-- converts it to raw `8000 Hz`, `8-bit`, `mono` PCM
-- writes the converted track into this `data/` folder as a `.u8` file
-- rejects files that do not fit the configured SPIFFS partition
+- accepts arbitrary input files
+- writes the staged copy into this `data/` folder
+- checks that the resulting SPIFFS image still fits
+- can optionally validate the fit with `mkspiffs`
 
 2. Upload the filesystem image from PlatformIO.
-   In the PlatformIO sidebar, use `Upload Filesystem Image`.
+
+In the PlatformIO sidebar, use `Upload Filesystem Image`.
 
 3. Flash the firmware and boot the board.
 
 4. Open the serial monitor and use commands such as:
 - `FILES`
-- `SELECT your_track.u8`
+- `SELECT your_file.bin`
 - `TX`
 - `RX`
-- `SLEEP`
 - `STATUS`
 
 Notes:
-- The firmware now lists and selects `.u8` tracks from `/spiffs`.
-- Each packet uses 4 bytes of header and up to 28 bytes of audio.
-- The conversion helper requires `ffmpeg` on the host machine.
+- The firmware lists every regular staged file from `/spiffs`.
+- Partial RX saves use `.part` temporarily and are hidden from `FILES`.
+- Completed RX streams are saved as `rx_####.bin`.
+- Each packet uses 4 bytes of header and up to 28 bytes of payload.

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cctype>
 #include <cstdarg>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
+#include <utility>
 #include <vector>
 
 #include "esp_err.h"
@@ -43,9 +45,13 @@
 #define WIRELESS_CONTROL_AUTO_RX 0
 #endif
 
+#ifndef RF3_WIFI_CONTROL_ENABLED
+#define RF3_WIFI_CONTROL_ENABLED 1
+#endif
+
 // main.cpp owns the top-level demo flow:
 // - mount the Serial Peripheral Interface Flash File System (SPIFFS) partition
-//   that stores converted audio
+//   that stores staged data files
 // - initialize the nRF24 radio
 // - expose a serial-console command loop
 // - run a small background task that polls receive (RX) mode
@@ -54,42 +60,44 @@
 // files keep packet formatting and radio access focused and testable.
 namespace {
 constexpr const char* TAG = "APP";
-// The demo audio format is unsigned 8-bit mono pulse-code modulation (PCM) at
-// 8 kHz, so one byte is consumed per sample.
-constexpr uint32_t kSampleRateHz = 8000;
-constexpr uint32_t kAudioBytesPerSecond = kSampleRateHz;
-constexpr uint32_t kSampleBytePeriodUs = 1000000u / kSampleRateHz;
-// Packet rate is derived from the packet payload budget.
-constexpr uint32_t kPacketsPerSecond =
-    (kAudioBytesPerSecond + AudioPacket::kAudioBytesPerPacket - 1) /
-    AudioPacket::kAudioBytesPerPacket;
-// Rough over-the-air bitrate including the packet header bytes.
+// Pace bulk file transfer conservatively so the receiver can drain the nRF24
+// receive (RX) FIFO without relying on acknowledgements or retransmits.
+constexpr uint32_t kDataPacketGapMs = 2;
+constexpr uint32_t kPacketsPerSecond = 1000u / kDataPacketGapMs;
+constexpr uint32_t kPayloadBytesPerSecond =
+    kPacketsPerSecond * AudioPacket::kAudioBytesPerPacket;
+// Rough over-the-air bitrate including the fixed packet header bytes.
 constexpr uint32_t kPayloadBitsPerSecond =
     kPacketsPerSecond * AudioPacket::kPacketBytes * 8;
 constexpr const char* kSpiffsRoot = "/spiffs";
-constexpr const char* kDefaultTrack = "song.u8";
+constexpr const char* kDefaultTrack = "";
+constexpr const char* kReceivedFilePrefix = "rx_";
+constexpr const char* kReceivedFileExtension = ".bin";
+constexpr const char* kReceivedPartialExtension = ".part";
 constexpr uint32_t kDefaultMorseDotMs = 120;
 constexpr uint8_t kDefaultMorsePowerLevel = 3;
+constexpr TickType_t kDataPacketGap =
+    pdMS_TO_TICKS(kDataPacketGapMs) > 0 ? pdMS_TO_TICKS(kDataPacketGapMs) : 1;
 constexpr TickType_t kLoopWorkerPeriod = pdMS_TO_TICKS(20);
 constexpr TickType_t kLoopStopPollPeriod = pdMS_TO_TICKS(20);
 constexpr TickType_t kLoopStopTimeout = pdMS_TO_TICKS(2000);
 constexpr TickType_t kWifiControlPollPeriod = pdMS_TO_TICKS(100);
 // The nRF24 RX FIFO is only three packets deep, so polling much slower than
-// the packet cadence will overrun the queue during live audio traffic.
+// the packet cadence will overrun the queue during live data transfer.
 constexpr TickType_t kRxPollPeriod = pdMS_TO_TICKS(2) > 0 ? pdMS_TO_TICKS(2) : 1;
 constexpr TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(15000);
 constexpr size_t kConsoleLineBytes = 160;
 constexpr bool kWirelessControlEnabled = WIRELESS_CONTROL_ENABLED != 0;
 constexpr bool kWirelessControlAutoRx = WIRELESS_CONTROL_AUTO_RX != 0;
+constexpr bool kWifiControlEnabled = RF3_WIFI_CONTROL_ENABLED != 0;
 constexpr EventBits_t kWifiConnectedBit = BIT0;
 constexpr char kWifiPlaceholderSsid[] = "YOUR_WIFI_SSID";
 constexpr char kWifiPlaceholderPassword[] = "YOUR_WIFI_PASSWORD";
 
-// These compile-time checks keep the audio format aligned with nRF24 hardware
-// limits instead of failing later at runtime.
+// These compile-time checks keep the packetized transfer settings aligned with
+// nRF24 hardware limits instead of failing later at runtime.
 static_assert(AudioPacket::kPacketBytes <= 32, "nRF24 payload limit exceeded");
-static_assert(kPayloadBitsPerSecond < 250000, "Audio stream exceeds the nRF24 250 kbps mode");
-static_assert((1000000u % kSampleRateHz) == 0, "Sample timing must be an integer number of microseconds");
+static_assert(kPayloadBitsPerSecond < 250000, "Data transfer pacing exceeds the nRF24 250 kbps mode");
 
 struct TrackInfo {
     std::string name;
@@ -133,9 +141,23 @@ struct HttpStatusSnapshot {
     bool tx_ok = false;
     bool tx_timeout = false;
     uint32_t rx_packets = 0;
-    uint32_t rx_audio = 0;
+    uint32_t rx_stream = 0;
     uint32_t rx_raw = 0;
+    uint32_t rx_saved = 0;
+    uint32_t rx_saved_bytes = 0;
     int last_fault = 0;
+};
+
+struct IncomingFileTransfer {
+    bool active = false;
+    bool saw_last_packet = false;
+    uint16_t stream_id = 0;
+    uint16_t next_sequence = 0;
+    uint32_t packet_count = 0;
+    size_t bytes_written = 0;
+    std::string final_name;
+    std::string partial_name;
+    std::FILE* file = nullptr;
 };
 
 const char* loopModeName(LoopMode mode)
@@ -179,8 +201,8 @@ std::string uppercaseCopy(std::string_view text)
 
 bool endsWithIgnoreCase(std::string_view text, std::string_view suffix)
 {
-    // Track selection accepts file names in any case but still enforces the
-    // expected .u8 extension.
+    // File selection accepts names in any case while still enforcing a
+    // specific suffix when needed.
     if (text.size() < suffix.size()) {
         return false;
     }
@@ -280,7 +302,7 @@ bool parseLoopCountToken(std::string_view text, bool& infinite, uint32_t& count)
 bool statFileSize(const std::string& path, size_t& bytes)
 {
     // SPIFFS directory listings only provide file names. stat() is used to get
-    // an accurate byte count for user-interface (UI) output and track
+    // an accurate byte count for user-interface (UI) output and file
     // selection.
     struct stat info {};
     if (::stat(path.c_str(), &info) != 0) {
@@ -291,13 +313,6 @@ bool statFileSize(const std::string& path, size_t& bytes)
     }
     bytes = static_cast<size_t>(info.st_size);
     return true;
-}
-
-double durationSeconds(size_t bytes)
-{
-    // Duration is derived directly from the known pulse-code modulation (PCM)
-    // format: one byte per sample at 8 kHz.
-    return static_cast<double>(bytes) / static_cast<double>(kAudioBytesPerSecond);
 }
 
 void delayAtLeastMs(uint32_t duration_ms)
@@ -328,7 +343,7 @@ void appendFormat(std::string& out, const char* format, ...)
     va_end(args);
 }
 
-// ---- SPIFFS track discovery helpers --------------------------------------
+// ---- SPIFFS file discovery helpers ---------------------------------------
 
 std::string buildTrackPath(std::string_view name)
 {
@@ -340,12 +355,23 @@ std::string buildTrackPath(std::string_view name)
     return std::string(kSpiffsRoot) + "/" + std::string(name);
 }
 
+std::string buildReceivedFileName(uint16_t stream_id, bool partial)
+{
+    char buffer[24] = {};
+    std::snprintf(buffer,
+                  sizeof(buffer),
+                  "%s%04u%s",
+                  kReceivedFilePrefix,
+                  static_cast<unsigned>(stream_id),
+                  partial ? kReceivedPartialExtension : kReceivedFileExtension);
+    return std::string(buffer);
+}
+
 bool resolveTrack(std::string request, TrackInfo& out)
 {
-    // Resolve a user-facing track reference into a verified SPIFFS file.
-    //
-    // The console accepts either "song" or "song.u8". Directory separators are
-    // rejected so commands cannot escape the SPIFFS root.
+    // Resolve a user-facing file reference into a verified SPIFFS file.
+    // Directory separators are rejected so commands cannot escape the SPIFFS
+    // root.
     request = trimAscii(request);
     if (request.empty()) {
         return false;
@@ -357,18 +383,15 @@ bool resolveTrack(std::string request, TrackInfo& out)
         return false;
     }
 
-    std::vector<std::string> candidates{request};
-    if (!endsWithIgnoreCase(request, ".u8")) {
-        candidates.push_back(request + ".u8");
+    if (endsWithIgnoreCase(request, kReceivedPartialExtension)) {
+        return false;
     }
 
-    for (const std::string& candidate : candidates) {
-        size_t bytes = 0;
-        if (statFileSize(buildTrackPath(candidate), bytes)) {
-            out.name = candidate;
-            out.bytes = bytes;
-            return true;
-        }
+    size_t bytes = 0;
+    if (statFileSize(buildTrackPath(request), bytes)) {
+        out.name = request;
+        out.bytes = bytes;
+        return true;
     }
 
     return false;
@@ -376,7 +399,7 @@ bool resolveTrack(std::string request, TrackInfo& out)
 
 std::vector<TrackInfo> listTracks()
 {
-    // Build a stable, sorted view of the available .u8 files so the console can
+    // Build a stable, sorted view of the available files so the console can
     // list them predictably.
     std::vector<TrackInfo> tracks;
     DIR* dir = opendir(kSpiffsRoot);
@@ -390,7 +413,7 @@ std::vector<TrackInfo> listTracks()
         }
 
         const std::string name(entry->d_name);
-        if (!endsWithIgnoreCase(name, ".u8")) {
+        if (endsWithIgnoreCase(name, kReceivedPartialExtension)) {
             continue;
         }
 
@@ -414,18 +437,17 @@ void printTrackTable(const std::vector<TrackInfo>& tracks, std::string_view sele
     // Show every available file and mark the one transmit (TX) will use by
     // default.
     if (tracks.empty()) {
-        std::printf("No .u8 tracks are available in SPIFFS.\n");
+        std::printf("No files are available in SPIFFS.\n");
         return;
     }
 
-    std::printf("Tracks in SPIFFS:\n");
+    std::printf("Files in SPIFFS:\n");
     for (const TrackInfo& track : tracks) {
         const char* marker = track.name == selected_track ? "*" : " ";
-        std::printf(" %s %s (%u bytes, %.1f s)\n",
+        std::printf(" %s %s (%u bytes)\n",
                     marker,
                     track.name.c_str(),
-                    static_cast<unsigned>(track.bytes),
-                    durationSeconds(track.bytes));
+                    static_cast<unsigned>(track.bytes));
     }
 }
 
@@ -433,8 +455,8 @@ void printTrackTable(const std::vector<TrackInfo>& tracks, std::string_view sele
 
 bool mountSongFs()
 {
-    // The app expects a prebuilt SPIFFS image containing converted audio files.
-    // It does not auto-format on failure because an empty partition is more
+    // The app expects a prebuilt SPIFFS image containing staged data files. It
+    // does not auto-format on failure because an empty partition is more
     // likely a missing upload than genuine corruption.
     esp_vfs_spiffs_conf_t conf{};
     conf.base_path = kSpiffsRoot;
@@ -459,13 +481,13 @@ bool mountSongFs()
     return true;
 }
 
-bool sendU8Song(RadioManager& manager,
-                const char* path,
-                const volatile bool* stop_requested = nullptr)
+bool sendDataFile(RadioManager& manager,
+                  const char* path,
+                  const volatile bool* stop_requested = nullptr)
 {
     std::FILE* fp = std::fopen(path, "rb");
     if (!fp) {
-        ESP_LOGE(TAG, "Could not open %s. Use the Prepare Demo Audio task and upload the filesystem image.", path);
+        ESP_LOGE(TAG, "Could not open %s. Stage a file into data/ and upload the filesystem image.", path);
         return false;
     }
 
@@ -487,7 +509,7 @@ bool sendU8Song(RadioManager& manager,
     for (uint8_t i = 0; i < StreamSync::kRecommendedStartRepeats; ++i) {
         if (stop_requested && *stop_requested) {
             std::fclose(fp);
-            ESP_LOGI(TAG, "Stopped TX before audio start for stream %u", stream_id);
+            ESP_LOGI(TAG, "Stopped TX before file data for stream %u", stream_id);
             return false;
         }
 
@@ -510,10 +532,9 @@ bool sendU8Song(RadioManager& manager,
 
     delayAtLeastMs(StreamSync::kRecommendedPostStartGapMs);
 
-    uint8_t audio_chunk[AudioPacket::kAudioBytesPerPacket];
+    uint8_t file_chunk[AudioPacket::kAudioBytesPerPacket];
     uint8_t packet[AudioPacket::kPacketBytes];
     uint16_t sequence = 0;
-    uint32_t pacing_remainder_us = 0;
 
     while (true) {
         if (stop_requested && *stop_requested) {
@@ -523,8 +544,13 @@ bool sendU8Song(RadioManager& manager,
         }
 
         const size_t bytes_read =
-            std::fread(audio_chunk, 1, AudioPacket::kAudioBytesPerPacket, fp);
+            std::fread(file_chunk, 1, AudioPacket::kAudioBytesPerPacket, fp);
         if (bytes_read == 0) {
+            if (std::ferror(fp)) {
+                std::fclose(fp);
+                ESP_LOGE(TAG, "Read failed while sending %s", path);
+                return false;
+            }
             break;
         }
 
@@ -534,7 +560,7 @@ bool sendU8Song(RadioManager& manager,
         std::fill(packet, packet + AudioPacket::kPacketBytes, 0);
 
         if (!AudioPacket::encode(sequence,
-                                 audio_chunk,
+                                 file_chunk,
                                  bytes_read,
                                  sequence == 0,
                                  is_last,
@@ -569,7 +595,6 @@ bool sendU8Song(RadioManager& manager,
 
             uint8_t duplicate_packet[AudioPacket::kPacketBytes];
             std::copy(packet, packet + AudioPacket::kPacketBytes, duplicate_packet);
-            duplicate_packet[AudioPacket::kPacketBytes - 1] ^= 0xA5;
 
             delayAtLeastMs(StreamSync::kRecommendedSeq0DuplicateGapMs);
 
@@ -577,7 +602,7 @@ bool sendU8Song(RadioManager& manager,
                 std::fclose(fp);
                 const RadioStatus status = manager.status();
                 ESP_LOGE(TAG,
-                         "Sequence 0 duplicate failed, STATUS=0x%02X FIFO=0x%02X OBSERVE_TX=0x%02X",
+                         "Sequence 0 repeat failed, STATUS=0x%02X FIFO=0x%02X OBSERVE_TX=0x%02X",
                          static_cast<unsigned>(status.last_status),
                          static_cast<unsigned>(status.last_fifo_status),
                          static_cast<unsigned>(status.last_observe_tx));
@@ -587,18 +612,11 @@ bool sendU8Song(RadioManager& manager,
 
         ++sequence;
 
-        const uint32_t chunk_total_us =
-            static_cast<uint32_t>(bytes_read) * 125u + pacing_remainder_us;
-        const uint32_t chunk_ms = chunk_total_us / 1000u;
-        pacing_remainder_us = chunk_total_us % 1000u;
-
-        if (chunk_ms > 0) {
-            vTaskDelay(pdMS_TO_TICKS(chunk_ms));
-        }
-
         if (is_last) {
             break;
         }
+
+        vTaskDelay(kDataPacketGap);
     }
 
     if (StreamSync::encodeStop(stream_id, control_packet, control_len)) {
@@ -623,7 +641,7 @@ public:
         // interactive console can start:
         // - create a mutex that serializes all radio access
         // - disable stdio buffering so the serial console feels live
-        // - mount SPIFFS and verify the selected track exists
+        // - mount SPIFFS and verify the selected file exists
         // - boot the radio
         // - start the background receive (RX) polling task
         radio_mutex_ = xSemaphoreCreateMutex();
@@ -676,7 +694,7 @@ public:
             ESP_LOGW(TAG, "Continuing without radio so SPIFFS and the serial console remain testable.");
         }
 
-        // If the configured default track is missing, fall back to the first
+        // If the configured default file is missing, fall back to the first
         // available SPIFFS file so the transmit (TX) command still has a sane
         // default.
         const std::vector<TrackInfo> tracks = listTracks();
@@ -707,12 +725,16 @@ public:
             tryResumeWirelessRx("Wireless control armed");
         }
 
-        if (!startWifiControlPlane()) {
-            ESP_LOGW(TAG, "Wi-Fi control plane not available. Serial console remains active.");
+        if (kWifiControlEnabled) {
+            if (!startWifiControlPlane()) {
+                ESP_LOGW(TAG, "Wi-Fi control plane not available. Serial console remains active.");
+            }
+        } else {
+            ESP_LOGI(TAG, "Wi-Fi control plane disabled for this build.");
         }
 
-        ESP_LOGI(TAG, "Audio stream: %u bytes/sec, ~%u packets/sec, ~%u payload bits/sec",
-                 static_cast<unsigned>(kAudioBytesPerSecond),
+        ESP_LOGI(TAG, "Data transfer pacing: ~%u bytes/sec, ~%u packets/sec, ~%u payload bits/sec",
+                 static_cast<unsigned>(kPayloadBytesPerSecond),
                  static_cast<unsigned>(kPacketsPerSecond),
                  static_cast<unsigned>(kPayloadBitsPerSecond));
         printHelp();
@@ -1067,16 +1089,18 @@ private:
 
     void wifiControlTask()
     {
-        while (true) {
-            const EventBits_t bits = xEventGroupWaitBits(wifi_event_group_,
-                                                         kWifiConnectedBit,
-                                                         pdFALSE,
-                                                         pdFALSE,
-                                                         kWifiControlPollPeriod);
-            if ((bits & kWifiConnectedBit) != 0 && !http_server_) {
-                (void)startHttpServer();
-            }
+        const EventBits_t bits = xEventGroupWaitBits(wifi_event_group_,
+                                                     kWifiConnectedBit,
+                                                     pdFALSE,
+                                                     pdFALSE,
+                                                     portMAX_DELAY);
+
+        if ((bits & kWifiConnectedBit) != 0 && !http_server_) {
+            (void)startHttpServer();
         }
+
+        wifi_control_task_ = nullptr;
+        vTaskDelete(nullptr);
     }
 
     esp_err_t handleHttpStatus(httpd_req_t* req)
@@ -1145,10 +1169,10 @@ private:
             "  HELP                 Show this command list\n"
             "  STATUS               Show radio state and selected file\n"
             "  STOP                 Stop any active TX/CW/Morse/RX and return to standby\n"
-            "  FILES                List available .u8 tracks in SPIFFS\n"
-            "  SELECT <file>        Choose which SPIFFS track TX will send\n"
-            "  TX [file]            Start sending the selected or named track\n"
-            "  TX LOOP [n|INF] [f]  Repeatedly send the selected or named track\n"
+            "  FILES                List staged SPIFFS files\n"
+            "  SELECT <file>        Choose which SPIFFS file TX will send\n"
+            "  TX [file]            Start sending the selected or named file\n"
+            "  TX LOOP [n|INF] [f]  Repeatedly send the selected or named file\n"
             "  MORSE <text>         Key A-Z/0-9/spaces as Morse; use STOP to abort\n"
             "  RX                   Enter receive/listen mode\n"
             "  STANDBY              Leave RX/CW/sleep and return to standby\n"
@@ -1158,8 +1182,8 @@ private:
             "  CHANNEL <0-125>      Reinitialize the radio on a new channel\n"
             "  CW START [ch] [0-3]  Start a continuous-wave test on a channel/power level\n"
             "  CW LOOP <on> <off>   Repeat CW bursts; optional [ch] [pwr] [EVERY <loops>]\n"
-            "\nPrepare new tracks on the host with the PlatformIO 'Prepare Demo Audio' target\n"
-            "or by running: python tools/prepare_demo_audio.py <path-to-song.mp3>\n");
+            "\nStage new files on the host with the PlatformIO 'Stage Demo File' target\n"
+            "or by running: python tools/stage_demo_file.py <path-to-file>\n");
 
         if (kWirelessControlEnabled) {
             std::printf("  REMOTE <cmd>         Send a short wireless command to a listening peer\n");
@@ -1216,12 +1240,168 @@ private:
         loop_config_ = LoopConfig{};
     }
 
+    void closeIncomingFileHandle()
+    {
+        if (incoming_file_.file) {
+            std::fclose(incoming_file_.file);
+            incoming_file_.file = nullptr;
+        }
+    }
+
+    void discardIncomingFileTransfer(const char* reason)
+    {
+        if (incoming_file_.active && reason && *reason) {
+            ESP_LOGW(TAG,
+                     "%s stream=%u file=%s bytes=%u packets=%u",
+                     reason,
+                     static_cast<unsigned>(incoming_file_.stream_id),
+                     incoming_file_.partial_name.c_str(),
+                     static_cast<unsigned>(incoming_file_.bytes_written),
+                     static_cast<unsigned>(incoming_file_.packet_count));
+        }
+
+        const std::string partial_path =
+            incoming_file_.partial_name.empty() ? std::string{} : buildTrackPath(incoming_file_.partial_name);
+
+        closeIncomingFileHandle();
+        if (!partial_path.empty()) {
+            (void)std::remove(partial_path.c_str());
+        }
+
+        incoming_file_ = IncomingFileTransfer{};
+    }
+
+    bool startIncomingFileTransfer(uint16_t stream_id)
+    {
+        if (incoming_file_.active &&
+            incoming_file_.stream_id == stream_id &&
+            incoming_file_.packet_count == 0 &&
+            incoming_file_.bytes_written == 0) {
+            return true;
+        }
+
+        if (incoming_file_.active) {
+            discardIncomingFileTransfer("Discarding partial RX file before a new START");
+        }
+
+        IncomingFileTransfer next{};
+        next.active = true;
+        next.stream_id = stream_id;
+        next.final_name = buildReceivedFileName(stream_id, false);
+        next.partial_name = buildReceivedFileName(stream_id, true);
+
+        const std::string partial_path = buildTrackPath(next.partial_name);
+        (void)std::remove(partial_path.c_str());
+
+        next.file = std::fopen(partial_path.c_str(), "wb");
+        if (!next.file) {
+            ESP_LOGE(TAG,
+                     "Could not open %s for RX stream %u: errno=%d",
+                     partial_path.c_str(),
+                     static_cast<unsigned>(stream_id),
+                     errno);
+            return false;
+        }
+
+        incoming_file_ = std::move(next);
+        return true;
+    }
+
+    bool finalizeIncomingFileTransfer()
+    {
+        if (!incoming_file_.active) {
+            return false;
+        }
+
+        const std::string partial_name = incoming_file_.partial_name;
+        const std::string final_name = incoming_file_.final_name;
+        const uint16_t stream_id = incoming_file_.stream_id;
+        const size_t bytes_written = incoming_file_.bytes_written;
+        const uint32_t packet_count = incoming_file_.packet_count;
+        const std::string partial_path = buildTrackPath(partial_name);
+        const std::string final_path = buildTrackPath(final_name);
+
+        closeIncomingFileHandle();
+        (void)std::remove(final_path.c_str());
+        if (std::rename(partial_path.c_str(), final_path.c_str()) != 0) {
+            ESP_LOGE(TAG,
+                     "Could not finalize RX file %s -> %s for stream %u: errno=%d",
+                     partial_path.c_str(),
+                     final_path.c_str(),
+                     static_cast<unsigned>(stream_id),
+                     errno);
+            (void)std::remove(partial_path.c_str());
+            incoming_file_ = IncomingFileTransfer{};
+            return false;
+        }
+
+        incoming_file_ = IncomingFileTransfer{};
+        ++saved_rx_file_count_;
+        saved_rx_byte_count_ += static_cast<uint32_t>(bytes_written);
+        ESP_LOGI(TAG,
+                 "Saved RX file %s (%u bytes across %u packets) for stream %u",
+                 final_name.c_str(),
+                 static_cast<unsigned>(bytes_written),
+                 static_cast<unsigned>(packet_count),
+                 static_cast<unsigned>(stream_id));
+        return true;
+    }
+
+    bool appendIncomingFileChunk(uint16_t stream_id,
+                                 const AudioPacket::Header& header,
+                                 const uint8_t* data)
+    {
+        if (!data) {
+            return false;
+        }
+
+        if (!incoming_file_.active || incoming_file_.stream_id != stream_id) {
+            if (!startIncomingFileTransfer(stream_id)) {
+                return false;
+            }
+        }
+
+        if (header.sequence != incoming_file_.next_sequence) {
+            ESP_LOGW(TAG,
+                     "RX sequence mismatch for stream=%u expected=%u got=%u",
+                     static_cast<unsigned>(stream_id),
+                     static_cast<unsigned>(incoming_file_.next_sequence),
+                     static_cast<unsigned>(header.sequence));
+            discardIncomingFileTransfer("Discarding partial RX file after sequence mismatch");
+            sync_gate_.reset();
+            return false;
+        }
+
+        const size_t written = std::fwrite(data, 1, header.audio_len, incoming_file_.file);
+        if (written != header.audio_len) {
+            ESP_LOGE(TAG,
+                     "RX write failed for stream=%u file=%s wrote=%u expected=%u errno=%d",
+                     static_cast<unsigned>(stream_id),
+                     incoming_file_.partial_name.c_str(),
+                     static_cast<unsigned>(written),
+                     static_cast<unsigned>(header.audio_len),
+                     errno);
+            discardIncomingFileTransfer("Discarding partial RX file after write failure");
+            sync_gate_.reset();
+            return false;
+        }
+
+        incoming_file_.next_sequence = static_cast<uint16_t>(header.sequence + 1u);
+        incoming_file_.packet_count += 1;
+        incoming_file_.bytes_written += written;
+        incoming_file_.saw_last_packet = (header.flags & AudioPacket::kLast) != 0;
+        return true;
+    }
+
     void resetRxSession()
     {
+        discardIncomingFileTransfer(nullptr);
         last_carrier_detected_ = false;
         carrier_event_count_ = 0;
         decoded_rx_packet_count_ = 0;
         raw_rx_packet_count_ = 0;
+        saved_rx_file_count_ = 0;
+        saved_rx_byte_count_ = 0;
         sync_gate_.reset();
     }
 
@@ -1312,6 +1492,8 @@ private:
             if (!manager_.leaveRx()) {
                 return false;
             }
+            discardIncomingFileTransfer("Discarding partial RX file while leaving RX");
+            sync_gate_.reset();
             status = manager_.status();
         }
         if (status.state == RadioState::Sleep || status.state == RadioState::PowerDown) {
@@ -1419,7 +1601,7 @@ private:
         } else {
             std::printf("power=unknown ");
         }
-        std::printf("selected=%s last_status=0x%02X fifo=0x%02X observe=0x%02X irq=%s tx_irq_seen=%s tx_ok=%s tx_timeout=%s rx_len=%u rx_packets=%u rx_audio=%u rx_raw=%u carrier_events=%u fault=%d",
+        std::printf("selected=%s last_status=0x%02X fifo=0x%02X observe=0x%02X irq=%s tx_irq_seen=%s tx_ok=%s tx_timeout=%s rx_len=%u rx_packets=%u rx_stream=%u rx_raw=%u rx_saved=%u rx_saved_bytes=%u carrier_events=%u fault=%d",
                     selected_track_.c_str(),
                     static_cast<unsigned>(status.last_status),
                     static_cast<unsigned>(status.last_fifo_status),
@@ -1432,6 +1614,8 @@ private:
                     static_cast<unsigned>(status.rx_packets),
                     static_cast<unsigned>(decoded_packets),
                     static_cast<unsigned>(raw_packets),
+                    static_cast<unsigned>(saved_rx_file_count_),
+                    static_cast<unsigned>(saved_rx_byte_count_),
                     static_cast<unsigned>(carrier_events),
                     status.last_fault);
         if (kWirelessControlEnabled) {
@@ -1451,7 +1635,7 @@ private:
         if (loop.active) {
             std::printf(" loop=%s", loopModeName(loop.mode));
             if (loop.mode == LoopMode::Tx) {
-                std::printf(" loop_track=%s", loop.track_name.c_str());
+                std::printf(" loop_file=%s", loop.track_name.c_str());
                 if (loop.infinite) {
                     std::printf(" loop_remaining=inf");
                 } else {
@@ -1489,8 +1673,10 @@ private:
         out.tx_ok = status.last_tx_ok;
         out.tx_timeout = status.last_tx_timed_out;
         out.rx_packets = status.rx_packets;
-        out.rx_audio = decoded_rx_packet_count_;
+        out.rx_stream = decoded_rx_packet_count_;
         out.rx_raw = raw_rx_packet_count_;
+        out.rx_saved = saved_rx_file_count_;
+        out.rx_saved_bytes = saved_rx_byte_count_;
         out.last_fault = status.last_fault;
         giveRadio();
         return true;
@@ -1507,7 +1693,8 @@ private:
         appendFormat(json,
                      "{\"node_name\":\"%s\",\"hostname\":\"%s\",\"state\":\"%s\",\"channel\":%u,"
                      "\"tx_ok\":%s,\"tx_timeout\":%s,\"rx_packets\":%u,"
-                     "\"rx_audio\":%u,\"rx_raw\":%u,\"last_fault\":%d}",
+                     "\"rx_stream\":%u,\"rx_raw\":%u,\"rx_saved\":%u,"
+                     "\"rx_saved_bytes\":%u,\"last_fault\":%d}",
                      snapshot.node_name,
                      snapshot.hostname,
                      snapshot.state_name,
@@ -1515,8 +1702,10 @@ private:
                      snapshot.tx_ok ? "true" : "false",
                      snapshot.tx_timeout ? "true" : "false",
                      static_cast<unsigned>(snapshot.rx_packets),
-                     static_cast<unsigned>(snapshot.rx_audio),
+                     static_cast<unsigned>(snapshot.rx_stream),
                      static_cast<unsigned>(snapshot.rx_raw),
+                     static_cast<unsigned>(snapshot.rx_saved),
+                     static_cast<unsigned>(snapshot.rx_saved_bytes),
                      snapshot.last_fault);
         return json;
     }
@@ -1538,18 +1727,20 @@ private:
         // commands. It
         // does not start transmission immediately.
         if (words.size() < 2) {
-            std::printf("Usage: SELECT <file.u8>\n");
+            std::printf("Usage: SELECT <file>\n");
             return false;
         }
 
         TrackInfo track{};
         if (!resolveTrack(words[1], track)) {
-            std::printf("Track '%s' was not found in SPIFFS.\n", words[1].c_str());
+            std::printf("File '%s' was not found in SPIFFS.\n", words[1].c_str());
             return false;
         }
 
         selected_track_ = track.name;
-        std::printf("Selected %s (%.1f s)\n", selected_track_.c_str(), durationSeconds(track.bytes));
+        std::printf("Selected %s (%u bytes)\n",
+                    selected_track_.c_str(),
+                    static_cast<unsigned>(track.bytes));
         return true;
     }
 
@@ -1564,7 +1755,7 @@ private:
 
             if (action == "LOOP") {
                 if (words.size() > 4) {
-                    std::printf("Usage: TX LOOP [count|INF] [file.u8]\n");
+                    std::printf("Usage: TX LOOP [count|INF] [file]\n");
                     return false;
                 }
 
@@ -1584,7 +1775,7 @@ private:
 
                 TrackInfo track{};
                 if (!resolveTrack(request, track)) {
-                    std::printf("Track '%s' was not found in SPIFFS.\n", request.c_str());
+                    std::printf("File '%s' was not found in SPIFFS.\n", request.c_str());
                     return false;
                 }
 
@@ -1622,12 +1813,11 @@ private:
         }
 
         // Transmit (TX) either uses the explicitly requested file or the
-        // currently
-        // selected default track.
+        // currently selected default file.
         const std::string request = words.size() >= 2 ? words[1] : selected_track_;
         TrackInfo track{};
         if (!resolveTrack(request, track)) {
-            std::printf("Track '%s' was not found in SPIFFS.\n", request.c_str());
+            std::printf("File '%s' was not found in SPIFFS.\n", request.c_str());
             return false;
         }
 
@@ -2117,6 +2307,8 @@ private:
             return false;
         }
 
+        discardIncomingFileTransfer("Discarding partial RX file before channel change");
+        sync_gate_.reset();
         const bool ok = manager_.boot(channel);
         const RadioStatus status = manager_.status();
         giveRadio();
@@ -2327,7 +2519,7 @@ private:
         RadioStatus status = manager_.status();
         if (ok) {
             const std::string path = buildTrackPath(loop.track_name);
-            ok = sendU8Song(manager_, path.c_str(), &loop_stop_requested_);
+            ok = sendDataFile(manager_, path.c_str(), &loop_stop_requested_);
             status = manager_.status();
         }
         giveRadio();
@@ -2534,32 +2726,53 @@ private:
         }
     }
 
-    void logRxPacket(const uint8_t* payload, size_t len)
+    void processRxPayload(const uint8_t* payload, size_t len)
     {
         AudioPacket::Header header{};
-        const uint8_t* audio = nullptr;
+        const uint8_t* data = nullptr;
 
-        switch (sync_gate_.accept(payload, len, &header, &audio)) {
+        switch (sync_gate_.accept(payload, len, &header, &data)) {
             case StreamSync::ReceiverGate::Action::StartAccepted:
-                ESP_LOGI(TAG, "RX START stream=%u",
-                         static_cast<unsigned>(sync_gate_.currentStreamId()));
+                if (!startIncomingFileTransfer(sync_gate_.currentStreamId())) {
+                    sync_gate_.reset();
+                    ++raw_rx_packet_count_;
+                }
                 return;
             case StreamSync::ReceiverGate::Action::StopAccepted:
+                if (incoming_file_.active && !incoming_file_.saw_last_packet) {
+                    discardIncomingFileTransfer("Discarding partial RX file after STOP");
+                }
                 ESP_LOGI(TAG, "RX STOP");
                 return;
 
             case StreamSync::ReceiverGate::Action::AudioAccepted:
+                if (!appendIncomingFileChunk(sync_gate_.currentStreamId(), header, data)) {
+                    ++raw_rx_packet_count_;
+                    return;
+                }
                 ++decoded_rx_packet_count_;
-                ESP_LOGI(TAG,
-                         "RX packet stream=%u seq=%u audio=%u flags=0x%02X",
-                         static_cast<unsigned>(sync_gate_.currentStreamId()),
-                         static_cast<unsigned>(header.sequence),
-                         static_cast<unsigned>(header.audio_len),
-                         static_cast<unsigned>(header.flags));
+                if (header.sequence == 0 ||
+                    incoming_file_.packet_count == 1 ||
+                    (incoming_file_.packet_count % 64u) == 0 ||
+                    (header.flags & AudioPacket::kLast) != 0) {
+                    ESP_LOGI(TAG,
+                             "RX data stream=%u seq=%u bytes=%u total=%u flags=0x%02X",
+                             static_cast<unsigned>(sync_gate_.currentStreamId()),
+                             static_cast<unsigned>(header.sequence),
+                             static_cast<unsigned>(header.audio_len),
+                             static_cast<unsigned>(incoming_file_.bytes_written),
+                             static_cast<unsigned>(header.flags));
+                }
+                if ((header.flags & AudioPacket::kLast) != 0) {
+                    if (!finalizeIncomingFileTransfer()) {
+                        ++raw_rx_packet_count_;
+                        sync_gate_.reset();
+                    }
+                }
                 return;
             case StreamSync::ReceiverGate::Action::Ignore:
                 ++raw_rx_packet_count_;
-                ESP_LOGI(TAG, "RX packet ignored while waiting for sync");
+                ESP_LOGI(TAG, "RX packet ignored while waiting for file sync");
                 return;
 
             case StreamSync::ReceiverGate::Action::Invalid:
@@ -2577,7 +2790,7 @@ private:
         // - it tries to grab the mutex briefly
         // - it only touches the radio when receive (RX) mode is active
         // - it drains any queued packets before releasing the radio again
-        // - it logs received packets but does not otherwise mutate app state
+        // - it saves accepted payload streams into SPIFFS as completed files
         std::array<uint8_t, AudioPacket::kPacketBytes> payload{};
 
         while (true) {
@@ -2605,7 +2818,7 @@ private:
                                 break;
                             }
 
-                            logRxPacket(payload.data(), out_len);
+                            processRxPayload(payload.data(), out_len);
                         } else {
                             const RadioStatus status = manager_.status();
                             ESP_LOGW(TAG, "RX read failed, state=%s fault=%d",
@@ -2726,9 +2939,12 @@ private:
     std::string last_morse_text_;              // Most recent MORSE text for STATUS output.
     bool last_carrier_detected_ = false;      // Edge detector for RPD logging while in RX.
     uint32_t carrier_event_count_ = 0;        // Number of distinct RPD-high events seen while listening.
-    StreamSync::ReceiverGate sync_gate_{};    // RX stream gate for START/STOP/audio synchronization.
-    uint32_t decoded_rx_packet_count_ = 0;    // Payloads that matched the AudioPacket format.
-    uint32_t raw_rx_packet_count_ = 0;        // Payloads that were received but did not match AudioPacket.
+    StreamSync::ReceiverGate sync_gate_{};    // RX stream gate for START/STOP/file synchronization.
+    IncomingFileTransfer incoming_file_{};    // Active file being reconstructed from RX packets.
+    uint32_t decoded_rx_packet_count_ = 0;    // Payloads accepted as in-order stream data.
+    uint32_t raw_rx_packet_count_ = 0;        // Payloads that were received but not accepted as stream data.
+    uint32_t saved_rx_file_count_ = 0;        // Completed files written to SPIFFS in the current RX session.
+    uint32_t saved_rx_byte_count_ = 0;        // Total bytes written across saved RX files in the current RX session.
     LoopConfig loop_config_{};
     volatile bool loop_stop_requested_ = false;
     EventGroupHandle_t wifi_event_group_ = nullptr;

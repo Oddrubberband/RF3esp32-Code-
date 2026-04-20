@@ -217,7 +217,7 @@ void test_initDefaults_programs_expected_registers(void)
     TEST_ASSERT_EQUAL_UINT8(0x00, hal.regs[0x04]);
     TEST_ASSERT_EQUAL_UINT8(0x01, hal.regs[0x02]);
     TEST_ASSERT_EQUAL_UINT8(40, hal.regs[0x05]);
-    TEST_ASSERT_EQUAL_UINT8(0x26, hal.regs[0x06]);
+    TEST_ASSERT_EQUAL_UINT8(0x06, hal.regs[0x06]);
     TEST_ASSERT_EQUAL_UINT8(32, hal.regs[0x11]);
     TEST_ASSERT_FALSE(hal.ce_level);
 }
@@ -519,7 +519,7 @@ void test_stopContinuousCarrier_restores_demo_rf_setup(void)
     radio.stopContinuousCarrier();
 
     TEST_ASSERT_FALSE(hal.ce_level);
-    TEST_ASSERT_EQUAL_UINT8(0x26, hal.regs[0x06]);
+    TEST_ASSERT_EQUAL_UINT8(0x06, hal.regs[0x06]);
     TEST_ASSERT_TRUE((hal.regs[0x00] & (1 << 1)) != 0);
 }
 
@@ -533,7 +533,7 @@ void test_startContinuousCarrier_uses_cont_wave_when_supported(void)
 
     TEST_ASSERT_TRUE(hal.ce_level);
     TEST_ASSERT_EQUAL_UINT8(40, hal.regs[0x05]);
-    TEST_ASSERT_EQUAL_UINT8(0xB6, hal.regs[0x06]);
+    TEST_ASSERT_EQUAL_UINT8(0x96, hal.regs[0x06]);
     TEST_ASSERT_TRUE(hal.last_payload_write.empty());
 }
 
