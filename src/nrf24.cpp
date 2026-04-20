@@ -329,7 +329,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
             hal_.ce(false);
         }
 
-        const bool irq_connected = hal_.irqConnected();
+                const bool irq_connected = hal_.irqConnected();
         const uint64_t start = hal_.nowUs();
         uint64_t last_status_poll = start;
 
@@ -343,16 +343,18 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
             }
 
             if (!should_read_status) {
+                hal_.delayUs(25);
                 continue;
             }
 
             last_status_poll = hal_.nowUs();
 
             const uint8_t status = getStatus();
+            const uint8_t fifo_status = readReg(0x17);
 
             if (status & (1 << 5)) {
                 last_tx_status_ = status;
-                last_tx_fifo_status_ = readReg(0x17);
+                last_tx_fifo_status_ = fifo_status;
                 last_tx_observe_ = readReg(0x08);
                 last_tx_timed_out_ = false;
                 hal_.ce(false);
@@ -362,7 +364,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
 
             if (status & (1 << 4)) {
                 last_tx_status_ = status;
-                last_tx_fifo_status_ = readReg(0x17);
+                last_tx_fifo_status_ = fifo_status;
                 last_tx_observe_ = readReg(0x08);
                 last_tx_timed_out_ = false;
                 hal_.ce(false);
@@ -370,6 +372,22 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
                 flushTx();
                 return false;
             }
+
+            // Some real modules appear to dequeue the payload without ever
+            // presenting TX_DS cleanly. In no-ACK mode, an empty TX FIFO after
+            // launch is a practical fallback indicator that the one-shot send
+            // completed.
+            if ((hal_.nowUs() - start) >= 300 && (fifo_status & (1 << 4)) != 0) {
+                last_tx_status_ = status;
+                last_tx_fifo_status_ = fifo_status;
+                last_tx_observe_ = readReg(0x08);
+                last_tx_timed_out_ = false;
+                hal_.ce(false);
+                clearIrq(false, true, true);
+                return true;
+            }
+
+            hal_.delayUs(25);
         }
 
         if (irq_connected) {
