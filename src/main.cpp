@@ -138,6 +138,7 @@ struct HttpStatusSnapshot {
     const char* node_name = WifiControlConfig::kNodeName;
     const char* hostname = WifiControlConfig::kNodeName;
     const char* state_name = "Boot";
+    const char* selected_name = "";
     uint8_t channel = 76;
     int power_level = -1;
     bool tx_ok = false;
@@ -149,6 +150,7 @@ struct HttpStatusSnapshot {
     uint32_t rx_raw = 0;
     uint32_t rx_saved = 0;
     uint32_t rx_saved_bytes = 0;
+    uint32_t selected_bytes = 0;
     int last_fault = 0;
 };
 
@@ -1733,7 +1735,16 @@ private:
         const RadioStatus status = manager_.status();
         out.node_name = WifiControlConfig::kNodeName;
         out.hostname = WifiControlConfig::kNodeName;
+        out.node_name = WifiControlConfig::kNodeName;
+        out.hostname = WifiControlConfig::kNodeName;
         out.state_name = RadioManager::stateName(status.state);
+        out.selected_name = selected_track_.c_str();
+        size_t selected_bytes = 0;
+        if (statFileSize(buildTrackPath(selected_track_), selected_bytes)) {
+            out.selected_bytes = static_cast<uint32_t>(selected_bytes);
+        }
+        out.channel = status.channel;
+        out.power_level = status.power_level;
         out.channel = status.channel;
         out.power_level = status.power_level;
         out.tx_ok = status.last_tx_ok;
@@ -1758,8 +1769,9 @@ private:
         }
 
         std::string json;
-        appendFormat(json,
-                     "{\"node_name\":\"%s\",\"hostname\":\"%s\",\"state\":\"%s\",\"channel\":%u,\"power\":%d,"
+                appendFormat(json,
+                     "{\"node_name\":\"%s\",\"hostname\":\"%s\",\"state\":\"%s\",\"selected\":\"%s\",\"selected_bytes\":%u,"
+                     "\"channel\":%u,\"power\":%d,"
                      "\"tx_ok\":%s,\"tx_timeout\":%s,\"rx_packets\":%u,"
                      "\"rx_stream\":%u,\"rx_raw\":%u,\"rx_saved\":%u,"
                      "\"rx_saved_bytes\":%u,\"last_fault\":%d,"
@@ -1767,6 +1779,8 @@ private:
                      snapshot.node_name,
                      snapshot.hostname,
                      snapshot.state_name,
+                     snapshot.selected_name,
+                     static_cast<unsigned>(snapshot.selected_bytes),
                      static_cast<unsigned>(snapshot.channel),
                      snapshot.power_level,
                      snapshot.tx_ok ? "true" : "false",
