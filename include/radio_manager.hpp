@@ -65,6 +65,7 @@ public:
     bool sleep();
     bool wake();
     bool powerDown();
+    bool setPowerLevel(uint8_t level);
 
     // Continuous-wave (CW) test controls.
     bool startCw(uint8_t channel, uint8_t rfPowerBits);

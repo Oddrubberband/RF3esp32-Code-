@@ -62,7 +62,7 @@ namespace {
 constexpr const char* TAG = "APP";
 // Pace bulk file transfer conservatively so the receiver can drain the nRF24
 // receive (RX) FIFO without relying on acknowledgements or retransmits.
-constexpr uint32_t kDataPacketGapMs = 2;
+constexpr uint32_t kDataPacketGapMs = 8;
 constexpr uint32_t kPacketsPerSecond = 1000u / kDataPacketGapMs;
 constexpr uint32_t kPayloadBytesPerSecond =
     kPacketsPerSecond * AudioPacket::kAudioBytesPerPacket;
@@ -138,8 +138,11 @@ struct HttpStatusSnapshot {
     const char* hostname = WifiControlConfig::kNodeName;
     const char* state_name = "Boot";
     uint8_t channel = 76;
+    int power_level = -1;
     bool tx_ok = false;
     bool tx_timeout = false;
+    bool rx_pending = false;
+    bool rpd = false;
     uint32_t rx_packets = 0;
     uint32_t rx_stream = 0;
     uint32_t rx_raw = 0;
@@ -813,6 +816,16 @@ private:
         return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpChannel(req);
     }
 
+    static esp_err_t httpPowerHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpPower(req);
+    }
+
+    static esp_err_t httpCommandHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpCommand(req);
+    }
+
     esp_err_t sendHttpJson(httpd_req_t* req,
                            const std::string& json,
                            const char* status = "200 OK") const
@@ -826,6 +839,44 @@ private:
     {
         const std::string json = buildStatusJson();
         return sendHttpJson(req, json, status);
+    }
+
+    bool tryReadHttpCommandText(httpd_req_t* req, std::string& out)
+    {
+        out.clear();
+
+        const size_t query_len = httpd_req_get_url_query_len(req);
+        if (query_len > 0) {
+            std::string query(query_len + 1, '\0');
+            if (httpd_req_get_url_query_str(req, query.data(), query.size()) != ESP_OK) {
+                return false;
+            }
+
+            std::array<char, kConsoleLineBytes> value_buf{};
+            if (httpd_query_key_value(query.c_str(), "value", value_buf.data(), value_buf.size()) == ESP_OK ||
+                httpd_query_key_value(query.c_str(), "command", value_buf.data(), value_buf.size()) == ESP_OK) {
+                out = trimAscii(value_buf.data());
+                return !out.empty();
+            }
+        }
+
+        if (req->content_len <= 0 || req->content_len >= static_cast<int>(kConsoleLineBytes)) {
+            return false;
+        }
+
+        std::string body(static_cast<size_t>(req->content_len), '\0');
+        int offset = 0;
+        while (offset < req->content_len) {
+            const int received =
+                httpd_req_recv(req, body.data() + offset, req->content_len - offset);
+            if (received <= 0) {
+                return false;
+            }
+            offset += received;
+        }
+
+        out = trimAscii(body);
+        return !out.empty();
     }
 
     bool startHttpServer()
@@ -874,11 +925,25 @@ private:
         channel_uri.handler = &DemoConsoleApp::httpChannelHandlerEntry;
         channel_uri.user_ctx = this;
 
+        httpd_uri_t power_uri{};
+        power_uri.uri = "/power";
+        power_uri.method = HTTP_POST;
+        power_uri.handler = &DemoConsoleApp::httpPowerHandlerEntry;
+        power_uri.user_ctx = this;
+
+        httpd_uri_t command_uri{};
+        command_uri.uri = "/command";
+        command_uri.method = HTTP_POST;
+        command_uri.handler = &DemoConsoleApp::httpCommandHandlerEntry;
+        command_uri.user_ctx = this;
+
         err = httpd_register_uri_handler(http_server_, &status_uri);
         if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &rx_uri);
         if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &tx_uri);
         if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &stop_uri);
         if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &channel_uri);
+        if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &power_uri);
+        if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &command_uri);
 
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "HTTP route registration failed: %s", esp_err_to_name(err));
@@ -1120,6 +1185,45 @@ private:
         return sendHttpStatusResponse(req, ok ? "200 OK" : "500 Internal Server Error");
     }
 
+    esp_err_t handleHttpPower(httpd_req_t* req)
+    {
+        const size_t query_len = httpd_req_get_url_query_len(req);
+        if (query_len == 0) {
+            return sendHttpJson(req, "{\"error\":\"missing_value\"}", "400 Bad Request");
+        }
+
+        std::string query(query_len + 1, '\0');
+        if (httpd_req_get_url_query_str(req, query.data(), query.size()) != ESP_OK) {
+            return sendHttpJson(req, "{\"error\":\"invalid_query\"}", "400 Bad Request");
+        }
+
+        char value_buf[8] = {};
+        if (httpd_query_key_value(query.c_str(), "value", value_buf, sizeof(value_buf)) != ESP_OK) {
+            return sendHttpJson(req, "{\"error\":\"missing_value\"}", "400 Bad Request");
+        }
+
+        uint8_t power_level = 0;
+        if (!parseUint8Arg(value_buf, 0, 3, power_level)) {
+            return sendHttpJson(req, "{\"error\":\"invalid_power\"}", "400 Bad Request");
+        }
+
+        std::string command = "POWER ";
+        command += value_buf;
+        const bool ok = dispatchHttpCommand(command);
+        return sendHttpStatusResponse(req, ok ? "200 OK" : "500 Internal Server Error");
+    }
+
+    esp_err_t handleHttpCommand(httpd_req_t* req)
+    {
+        std::string command;
+        if (!tryReadHttpCommandText(req, command)) {
+            return sendHttpJson(req, "{\"error\":\"missing_command\"}", "400 Bad Request");
+        }
+
+        const bool ok = dispatchHttpCommand(command);
+        return sendHttpStatusResponse(req, ok ? "200 OK" : "500 Internal Server Error");
+    }
+
     void printPrompt() const
     {
         std::printf("\nrf24> ");
@@ -1144,6 +1248,7 @@ private:
             "  STANDBY              Leave RX/CW/sleep and return to standby\n"
             "  SLEEP                Put the radio into sleep mode\n"
             "  WAKE                 Wake the radio back to standby\n"
+            "  POWER <0-3>          Set packet TX power level\n"
             "  POWERDOWN            Fully power down the radio\n"
             "  CHANNEL <0-125>      Reinitialize the radio on a new channel\n"
             "  CW START [ch] [0-3]  Start a continuous-wave test on a channel/power level\n"
@@ -1487,16 +1592,10 @@ private:
         }
 
         const std::string command = uppercaseCopy(words.front());
-        return command == "HELP" ||
-               command == "?" ||
-               command == "STATUS" ||
-               command == "FILES" ||
-               command == "LS" ||
-               command == "SELECT" ||
-               command == "TX" ||
-               command == "MORSE" ||
-               command == "STOP" ||
-               command == "CHANNEL";
+        // Allow the full operator command set over the radio link, but keep
+        // REMOTE itself local-only so one board cannot recursively relay to
+        // another board (or back to itself).
+        return command != "REMOTE";
     }
 
     void tryResumeWirelessRx(const char* reason)
@@ -1629,11 +1728,14 @@ private:
         }
 
         manager_.refreshSnapshot();
+        const bool rx_pending =
+            manager_.status().state == RadioState::RxListening ? manager_.hasPendingRx() : false;
         const RadioStatus status = manager_.status();
         out.node_name = WifiControlConfig::kNodeName;
         out.hostname = WifiControlConfig::kNodeName;
         out.state_name = RadioManager::stateName(status.state);
         out.channel = status.channel;
+        out.power_level = status.power_level;
         out.tx_ok = status.last_tx_ok;
         out.tx_timeout = status.last_tx_timed_out;
         out.rx_packets = status.rx_packets;
@@ -1642,6 +1744,8 @@ private:
         out.rx_saved = saved_rx_file_count_;
         out.rx_saved_bytes = saved_rx_byte_count_;
         out.last_fault = status.last_fault;
+        out.rx_pending = rx_pending;
+        out.rpd = status.carrier_detected;
         giveRadio();
         return true;
     }
@@ -1655,14 +1759,16 @@ private:
 
         std::string json;
         appendFormat(json,
-                     "{\"node_name\":\"%s\",\"hostname\":\"%s\",\"state\":\"%s\",\"channel\":%u,"
+                     "{\"node_name\":\"%s\",\"hostname\":\"%s\",\"state\":\"%s\",\"channel\":%u,\"power\":%d,"
                      "\"tx_ok\":%s,\"tx_timeout\":%s,\"rx_packets\":%u,"
                      "\"rx_stream\":%u,\"rx_raw\":%u,\"rx_saved\":%u,"
-                     "\"rx_saved_bytes\":%u,\"last_fault\":%d}",
+                     "\"rx_saved_bytes\":%u,\"last_fault\":%d,"
+                     "\"rx_pending\":%s,\"rpd\":%s}",
                      snapshot.node_name,
                      snapshot.hostname,
                      snapshot.state_name,
                      static_cast<unsigned>(snapshot.channel),
+                     snapshot.power_level,
                      snapshot.tx_ok ? "true" : "false",
                      snapshot.tx_timeout ? "true" : "false",
                      static_cast<unsigned>(snapshot.rx_packets),
@@ -1670,7 +1776,9 @@ private:
                      static_cast<unsigned>(snapshot.rx_raw),
                      static_cast<unsigned>(snapshot.rx_saved),
                      static_cast<unsigned>(snapshot.rx_saved_bytes),
-                     snapshot.last_fault);
+                     snapshot.last_fault,
+                     snapshot.rx_pending ? "true" : "false",
+                     snapshot.rpd ? "true" : "false");
         return json;
     }
 
@@ -1832,7 +1940,7 @@ private:
 
         const std::vector<std::string> request_words = splitWords(request);
         if (!isRemoteCommandAllowed(request_words)) {
-            std::printf("Remote commands support HELP, STATUS, FILES, SELECT, TX, MORSE, STOP, and CHANNEL.\n");
+            std::printf("Remote commands support the full command set except REMOTE.\n");
             return false;
         }
 
@@ -2249,7 +2357,8 @@ private:
     bool commandChannel(const std::vector<std::string>& words)
     {
         // Changing channels is implemented as a full re-boot of the radio so
-        // all configuration returns to the known defaults for that channel.
+        // packet mode returns to a known baseline on the new channel while
+        // preserving the selected TX power level.
         if (words.size() < 2) {
             std::printf("Usage: CHANNEL <0-125>\n");
             return false;
@@ -2285,6 +2394,50 @@ private:
         }
 
         std::printf("Radio reinitialized on channel %u\n", static_cast<unsigned>(status.channel));
+        return true;
+    }
+
+    bool commandPower(const std::vector<std::string>& words)
+    {
+        if (words.size() < 2) {
+            std::printf("Usage: POWER <0-3>\n");
+            return false;
+        }
+
+        uint8_t power_level = 0;
+        if (!parseUint8Arg(words[1], 0, 3, power_level)) {
+            std::printf("TX power level must be in the range 0-3.\n");
+            return false;
+        }
+
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+
+        bool ok = ensureStandbyLocked();
+        if (ok) {
+            ok = manager_.setPowerLevel(power_level);
+        }
+
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        if (!ok) {
+            std::printf("Could not set TX power. state=%s fault=%d\n",
+                        RadioManager::stateName(status.state),
+                        status.last_fault);
+            return false;
+        }
+
+        std::printf("Packet TX power set to %u on channel %u\n",
+                    static_cast<unsigned>(power_level),
+                    static_cast<unsigned>(status.channel));
         return true;
     }
 
@@ -2864,6 +3017,9 @@ private:
         }
         if (command == "CHANNEL") {
             return commandChannel(words);
+        }
+        if (command == "POWER") {
+            return commandPower(words);
         }
         if (command == "CW") {
             return commandCw(words);

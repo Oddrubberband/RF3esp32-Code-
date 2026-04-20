@@ -89,6 +89,16 @@ void test_readRfPowerLevel_decodes_rf_setup_bits(void)
     TEST_ASSERT_EQUAL_UINT8(2, radio.readRfPowerLevel());
 }
 
+void test_setRfPowerLevel_updates_packet_setup_and_register(void)
+{
+    FakeHal hal;
+    Nrf24 radio(hal);
+
+    TEST_ASSERT_TRUE(radio.setRfPowerLevel(1));
+    TEST_ASSERT_EQUAL_UINT8(0x02, static_cast<uint8_t>(hal.regs[0x06] & 0x06));
+    TEST_ASSERT_EQUAL_UINT8(1, radio.readRfPowerLevel());
+}
+
 // Audio packet / reassembly tests
 void test_audioPacket_encode_decode_round_trip(void)
 {
@@ -217,7 +227,7 @@ void test_initDefaults_programs_expected_registers(void)
     TEST_ASSERT_EQUAL_UINT8(0x00, hal.regs[0x04]);
     TEST_ASSERT_EQUAL_UINT8(0x01, hal.regs[0x02]);
     TEST_ASSERT_EQUAL_UINT8(40, hal.regs[0x05]);
-    TEST_ASSERT_EQUAL_UINT8(0x06, hal.regs[0x06]);
+    TEST_ASSERT_EQUAL_UINT8(0x26, hal.regs[0x06]);
     TEST_ASSERT_EQUAL_UINT8(32, hal.regs[0x11]);
     TEST_ASSERT_FALSE(hal.ce_level);
 }
@@ -283,6 +293,19 @@ void test_transmitOnce_without_irq_wire_still_uses_status_polling(void)
 
     TEST_ASSERT_TRUE(ok);
     TEST_ASSERT_FALSE(radio.lastTxSawIrq());
+}
+
+void test_transmitOnce_rearm_preserves_runtime_power_level(void)
+{
+    FakeHal hal;
+    hal.next_tx_success = false;
+
+    Nrf24 radio(hal);
+    const uint8_t payload[] = {0xAA};
+
+    TEST_ASSERT_TRUE(radio.setRfPowerLevel(1));
+    TEST_ASSERT_FALSE(radio.transmitOnce(payload, sizeof(payload), 1000));
+    TEST_ASSERT_EQUAL_UINT8(0x02, static_cast<uint8_t>(hal.regs[0x06] & 0x06));
 }
 
 void test_readOnePacket_reads_payload_and_clears_rx_flag(void)
@@ -366,6 +389,24 @@ void test_radioManager_boot_invalid_channel_sets_fault_code(void)
     TEST_ASSERT_FALSE(ok);
     TEST_ASSERT_EQUAL(static_cast<int>(RadioState::Fault), static_cast<int>(status.state));
     TEST_ASSERT_EQUAL_INT(2, status.last_fault);
+}
+
+void test_radioManager_setPowerLevel_persists_across_reboot(void)
+{
+    FakeHal hal;
+    hal.regs[0x05] = 76;
+    Nrf24 radio(hal);
+    RadioManager manager(radio);
+
+    TEST_ASSERT_TRUE(manager.boot(76));
+    TEST_ASSERT_TRUE(manager.setPowerLevel(1));
+    TEST_ASSERT_TRUE(manager.boot(42));
+
+    const RadioStatus status = manager.status();
+    TEST_ASSERT_EQUAL(static_cast<int>(RadioState::Standby), static_cast<int>(status.state));
+    TEST_ASSERT_EQUAL_UINT8(42, status.channel);
+    TEST_ASSERT_EQUAL_INT(1, status.power_level);
+    TEST_ASSERT_EQUAL_UINT8(0x02, static_cast<uint8_t>(hal.regs[0x06] & 0x06));
 }
 
 void test_radioManager_sendPayload_success_updates_status(void)
@@ -519,7 +560,7 @@ void test_stopContinuousCarrier_restores_demo_rf_setup(void)
     radio.stopContinuousCarrier();
 
     TEST_ASSERT_FALSE(hal.ce_level);
-    TEST_ASSERT_EQUAL_UINT8(0x06, hal.regs[0x06]);
+    TEST_ASSERT_EQUAL_UINT8(0x26, hal.regs[0x06]);
     TEST_ASSERT_TRUE((hal.regs[0x00] & (1 << 1)) != 0);
 }
 
@@ -533,7 +574,7 @@ void test_startContinuousCarrier_uses_cont_wave_when_supported(void)
 
     TEST_ASSERT_TRUE(hal.ce_level);
     TEST_ASSERT_EQUAL_UINT8(40, hal.regs[0x05]);
-    TEST_ASSERT_EQUAL_UINT8(0x96, hal.regs[0x06]);
+    TEST_ASSERT_EQUAL_UINT8(0xB6, hal.regs[0x06]);
     TEST_ASSERT_TRUE(hal.last_payload_write.empty());
 }
 
@@ -1143,6 +1184,7 @@ int main(void)
     UNITY_BEGIN();
     RUN_TEST(test_readReg_reads_value_and_formats_spi_command);
     RUN_TEST(test_readRfPowerLevel_decodes_rf_setup_bits);
+    RUN_TEST(test_setRfPowerLevel_updates_packet_setup_and_register);
     RUN_TEST(test_audioPacket_encode_decode_round_trip);
     RUN_TEST(test_audioPacket_rejects_oversized_audio);
     RUN_TEST(test_audioReassembler_reassembles_packets_in_order);
@@ -1155,10 +1197,12 @@ int main(void)
     RUN_TEST(test_transmitOnce_success_writes_payload_and_reports_success);
     RUN_TEST(test_transmitOnce_failure_clears_fifo_and_returns_false);
     RUN_TEST(test_transmitOnce_without_irq_wire_still_uses_status_polling);
+    RUN_TEST(test_transmitOnce_rearm_preserves_runtime_power_level);
     RUN_TEST(test_readOnePacket_reads_payload_and_clears_rx_flag);
     RUN_TEST(test_readOnePacket_preserves_following_rx_payloads);
     RUN_TEST(test_radioManager_boot_success_transitions_to_standby);
     RUN_TEST(test_radioManager_boot_invalid_channel_sets_fault_code);
+    RUN_TEST(test_radioManager_setPowerLevel_persists_across_reboot);
     RUN_TEST(test_radioManager_sendPayload_success_updates_status);
     RUN_TEST(test_radioManager_refreshSnapshot_reports_live_irq_state);
     RUN_TEST(test_radioManager_receivePayload_updates_rx_length);

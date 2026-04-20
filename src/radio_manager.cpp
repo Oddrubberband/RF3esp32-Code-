@@ -203,6 +203,19 @@ bool RadioManager::powerDown()
     return false;
 }
 
+bool RadioManager::setPowerLevel(uint8_t level)
+{
+    if (radio_.setRfPowerLevel(level)) {
+        refreshSnapshot();
+        return true;
+    }
+
+    refreshSnapshot();
+    status_.state = RadioState::Fault;
+    status_.last_fault = 9;  // Packet TX power level change failed.
+    return false;
+}
+
 bool RadioManager::startCw(uint8_t channel, uint8_t rfPowerBits)
 {
     if (radio_.startContinuousCarrier(channel, rfPowerBits)) {

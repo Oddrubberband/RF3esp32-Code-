@@ -23,6 +23,7 @@ public:
     uint8_t getStatus();
     uint8_t readReg(uint8_t reg);
     uint8_t readRfPowerLevel();
+    bool setRfPowerLevel(uint8_t level);
     uint8_t readRpd();
     void readRegs(uint8_t reg, uint8_t* out, size_t len);
     void writeReg(uint8_t reg, uint8_t value);
@@ -77,6 +78,7 @@ private:
 
     Nrf24Hal& hal_;
     uint8_t static_payload_size_ = 32;  // Number of bytes expected in each receive (RX) payload read.
+    uint8_t packet_rf_setup_ = 0x26;  // Packet-mode RF_SETUP template, including the selected TX power bits.
     uint8_t last_tx_status_ = 0;
     uint8_t last_tx_fifo_status_ = 0;
     uint8_t last_tx_observe_ = 0;

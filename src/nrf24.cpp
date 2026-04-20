@@ -5,21 +5,22 @@
 namespace {
 constexpr std::array<uint8_t, 5> kDemoAddress = {0x52, 0x46, 0x33, 0x24, 0x01};
 #ifndef RF3_NRF24_RF_SETUP
-#define RF3_NRF24_RF_SETUP 0x06
+#define RF3_NRF24_RF_SETUP 0x26
 #endif
 #ifndef RF3_NRF24_TX_CE_PULSE_US
 #define RF3_NRF24_TX_CE_PULSE_US 15
 #endif
-// Default to 1 Mbps because it is broadly supported across genuine parts and
-// clone modules. Boards that reliably support other rates can override this at
-// build time with RF3_NRF24_RF_SETUP.
+// Default to 250 kbps to trade some peak throughput for a much more forgiving
+// link budget and receive timing margin during file transfer. Boards that need
+// a different rate can still override this at build time with RF3_NRF24_RF_SETUP.
 constexpr uint8_t kDemoRfSetup = RF3_NRF24_RF_SETUP;
 constexpr uint32_t kTxCePulseUs = RF3_NRF24_TX_CE_PULSE_US;
 }
 
 Nrf24::Nrf24(Nrf24Hal& hal)
     : hal_(hal),
-      static_payload_size_(32)
+      static_payload_size_(32),
+      packet_rf_setup_(kDemoRfSetup)
 {
 }
 
@@ -50,7 +51,8 @@ bool Nrf24::initDefaults(uint8_t channel)
     // - one enabled receive (RX) pipe
     // - 5-byte addresses
     // - fixed payload width
-    // - fixed demo channel and radio-frequency (RF) setup
+    // - a fixed packet-mode address/payload layout and the currently selected
+    //   radio-frequency (RF) setup
     // - no auto retransmit, because this demo does not use ACKs
     //
     // The individual register values are the bare minimum needed for a
@@ -63,7 +65,7 @@ bool Nrf24::initDefaults(uint8_t channel)
     writeReg(0x03, 0x03);
     writeReg(0x04, 0x00);
     writeReg(0x05, channel);
-    writeReg(0x06, kDemoRfSetup);
+    writeReg(0x06, packet_rf_setup_);
     writeRegs(0x0A, kDemoAddress.data(), kDemoAddress.size());
     writeRegs(0x10, kDemoAddress.data(), kDemoAddress.size());
     writeReg(0x11, static_payload_size_);
@@ -108,6 +110,18 @@ uint8_t Nrf24::readRfPowerLevel()
 {
     // RF_SETUP bits 2:1 encode the output power level as a small 0-3 value.
     return static_cast<uint8_t>((readReg(0x06) >> 1) & 0x03);
+}
+
+bool Nrf24::setRfPowerLevel(uint8_t level)
+{
+    if (level > 3) {
+        return false;
+    }
+
+    packet_rf_setup_ = static_cast<uint8_t>((packet_rf_setup_ & ~0x06u) |
+                                            static_cast<uint8_t>((level & 0x03u) << 1));
+    writeReg(0x06, packet_rf_setup_);
+    return readRfPowerLevel() == level;
 }
 
 uint8_t Nrf24::readRpd()
@@ -280,7 +294,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
             writeReg(0x03, 0x03);
             writeReg(0x04, 0x00);
             writeReg(0x05, channel);
-            writeReg(0x06, kDemoRfSetup);
+            writeReg(0x06, packet_rf_setup_);
             writeRegs(0x0A, kDemoAddress.data(), kDemoAddress.size());
             writeRegs(0x10, kDemoAddress.data(), kDemoAddress.size());
             writeReg(0x11, static_payload_size_);
@@ -564,7 +578,7 @@ void Nrf24::stopContinuousCarrier()
     flushTx();
 
     if (!cw_restore_.valid) {
-        writeReg(0x06, kDemoRfSetup);
+        writeReg(0x06, packet_rf_setup_);
         cw_mode_ = CwMode::None;
         return;
     }

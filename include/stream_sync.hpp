@@ -20,10 +20,10 @@ constexpr uint8_t kVersion = 1;
 constexpr size_t kRemoteCommandHeaderBytes = 6;
 constexpr size_t kRemoteCommandMaxBytes = AudioPacket::kPacketBytes - kRemoteCommandHeaderBytes;
 
-constexpr uint8_t kRecommendedStartRepeats = 3;
-constexpr uint32_t kRecommendedStartGapMs = 10;
-constexpr uint32_t kRecommendedPostStartGapMs = 20;
-constexpr uint32_t kRecommendedSeq0DuplicateGapMs = 2;
+constexpr uint8_t kRecommendedStartRepeats = 5;
+constexpr uint32_t kRecommendedStartGapMs = 15;
+constexpr uint32_t kRecommendedPostStartGapMs = 40;
+constexpr uint32_t kRecommendedSeq0DuplicateGapMs = 8;
 
 struct ControlFrame {
     uint16_t stream_id = 0;
@@ -293,6 +293,7 @@ public:
     {
         state_ = State::WaitingForStart;
         current_stream_id_ = 0;
+        pending_stream_id_ = 0;
     }
 
     State state() const
@@ -319,12 +320,30 @@ public:
 
         ControlFrame control{};
         if (decodeStart(packet, packet_len, control)) {
+            if (state_ == State::Streaming) {
+                if (control.stream_id != current_stream_id_) {
+                    pending_stream_id_ = control.stream_id;
+                }
+                return Action::StartAccepted;
+            }
+
             current_stream_id_ = control.stream_id;
+            pending_stream_id_ = 0;
             state_ = State::WaitingForSeq0;
             return Action::StartAccepted;
         }
 
         if (decodeStop(packet, packet_len, control)) {
+            if (state_ == State::WaitingForSeq0 &&
+                current_stream_id_ != 0 &&
+                control.stream_id != current_stream_id_) {
+                return Action::Ignore;
+            }
+            if (state_ == State::Streaming &&
+                control.stream_id != current_stream_id_ &&
+                control.stream_id != pending_stream_id_) {
+                return Action::Ignore;
+            }
             reset();
             return Action::StopAccepted;
         }
@@ -340,6 +359,7 @@ public:
 
         if (state_ == State::WaitingForStart) {
             if (header.sequence == 0 && is_first) {
+                pending_stream_id_ = 0;
                 state_ = is_last ? State::WaitingForStart : State::Streaming;
                 if (out_header) {
                     *out_header = header;
@@ -354,6 +374,7 @@ public:
 
         if (state_ == State::WaitingForSeq0) {
             if (header.sequence == 0 && is_first) {
+                pending_stream_id_ = 0;
                 state_ = is_last ? State::WaitingForStart : State::Streaming;
                 if (out_header) {
                     *out_header = header;
@@ -367,6 +388,18 @@ public:
         }
 
         if (header.sequence == 0 && is_first) {
+            if (pending_stream_id_ != 0 && pending_stream_id_ != current_stream_id_) {
+                current_stream_id_ = pending_stream_id_;
+                pending_stream_id_ = 0;
+                state_ = is_last ? State::WaitingForStart : State::Streaming;
+                if (out_header) {
+                    *out_header = header;
+                }
+                if (out_audio) {
+                    *out_audio = audio;
+                }
+                return Action::AudioAccepted;
+            }
             return Action::Ignore;
         }
 
@@ -378,7 +411,14 @@ public:
         }
 
         if (is_last) {
-            state_ = State::WaitingForStart;
+            if (pending_stream_id_ != 0 && pending_stream_id_ != current_stream_id_) {
+                current_stream_id_ = pending_stream_id_;
+                pending_stream_id_ = 0;
+                state_ = State::WaitingForSeq0;
+            } else {
+                pending_stream_id_ = 0;
+                state_ = State::WaitingForStart;
+            }
         }
 
         return Action::AudioAccepted;
@@ -387,6 +427,7 @@ public:
 private:
     State state_ = State::WaitingForStart;
     uint16_t current_stream_id_ = 0;
+    uint16_t pending_stream_id_ = 0;
 };
 
 }  // namespace StreamSync
