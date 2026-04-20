@@ -1342,15 +1342,12 @@ private:
 
     bool startIncomingFileTransfer(uint16_t stream_id)
     {
-        if (incoming_file_.active &&
-            incoming_file_.stream_id == stream_id &&
-            incoming_file_.packet_count == 0 &&
-            incoming_file_.bytes_written == 0) {
+        if (incoming_file_.active && incoming_file_.stream_id == stream_id) {
             return true;
         }
 
         if (incoming_file_.active) {
-            discardIncomingFileTransfer("Discarding partial RX file before a new START");
+            discardIncomingFileTransfer("Discarding partial RX file before switching streams");
         }
 
         IncomingFileTransfer next{};
@@ -1365,17 +1362,16 @@ private:
         next.file = std::fopen(partial_path.c_str(), "wb");
         if (!next.file) {
             ESP_LOGE(TAG,
-                     "Could not open %s for RX stream %u: errno=%d",
-                     partial_path.c_str(),
-                     static_cast<unsigned>(stream_id),
-                     errno);
+                    "Could not open %s for RX stream %u: errno=%d",
+                    partial_path.c_str(),
+                    static_cast<unsigned>(stream_id),
+                    errno);
             return false;
-        }
-
-        incoming_file_ = std::move(next);
-        return true;
     }
 
+    incoming_file_ = std::move(next);
+    return true;
+}
     bool finalizeIncomingFileTransfer()
     {
         if (!incoming_file_.active) {
@@ -2850,10 +2846,9 @@ private:
 
         switch (sync_gate_.accept(payload, len, &header, &data)) {
             case StreamSync::ReceiverGate::Action::StartAccepted:
-                if (!startIncomingFileTransfer(sync_gate_.currentStreamId())) {
-                    sync_gate_.reset();
-                    ++raw_rx_packet_count_;
-                }
+                ESP_LOGI(TAG,
+                     "RX START armed for stream=%u",
+                     static_cast<unsigned>(sync_gate_.currentStreamId()));
                 return;
             case StreamSync::ReceiverGate::Action::StopAccepted:
                 if (incoming_file_.active && !incoming_file_.saw_last_packet) {
