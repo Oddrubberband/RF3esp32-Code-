@@ -62,8 +62,8 @@ namespace {
 constexpr const char* TAG = "APP";
 // Pace bulk file transfer conservatively so the receiver can drain the nRF24
 // receive (RX) FIFO without relying on acknowledgements or retransmits.
-constexpr uint32_t kDataPacketGapMs = 100;
-constexpr uint32_t kDataPacketRepeatGapMs = 12;
+constexpr uint32_t kDataPacketGapMs = 40;
+constexpr uint32_t kDataPacketRepeatGapMs = 8;
 constexpr uint32_t kPacketsPerSecond = 1000u / kDataPacketGapMs;
 constexpr uint32_t kPayloadBytesPerSecond =
     kPacketsPerSecond * AudioPacket::kAudioBytesPerPacket;
@@ -1234,7 +1234,15 @@ private:
         }
 
         const bool ok = dispatchHttpCommand(command);
-        return sendHttpStatusResponse(req, ok ? "200 OK" : "500 Internal Server Error");
+        if (ok) {
+            return sendHttpJson(req,
+                                "{\"accepted\":true,\"command\":\"queued\"}",
+                                "200 OK");
+        }
+
+        return sendHttpJson(req,
+                            "{\"accepted\":false,\"command\":\"failed\"}",
+                            "500 Internal Server Error");
     }
 
     void printPrompt() const
@@ -1732,7 +1740,7 @@ private:
 
     bool captureHttpStatus(HttpStatusSnapshot& out)
     {
-        if (!takeRadio(pdMS_TO_TICKS(50))) {
+        if (!takeRadio(pdMS_TO_TICKS(500))) {
             return false;
         }
 
@@ -1742,16 +1750,14 @@ private:
         const RadioStatus status = manager_.status();
         out.node_name = WifiControlConfig::kNodeName;
         out.hostname = WifiControlConfig::kNodeName;
-        out.node_name = WifiControlConfig::kNodeName;
-        out.hostname = WifiControlConfig::kNodeName;
         out.state_name = RadioManager::stateName(status.state);
         out.selected_name = selected_track_.c_str();
+
         size_t selected_bytes = 0;
         if (statFileSize(buildTrackPath(selected_track_), selected_bytes)) {
             out.selected_bytes = static_cast<uint32_t>(selected_bytes);
         }
-        out.channel = status.channel;
-        out.power_level = status.power_level;
+
         out.channel = status.channel;
         out.power_level = status.power_level;
         out.tx_ok = status.last_tx_ok;
@@ -2879,9 +2885,45 @@ private:
                 ESP_LOGI(TAG, "RX STOP");
                 return;
 
-                    case StreamSync::ReceiverGate::Action::AudioAccepted: {
-            const uint16_t stream_id = sync_gate_.currentStreamId();
+            case StreamSync::ReceiverGate::Action::AudioAccepted: {
+                const uint16_t stream_id = sync_gate_.currentStreamId();
 
+                if (incoming_file_.active &&
+                    incoming_file_.stream_id == stream_id &&
+                    incoming_file_.next_sequence > 0 &&
+                    header.sequence == static_cast<uint16_t>(incoming_file_.next_sequence - 1u)) {
+                    ++raw_rx_packet_count_;
+                    return;
+                }
+
+                if (!appendIncomingFileChunk(stream_id, header, data)) {
+                    ++raw_rx_packet_count_;
+                    return;
+                }
+
+                ++decoded_rx_packet_count_;
+
+                if (header.sequence == 0 ||
+                    incoming_file_.packet_count == 1 ||
+                    (incoming_file_.packet_count % 64u) == 0 ||
+                    (header.flags & AudioPacket::kLast) != 0) {
+                    ESP_LOGI(TAG,
+                             "RX data stream=%u seq=%u bytes=%u total=%u flags=0x%02X",
+                             static_cast<unsigned>(stream_id),
+                             static_cast<unsigned>(header.sequence),
+                             static_cast<unsigned>(header.audio_len),
+                             static_cast<unsigned>(incoming_file_.bytes_written),
+                             static_cast<unsigned>(header.flags));
+                }
+
+                if ((header.flags & AudioPacket::kLast) != 0) {
+                    if (!finalizeIncomingFileTransfer()) {
+                        ++raw_rx_packet_count_;
+                        sync_gate_.reset();
+                    }
+                }
+                return;
+            
             if (incoming_file_.active &&
                 incoming_file_.stream_id == stream_id &&
                 incoming_file_.next_sequence > 0 &&

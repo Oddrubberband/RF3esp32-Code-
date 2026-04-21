@@ -60,10 +60,10 @@ bool Nrf24::initDefaults(uint8_t channel)
     hal_.ce(false);
 
     writeReg(0x00, 0x0C);
-    writeReg(0x01, 0x00);
+    writeReg(0x01, 0x01);  // enable auto-ack on pipe 0
     writeReg(0x02, 0x01);
     writeReg(0x03, 0x03);
-    writeReg(0x04, 0x00);
+    writeReg(0x04, 0x5F);  // 1500 us retry delay, 15 retries
     writeReg(0x05, channel);
     writeReg(0x06, packet_rf_setup_);
     writeRegs(0x0A, kDemoAddress.data(), kDemoAddress.size());
@@ -289,10 +289,10 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
 
             hal_.ce(false);
             writeReg(0x00, 0x0C);
-            writeReg(0x01, 0x00);
+            writeReg(0x01, 0x01);  // keep auto-ack enabled after re-prime
             writeReg(0x02, 0x01);
             writeReg(0x03, 0x03);
-            writeReg(0x04, 0x00);
+            writeReg(0x04, 0x5F);  // keep retry policy enabled after re-prime
             writeReg(0x05, channel);
             writeReg(0x06, packet_rf_setup_);
             writeRegs(0x0A, kDemoAddress.data(), kDemoAddress.size());
@@ -311,6 +311,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
         last_tx_observe_ = readReg(0x08);
         last_tx_timed_out_ = false;
         last_tx_saw_irq_ = false;
+        const bool auto_ack_enabled = (readReg(0x01) & 0x01) != 0;
 
         // Force transmit (TX) mode, queue one payload, then trigger the send
         // with either the normal short CE pulse or the longer hold-high
@@ -391,7 +392,9 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
             // presenting TX_DS cleanly. In no-ACK mode, an empty TX FIFO after
             // launch is a practical fallback indicator that the one-shot send
             // completed.
-            if ((hal_.nowUs() - start) >= 300 && (fifo_status & (1 << 4)) != 0) {
+            if (!auto_ack_enabled &&
+                (hal_.nowUs() - start) >= 300 &&
+                (fifo_status & (1 << 4)) != 0) {
                 last_tx_status_ = status;
                 last_tx_fifo_status_ = fifo_status;
                 last_tx_observe_ = readReg(0x08);

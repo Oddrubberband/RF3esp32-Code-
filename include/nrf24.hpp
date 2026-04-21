@@ -41,7 +41,7 @@ public:
     bool stopRx();
 
     // One-shot payload send/receive helpers used by the console demo.
-    bool transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs = 20000);
+    bool transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs = 60000); 
     bool readOnePacket(uint8_t* out, size_t capacity, size_t& outLen);
 
     // Minimal continuous-wave test helpers.
