@@ -62,16 +62,12 @@ bool decode(const uint8_t* packet,
     out_header.audio_len = packet[2];
     out_header.flags = packet[3];
 
-    if (out_header.audio_len == 0 || out_header.audio_len > kAudioBytesPerPacket) {
+    if (out_header.audio_len > kAudioBytesPerPacket) {
         return false;
     }
 
-    const size_t exact_len = kHeaderBytes + out_header.audio_len;
-
-    // Accept either:
-    // 1. an exact-length packet, or
-    // 2. a full fixed-width padded packet
-    if (packet_len != exact_len && packet_len != kPacketBytes) {
+    const size_t min_len = kHeaderBytes + out_header.audio_len;
+    if (packet_len < min_len || packet_len > kPacketBytes) {
         return false;
     }
 

@@ -31,6 +31,7 @@ public:
     uint64_t time_us = 0;
     uint32_t now_step_us = 100;
     int tx_trigger_count = 0;
+    int flush_rx_count = 0;
 
     void loadRxPayload(std::initializer_list<uint8_t> payload)
     {
@@ -170,6 +171,7 @@ public:
                 break;
 
             case 0xE2:
+                ++flush_rx_count;
                 rx_fifo_packets.clear();
                 regs[0x07] &= static_cast<uint8_t>(~(1 << 6));
                 syncFifoStatus();

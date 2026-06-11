@@ -12,15 +12,19 @@ enum class AudioReassemblyError {
     InvalidPacket,      // Packet framing or lengths were malformed.
     MissingStart,       // A stream began without the required first marker.
     UnexpectedSequence, // The next packet number did not match the expectation.
+    DuplicateOrOld,     // The packet sequence was already accepted and was ignored.
+    SequenceGapTooLarge,// Too many packets were missing to keep this stream.
     DuplicateStart,     // A fresh "first" packet arrived mid-stream.
     AlreadyComplete     // Additional packets arrived after the stream ended.
 };
 
+constexpr uint16_t kMaxToleratedSequenceGap = 8;
+
 // AudioReassembler rebuilds the original byte stream from ordered packets.
 //
-// The class is intentionally strict: packets must begin at sequence 0 with the
-// "first" flag set, then continue in exact order until a packet marked "last".
-// This keeps the receiver logic simple and makes bad radio data obvious.
+// Packets must begin at sequence 0 with the "first" flag set. After that, small
+// forward gaps are tolerated and counted so one missed RF packet does not abort
+// the entire stream; duplicates and old packets are ignored.
 class AudioReassembler {
 public:
     // Accept one packet and append its payload bytes if the stream is still valid.
@@ -36,12 +40,15 @@ public:
     bool complete() const;
     // Report the sequence number the next valid packet must carry.
     uint16_t nextSequence() const;
+    // Count packets skipped across tolerated forward sequence gaps.
+    uint32_t missingPackets() const;
     // Expose why the most recent packet was rejected.
     AudioReassemblyError lastError() const;
 
 private:
     std::vector<uint8_t> audio_;  // Reassembled payload byte stream.
     uint16_t next_sequence_ = 0;  // Next packet number required for acceptance.
+    uint32_t missing_packets_ = 0; // Number of sequence slots skipped by tolerated gaps.
     bool started_ = false;        // True once a valid first packet was accepted.
     bool complete_ = false;       // True once the stream has received its last packet.
     AudioReassemblyError last_error_ = AudioReassemblyError::None;

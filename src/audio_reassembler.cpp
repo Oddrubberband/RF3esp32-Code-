@@ -15,11 +15,14 @@ bool AudioReassembler::acceptPacket(const uint8_t* packet, size_t packet_len)
     const bool is_last = (header.flags & AudioPacket::kLast) != 0;
 
     if (complete_) {
+        if (header.sequence < next_sequence_) {
+            last_error_ = AudioReassemblyError::DuplicateOrOld;
+            return false;
+        }
         last_error_ = AudioReassemblyError::AlreadyComplete;
         return false;
     }
 
-    // The first packet must mark the start of a stream; after that sequence numbers must be exact.
     if (!started_) {
         if (!is_first || header.sequence != 0) {
             last_error_ = AudioReassemblyError::MissingStart;
@@ -27,13 +30,26 @@ bool AudioReassembler::acceptPacket(const uint8_t* packet, size_t packet_len)
         }
         started_ = true;
     } else {
+        if (header.sequence < next_sequence_) {
+            last_error_ = AudioReassemblyError::DuplicateOrOld;
+            return false;
+        }
         if (is_first) {
             last_error_ = AudioReassemblyError::DuplicateStart;
             return false;
         }
-        if (header.sequence != next_sequence_) {
-            last_error_ = AudioReassemblyError::UnexpectedSequence;
-            return false;
+        if (header.sequence > next_sequence_) {
+            const uint16_t gap = static_cast<uint16_t>(header.sequence - next_sequence_);
+            if (gap > kMaxToleratedSequenceGap) {
+                audio_.clear();
+                next_sequence_ = 0;
+                missing_packets_ = 0;
+                started_ = false;
+                complete_ = false;
+                last_error_ = AudioReassemblyError::SequenceGapTooLarge;
+                return false;
+            }
+            missing_packets_ += gap;
         }
     }
 
@@ -52,6 +68,7 @@ void AudioReassembler::reset()
     // next accepted packet must again be the first packet in a new stream.
     audio_.clear();
     next_sequence_ = 0;
+    missing_packets_ = 0;
     started_ = false;
     complete_ = false;
     last_error_ = AudioReassemblyError::None;
@@ -77,6 +94,11 @@ bool AudioReassembler::complete() const
 uint16_t AudioReassembler::nextSequence() const
 {
     return next_sequence_;
+}
+
+uint32_t AudioReassembler::missingPackets() const
+{
+    return missing_packets_;
 }
 
 AudioReassemblyError AudioReassembler::lastError() const

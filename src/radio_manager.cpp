@@ -123,6 +123,7 @@ bool RadioManager::sendPayload(const uint8_t* payload, size_t len)
         status_.last_tx_ok = true;
         status_.last_tx_timed_out = false;
         status_.last_tx_saw_irq = radio_.lastTxSawIrq();
+        status_.last_fault = 0;
         status_.last_status = radio_.lastTxStatus();
         status_.last_fifo_status = radio_.lastTxFifoStatus();
         status_.last_observe_tx = radio_.lastTxObserve();

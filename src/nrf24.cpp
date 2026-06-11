@@ -60,10 +60,10 @@ bool Nrf24::initDefaults(uint8_t channel)
     hal_.ce(false);
 
     writeReg(0x00, 0x0C);
-    writeReg(0x01, 0x01);  // enable auto-ack on pipe 0
+    writeReg(0x01, 0x00);
     writeReg(0x02, 0x01);
     writeReg(0x03, 0x03);
-    writeReg(0x04, 0x5F);  // 1500 us retry delay, 15 retries
+    writeReg(0x04, 0x00);
     writeReg(0x05, channel);
     writeReg(0x06, packet_rf_setup_);
     writeRegs(0x0A, kDemoAddress.data(), kDemoAddress.size());
@@ -289,10 +289,10 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
 
             hal_.ce(false);
             writeReg(0x00, 0x0C);
-            writeReg(0x01, 0x01);  // keep auto-ack enabled after re-prime
+            writeReg(0x01, 0x00);
             writeReg(0x02, 0x01);
             writeReg(0x03, 0x03);
-            writeReg(0x04, 0x5F);  // keep retry policy enabled after re-prime
+            writeReg(0x04, 0x00);
             writeReg(0x05, channel);
             writeReg(0x06, packet_rf_setup_);
             writeRegs(0x0A, kDemoAddress.data(), kDemoAddress.size());

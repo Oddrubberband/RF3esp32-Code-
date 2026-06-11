@@ -24,6 +24,9 @@ constexpr uint8_t kRecommendedStartRepeats = 5;
 constexpr uint32_t kRecommendedStartGapMs = 15;
 constexpr uint32_t kRecommendedPostStartGapMs = 40;
 constexpr uint32_t kRecommendedSeq0DuplicateGapMs = 8;
+constexpr uint8_t kRecommendedStopRepeats = 3;
+constexpr uint32_t kRecommendedStopGapMs = 8;
+constexpr uint16_t kMaxToleratedSequenceGap = 8;
 
 struct ControlFrame {
     uint16_t stream_id = 0;
@@ -320,13 +323,6 @@ public:
 
         ControlFrame control{};
         if (decodeStart(packet, packet_len, control)) {
-            if (state_ == State::Streaming) {
-                if (control.stream_id != current_stream_id_) {
-                    pending_stream_id_ = control.stream_id;
-                }
-                return Action::StartAccepted;
-            }
-
             current_stream_id_ = control.stream_id;
             pending_stream_id_ = 0;
             state_ = State::WaitingForSeq0;

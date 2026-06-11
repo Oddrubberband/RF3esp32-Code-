@@ -12,6 +12,8 @@
 #include "morse.hpp"
 #include "nrf24.hpp"
 #include "radio_manager.hpp"
+#include "rx_drain.hpp"
+#include "tx_helpers.hpp"
 #include "validation.hpp"
 #include "stream_sync.hpp"
 
@@ -160,7 +162,7 @@ void test_audioReassembler_reassembles_packets_in_order(void)
     assertBytes(reassembler.audio(), {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'});
 }
 
-void test_audioReassembler_rejects_out_of_order_packet(void)
+void test_audioReassembler_accepts_small_forward_gap_and_records_missing(void)
 {
     uint8_t packet0[AudioPacket::kPacketBytes] = {};
     uint8_t packet2[AudioPacket::kPacketBytes] = {};
@@ -172,9 +174,48 @@ void test_audioReassembler_rejects_out_of_order_packet(void)
 
     AudioReassembler reassembler;
     TEST_ASSERT_TRUE(reassembler.acceptPacket(packet0, len0));
-    TEST_ASSERT_FALSE(reassembler.acceptPacket(packet2, len2));
-    TEST_ASSERT_EQUAL(static_cast<int>(AudioReassemblyError::UnexpectedSequence),
+    TEST_ASSERT_TRUE(reassembler.acceptPacket(packet2, len2));
+    TEST_ASSERT_TRUE(reassembler.complete());
+    TEST_ASSERT_EQUAL_UINT16(3, reassembler.nextSequence());
+    TEST_ASSERT_EQUAL_UINT32(1, reassembler.missingPackets());
+    assertBytes(reassembler.audio(), {'a', 'b', 'c', 'z', 'z'});
+}
+
+void test_audioReassembler_rejects_large_forward_gap_and_resets(void)
+{
+    uint8_t packet0[AudioPacket::kPacketBytes] = {};
+    uint8_t packet10[AudioPacket::kPacketBytes] = {};
+    size_t len0 = 0;
+    size_t len10 = 0;
+
+    TEST_ASSERT_TRUE(AudioPacket::encode(0, reinterpret_cast<const uint8_t*>("abc"), 3, true, false, packet0, len0));
+    TEST_ASSERT_TRUE(AudioPacket::encode(10, reinterpret_cast<const uint8_t*>("zz"), 2, false, true, packet10, len10));
+
+    AudioReassembler reassembler;
+    TEST_ASSERT_TRUE(reassembler.acceptPacket(packet0, len0));
+    TEST_ASSERT_FALSE(reassembler.acceptPacket(packet10, len10));
+    TEST_ASSERT_EQUAL(static_cast<int>(AudioReassemblyError::SequenceGapTooLarge),
                       static_cast<int>(reassembler.lastError()));
+    TEST_ASSERT_FALSE(reassembler.started());
+    TEST_ASSERT_EQUAL_UINT16(0, reassembler.nextSequence());
+    TEST_ASSERT_EQUAL_UINT32(0, reassembler.missingPackets());
+}
+
+void test_audioReassembler_ignores_duplicate_packet(void)
+{
+    uint8_t packet0[AudioPacket::kPacketBytes] = {};
+    size_t len0 = 0;
+
+    TEST_ASSERT_TRUE(AudioPacket::encode(0, reinterpret_cast<const uint8_t*>("abc"), 3, true, false, packet0, len0));
+
+    AudioReassembler reassembler;
+    TEST_ASSERT_TRUE(reassembler.acceptPacket(packet0, len0));
+    TEST_ASSERT_FALSE(reassembler.acceptPacket(packet0, len0));
+    TEST_ASSERT_EQUAL(static_cast<int>(AudioReassemblyError::DuplicateOrOld),
+                      static_cast<int>(reassembler.lastError()));
+    TEST_ASSERT_EQUAL_UINT16(1, reassembler.nextSequence());
+    TEST_ASSERT_EQUAL_UINT32(0, reassembler.missingPackets());
+    assertBytes(reassembler.audio(), {'a', 'b', 'c'});
 }
 
 // Driver and manager tests
@@ -479,6 +520,80 @@ void test_radioManager_hasPendingRx_reports_fifo_backlog_after_irq_clear(void)
     TEST_ASSERT_TRUE(manager.hasPendingRx());
 }
 
+void test_radioManager_hasPendingRx_true_when_rx_dr_set(void)
+{
+    FakeHal hal;
+    Nrf24 radio(hal);
+    RadioManager manager(radio);
+
+    hal.regs[0x07] |= (1 << 6);
+    hal.regs[0x17] |= 0x01;
+
+    TEST_ASSERT_TRUE(manager.hasPendingRx());
+}
+
+void test_radioManager_hasPendingRx_true_when_fifo_not_empty_without_rx_dr(void)
+{
+    FakeHal hal;
+    Nrf24 radio(hal);
+    RadioManager manager(radio);
+
+    hal.regs[0x07] &= static_cast<uint8_t>(~(1 << 6));
+    hal.regs[0x17] &= static_cast<uint8_t>(~0x01);
+
+    TEST_ASSERT_TRUE(manager.hasPendingRx());
+}
+
+void test_radioManager_hasPendingRx_false_when_rx_dr_clear_and_fifo_empty(void)
+{
+    FakeHal hal;
+    Nrf24 radio(hal);
+    RadioManager manager(radio);
+
+    hal.regs[0x07] &= static_cast<uint8_t>(~(1 << 6));
+    hal.regs[0x17] |= 0x01;
+
+    TEST_ASSERT_FALSE(manager.hasPendingRx());
+}
+
+void test_readOnePacket_does_not_flush_rx_after_successful_read(void)
+{
+    FakeHal hal;
+    Nrf24 radio(hal);
+    radio.setStaticPayloadSize(4);
+    hal.loadRxPayload({0x10, 0x20, 0x30, 0x40});
+
+    uint8_t out[4] = {};
+    size_t out_len = 0;
+
+    TEST_ASSERT_TRUE(radio.readOnePacket(out, sizeof(out), out_len));
+    TEST_ASSERT_EQUAL(0, hal.flush_rx_count);
+}
+
+void test_radioManager_sends_encoded_audio_as_fixed_width_zero_padded_payload(void)
+{
+    FakeHal hal;
+    hal.next_tx_success = true;
+    Nrf24 radio(hal);
+    RadioManager manager(radio);
+
+    const uint8_t audio[] = {0x11, 0x22, 0x33};
+    uint8_t packet[AudioPacket::kPacketBytes];
+    for (size_t i = 0; i < AudioPacket::kPacketBytes; ++i) {
+        packet[i] = 0xA5;
+    }
+    size_t packet_len = 0;
+
+    TEST_ASSERT_TRUE(AudioPacket::encode(5, audio, sizeof(audio), true, false, packet, packet_len));
+    TEST_ASSERT_EQUAL_UINT32(AudioPacket::kPacketBytes, static_cast<uint32_t>(packet_len));
+    TEST_ASSERT_TRUE(manager.sendPayload(packet, AudioPacket::kPacketBytes));
+
+    TEST_ASSERT_EQUAL_UINT32(AudioPacket::kPacketBytes, static_cast<uint32_t>(hal.last_payload_write.size()));
+    for (size_t i = AudioPacket::kHeaderBytes + sizeof(audio); i < AudioPacket::kPacketBytes; ++i) {
+        TEST_ASSERT_EQUAL_UINT8(0, hal.last_payload_write[i]);
+    }
+}
+
 void test_radioManager_startCw_updates_output_power(void)
 {
     FakeHal hal;
@@ -494,6 +609,134 @@ void test_radioManager_startCw_updates_output_power(void)
 }
 
 // Utility tests
+void test_txHelpers_pacing_8_bytes_delays_1_ms_with_no_remainder(void)
+{
+    const TxHelpers::PacingDelay delay = TxHelpers::calculateAudioPacingDelay(8, 0);
+
+    TEST_ASSERT_EQUAL_UINT32(1, delay.delay_ms);
+    TEST_ASSERT_EQUAL_UINT32(0, delay.remainder_us);
+}
+
+void test_txHelpers_pacing_single_bytes_accumulate_to_1_ms(void)
+{
+    uint32_t remainder_us = 0;
+    uint32_t total_delay_ms = 0;
+
+    for (int i = 0; i < 8; ++i) {
+        const TxHelpers::PacingDelay delay =
+            TxHelpers::calculateAudioPacingDelay(1, remainder_us);
+        total_delay_ms += delay.delay_ms;
+        remainder_us = delay.remainder_us;
+    }
+
+    TEST_ASSERT_EQUAL_UINT32(1, total_delay_ms);
+    TEST_ASSERT_EQUAL_UINT32(0, remainder_us);
+}
+
+void test_txHelpers_pacing_10_bytes_keeps_250_us_remainder(void)
+{
+    const TxHelpers::PacingDelay delay = TxHelpers::calculateAudioPacingDelay(10, 0);
+
+    TEST_ASSERT_EQUAL_UINT32(1, delay.delay_ms);
+    TEST_ASSERT_EQUAL_UINT32(250, delay.remainder_us);
+}
+
+void test_txHelpers_retry_succeeds_on_first_try(void)
+{
+    int send_calls = 0;
+    int delay_calls = 0;
+
+    const bool ok = TxHelpers::sendWithRetry(
+        [&]() {
+            ++send_calls;
+            return true;
+        },
+        [&](uint32_t) {
+            ++delay_calls;
+        });
+
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_EQUAL(1, send_calls);
+    TEST_ASSERT_EQUAL(0, delay_calls);
+}
+
+void test_txHelpers_retry_succeeds_on_retry(void)
+{
+    int send_calls = 0;
+    uint32_t delayed_ms = 0;
+
+    const bool ok = TxHelpers::sendWithRetry(
+        [&]() {
+            ++send_calls;
+            return send_calls == 2;
+        },
+        [&](uint32_t ms) {
+            delayed_ms += ms;
+        });
+
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_EQUAL(2, send_calls);
+    TEST_ASSERT_EQUAL_UINT32(TxHelpers::kDefaultRetryDelayMs, delayed_ms);
+}
+
+void test_txHelpers_retry_fails_after_all_attempts(void)
+{
+    int send_calls = 0;
+    int delay_calls = 0;
+
+    const bool ok = TxHelpers::sendWithRetry(
+        [&]() {
+            ++send_calls;
+            return false;
+        },
+        [&](uint32_t) {
+            ++delay_calls;
+        });
+
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_EQUAL(TxHelpers::kDefaultSendAttempts, send_calls);
+    TEST_ASSERT_EQUAL(TxHelpers::kDefaultSendAttempts - 1, delay_calls);
+}
+
+void test_rxDrain_processes_multiple_pending_packets(void)
+{
+    int pending = 3;
+    int processed = 0;
+
+    const RxDrain::DrainResult result = RxDrain::drainPending(
+        [&]() {
+            return pending > 0;
+        },
+        [&]() {
+            --pending;
+            ++processed;
+            return RxDrain::StepResult::Processed;
+        });
+
+    TEST_ASSERT_EQUAL_UINT32(3, static_cast<uint32_t>(result.processed));
+    TEST_ASSERT_EQUAL(3, processed);
+    TEST_ASSERT_FALSE(result.receive_failed);
+}
+
+void test_rxDrain_exits_on_receive_failure(void)
+{
+    int step_calls = 0;
+
+    const RxDrain::DrainResult result = RxDrain::drainPending(
+        []() {
+            return true;
+        },
+        [&]() {
+            ++step_calls;
+            return step_calls == 1 ? RxDrain::StepResult::Processed : RxDrain::StepResult::Failed;
+        },
+        8);
+
+    TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(result.processed));
+    TEST_ASSERT_EQUAL(2, step_calls);
+    TEST_ASSERT_TRUE(result.receive_failed);
+}
+
 void test_frame_io_round_trip_preserves_record(void)
 {
     FrameRecord original;
@@ -642,7 +885,7 @@ void test_audioPacket_decode_accepts_full_width_padded_packet(void)
     assertBytes(std::vector<uint8_t>(decoded_audio, decoded_audio + header.audio_len), {0x12, 0x34, 0x56});
 }
 
-void test_audioPacket_decode_rejects_non_exact_non_padded_length(void)
+void test_audioPacket_decode_accepts_exact_length_packet(void)
 {
     const uint8_t audio[] = {0xAA, 0xBB, 0xCC};
     uint8_t packet[AudioPacket::kPacketBytes] = {};
@@ -653,7 +896,71 @@ void test_audioPacket_decode_rejects_non_exact_non_padded_length(void)
     AudioPacket::Header header;
     const uint8_t* decoded_audio = nullptr;
 
-    TEST_ASSERT_FALSE(AudioPacket::decode(packet, 9, header, decoded_audio));
+    TEST_ASSERT_TRUE(AudioPacket::decode(packet,
+                                         AudioPacket::kHeaderBytes + sizeof(audio),
+                                         header,
+                                         decoded_audio));
+    TEST_ASSERT_EQUAL_UINT16(3, header.sequence);
+    TEST_ASSERT_EQUAL_UINT8(sizeof(audio), header.audio_len);
+    assertBytes(std::vector<uint8_t>(decoded_audio, decoded_audio + header.audio_len), {0xAA, 0xBB, 0xCC});
+}
+
+void test_audioPacket_decode_accepts_partially_padded_packet(void)
+{
+    const uint8_t audio[] = {0xAA, 0xBB, 0xCC};
+    uint8_t packet[AudioPacket::kPacketBytes] = {};
+    size_t packet_len = 0;
+
+    TEST_ASSERT_TRUE(AudioPacket::encode(3, audio, sizeof(audio), false, false, packet, packet_len));
+
+    AudioPacket::Header header;
+    const uint8_t* decoded_audio = nullptr;
+
+    TEST_ASSERT_TRUE(AudioPacket::decode(packet, 9, header, decoded_audio));
+    TEST_ASSERT_EQUAL_UINT16(3, header.sequence);
+    TEST_ASSERT_EQUAL_UINT8(sizeof(audio), header.audio_len);
+}
+
+void test_audioPacket_decode_rejects_too_short_packet(void)
+{
+    const uint8_t audio[] = {0xAA, 0xBB, 0xCC};
+    uint8_t packet[AudioPacket::kPacketBytes] = {};
+    size_t packet_len = 0;
+
+    TEST_ASSERT_TRUE(AudioPacket::encode(3, audio, sizeof(audio), false, false, packet, packet_len));
+
+    AudioPacket::Header header;
+    const uint8_t* decoded_audio = nullptr;
+
+    TEST_ASSERT_FALSE(AudioPacket::decode(packet,
+                                          AudioPacket::kHeaderBytes + sizeof(audio) - 1u,
+                                          header,
+                                          decoded_audio));
+}
+
+void test_audioPacket_decode_rejects_oversized_packet(void)
+{
+    const uint8_t audio[] = {0xAA};
+    uint8_t packet[AudioPacket::kPacketBytes + 1] = {};
+    size_t packet_len = 0;
+
+    TEST_ASSERT_TRUE(AudioPacket::encode(3, audio, sizeof(audio), false, false, packet, packet_len));
+
+    AudioPacket::Header header;
+    const uint8_t* decoded_audio = nullptr;
+
+    TEST_ASSERT_FALSE(AudioPacket::decode(packet, sizeof(packet), header, decoded_audio));
+}
+
+void test_audioPacket_decode_rejects_declared_audio_len_larger_than_max(void)
+{
+    uint8_t packet[AudioPacket::kPacketBytes] = {};
+    packet[2] = static_cast<uint8_t>(AudioPacket::kAudioBytesPerPacket + 1u);
+
+    AudioPacket::Header header;
+    const uint8_t* decoded_audio = nullptr;
+
+    TEST_ASSERT_FALSE(AudioPacket::decode(packet, AudioPacket::kPacketBytes, header, decoded_audio));
 }
 
 void test_readOnePacket_reads_fifo_backlog_even_if_rx_dr_is_clear(void)
@@ -755,7 +1062,7 @@ void test_audioPacket_decode_accepts_every_valid_audio_len_as_padded_packet(void
     }
 }
 
-void test_audioPacket_decode_rejects_zero_audio_len(void)
+void test_audioPacket_decode_accepts_zero_audio_len(void)
 {
     uint8_t packet[AudioPacket::kPacketBytes] = {};
     packet[0] = 0x01;
@@ -766,7 +1073,10 @@ void test_audioPacket_decode_rejects_zero_audio_len(void)
     AudioPacket::Header header;
     const uint8_t* decoded_audio = nullptr;
 
-    TEST_ASSERT_FALSE(AudioPacket::decode(packet, AudioPacket::kPacketBytes, header, decoded_audio));
+    TEST_ASSERT_TRUE(AudioPacket::decode(packet, AudioPacket::kPacketBytes, header, decoded_audio));
+    TEST_ASSERT_EQUAL_UINT16(1, header.sequence);
+    TEST_ASSERT_EQUAL_UINT8(0, header.audio_len);
+    TEST_ASSERT_EQUAL_PTR(packet + AudioPacket::kHeaderBytes, decoded_audio);
 }
 
 void test_audioReassembler_accepts_padded_packets_in_order(void)
@@ -1188,7 +1498,9 @@ int main(void)
     RUN_TEST(test_audioPacket_encode_decode_round_trip);
     RUN_TEST(test_audioPacket_rejects_oversized_audio);
     RUN_TEST(test_audioReassembler_reassembles_packets_in_order);
-    RUN_TEST(test_audioReassembler_rejects_out_of_order_packet);
+    RUN_TEST(test_audioReassembler_accepts_small_forward_gap_and_records_missing);
+    RUN_TEST(test_audioReassembler_rejects_large_forward_gap_and_resets);
+    RUN_TEST(test_audioReassembler_ignores_duplicate_packet);
     RUN_TEST(test_writeReg_writes_register_and_formats_spi_command);
     RUN_TEST(test_powerUp_sets_power_bit_and_waits_for_startup);
     RUN_TEST(test_probe_restores_original_channel_after_check);
@@ -1207,7 +1519,20 @@ int main(void)
     RUN_TEST(test_radioManager_refreshSnapshot_reports_live_irq_state);
     RUN_TEST(test_radioManager_receivePayload_updates_rx_length);
     RUN_TEST(test_radioManager_hasPendingRx_reports_fifo_backlog_after_irq_clear);
+    RUN_TEST(test_radioManager_hasPendingRx_true_when_rx_dr_set);
+    RUN_TEST(test_radioManager_hasPendingRx_true_when_fifo_not_empty_without_rx_dr);
+    RUN_TEST(test_radioManager_hasPendingRx_false_when_rx_dr_clear_and_fifo_empty);
+    RUN_TEST(test_readOnePacket_does_not_flush_rx_after_successful_read);
+    RUN_TEST(test_radioManager_sends_encoded_audio_as_fixed_width_zero_padded_payload);
     RUN_TEST(test_radioManager_startCw_updates_output_power);
+    RUN_TEST(test_txHelpers_pacing_8_bytes_delays_1_ms_with_no_remainder);
+    RUN_TEST(test_txHelpers_pacing_single_bytes_accumulate_to_1_ms);
+    RUN_TEST(test_txHelpers_pacing_10_bytes_keeps_250_us_remainder);
+    RUN_TEST(test_txHelpers_retry_succeeds_on_first_try);
+    RUN_TEST(test_txHelpers_retry_succeeds_on_retry);
+    RUN_TEST(test_txHelpers_retry_fails_after_all_attempts);
+    RUN_TEST(test_rxDrain_processes_multiple_pending_packets);
+    RUN_TEST(test_rxDrain_exits_on_receive_failure);
     RUN_TEST(test_frame_io_round_trip_preserves_record);
     RUN_TEST(test_validation_rejects_oversized_payload);
     RUN_TEST(test_morse_encode_e_creates_single_dot_event);
@@ -1217,12 +1542,16 @@ int main(void)
     RUN_TEST(test_startContinuousCarrier_uses_cont_wave_when_supported);
     RUN_TEST(test_startContinuousCarrier_falls_back_to_payload_reuse_when_needed);
     RUN_TEST(test_audioPacket_decode_accepts_full_width_padded_packet);
-    RUN_TEST(test_audioPacket_decode_rejects_non_exact_non_padded_length);
+    RUN_TEST(test_audioPacket_decode_accepts_exact_length_packet);
+    RUN_TEST(test_audioPacket_decode_accepts_partially_padded_packet);
+    RUN_TEST(test_audioPacket_decode_rejects_too_short_packet);
+    RUN_TEST(test_audioPacket_decode_rejects_oversized_packet);
+    RUN_TEST(test_audioPacket_decode_rejects_declared_audio_len_larger_than_max);
     RUN_TEST(test_readOnePacket_reads_fifo_backlog_even_if_rx_dr_is_clear);
     RUN_TEST(test_radioManager_hasPendingRx_reports_fifo_backlog_even_after_irq_clear);
     RUN_TEST(test_radioManager_receivePayload_reads_fifo_backlog_after_irq_clear);
     RUN_TEST(test_audioPacket_decode_accepts_every_valid_audio_len_as_padded_packet);
-    RUN_TEST(test_audioPacket_decode_rejects_zero_audio_len);
+    RUN_TEST(test_audioPacket_decode_accepts_zero_audio_len);
     RUN_TEST(test_audioReassembler_accepts_padded_packets_in_order);
     RUN_TEST(test_readOnePacket_returns_false_when_no_pending_data);
     RUN_TEST(test_radioManager_receivePayload_without_data_sets_fault);

@@ -33,6 +33,8 @@
 #include "morse.hpp"
 #include "nrf24.hpp"
 #include "radio_manager.hpp"
+#include "rx_drain.hpp"
+#include "tx_helpers.hpp"
 #include "validation.hpp"
 #include "stream_sync.hpp"
 #include "wifi_control_config.hpp"
@@ -49,6 +51,10 @@
 #define RF3_WIFI_CONTROL_ENABLED 1
 #endif
 
+#ifndef RF3_VERBOSE_RX_LOG
+#define RF3_VERBOSE_RX_LOG 0
+#endif
+
 // main.cpp owns the top-level demo flow:
 // - mount the Serial Peripheral Interface Flash File System (SPIFFS) partition
 //   that stores staged data files
@@ -60,16 +66,16 @@
 // files keep packet formatting and radio access focused and testable.
 namespace {
 constexpr const char* TAG = "APP";
-// Pace bulk file transfer conservatively so the receiver can drain the nRF24
-// receive (RX) FIFO without relying on acknowledgements or retransmits.
-constexpr uint32_t kDataPacketGapMs = 40;
 constexpr uint32_t kDataPacketRepeatGapMs = 8;
-constexpr uint32_t kPacketsPerSecond = 1000u / kDataPacketGapMs;
-constexpr uint32_t kPayloadBytesPerSecond =
-    kPacketsPerSecond * AudioPacket::kAudioBytesPerPacket;
-// Rough over-the-air bitrate including the fixed packet header bytes.
+constexpr uint32_t kAudioBytesPerSecond = 8000;
+constexpr uint16_t kMaxToleratedIncomingGap = StreamSync::kMaxToleratedSequenceGap;
+constexpr uint32_t kPacketsPerSecond =
+    (kAudioBytesPerSecond + AudioPacket::kAudioBytesPerPacket - 1u) /
+    AudioPacket::kAudioBytesPerPacket;
+constexpr uint32_t kPayloadBytesPerSecond = kAudioBytesPerSecond;
+// Rough over-the-air bitrate including fixed-width packet overhead.
 constexpr uint32_t kPayloadBitsPerSecond =
-    kPacketsPerSecond * AudioPacket::kPacketBytes * 8;
+    kPacketsPerSecond * AudioPacket::kPacketBytes * 8u;
 constexpr const char* kSpiffsRoot = "/spiffs";
 constexpr const char* kDefaultTrack = "payload.bin";
 constexpr const char* kReceivedFilePrefix = "rx_";
@@ -77,8 +83,6 @@ constexpr const char* kReceivedFileExtension = ".bin";
 constexpr const char* kReceivedPartialExtension = ".part";
 constexpr uint32_t kDefaultMorseDotMs = 120;
 constexpr uint8_t kDefaultMorsePowerLevel = 3;
-constexpr TickType_t kDataPacketGap =
-    pdMS_TO_TICKS(kDataPacketGapMs) > 0 ? pdMS_TO_TICKS(kDataPacketGapMs) : 1;
 constexpr TickType_t kLoopWorkerPeriod = pdMS_TO_TICKS(20);
 constexpr TickType_t kLoopStopPollPeriod = pdMS_TO_TICKS(20);
 constexpr TickType_t kLoopStopTimeout = pdMS_TO_TICKS(2000);
@@ -98,6 +102,7 @@ constexpr char kWifiPlaceholderPassword[] = "YOUR_WIFI_PASSWORD";
 // These compile-time checks keep the packetized transfer settings aligned with
 // nRF24 hardware limits instead of failing later at runtime.
 static_assert(AudioPacket::kPacketBytes <= 32, "nRF24 payload limit exceeded");
+static_assert(TxHelpers::kAudioByteUs == 125, "8 kHz unsigned 8-bit audio pacing changed");
 static_assert(kPayloadBitsPerSecond < 250000, "Data transfer pacing exceeds the nRF24 250 kbps mode");
 
 struct TrackInfo {
@@ -148,6 +153,7 @@ struct HttpStatusSnapshot {
     uint32_t rx_packets = 0;
     uint32_t rx_stream = 0;
     uint32_t rx_raw = 0;
+    uint32_t rx_missing = 0;
     uint32_t rx_saved = 0;
     uint32_t rx_saved_bytes = 0;
     uint32_t selected_bytes = 0;
@@ -160,10 +166,17 @@ struct IncomingFileTransfer {
     uint16_t stream_id = 0;
     uint16_t next_sequence = 0;
     uint32_t packet_count = 0;
+    uint32_t missing_packets = 0;
     size_t bytes_written = 0;
     std::string final_name;
     std::string partial_name;
     std::FILE* file = nullptr;
+};
+
+enum class IncomingChunkResult {
+    Accepted,
+    IgnoredOld,
+    Rejected
 };
 
 const char* loopModeName(LoopMode mode)
@@ -305,6 +318,17 @@ void delayAtLeastMs(uint32_t duration_ms)
 {
     const TickType_t ticks = pdMS_TO_TICKS(duration_ms);
     vTaskDelay(ticks > 0 ? ticks : 1);
+}
+
+bool sendPayloadWithRetry(RadioManager& manager, const uint8_t* payload, size_t len)
+{
+    return TxHelpers::sendWithRetry(
+        [&manager, payload, len]() {
+            return manager.sendPayload(payload, len);
+        },
+        [](uint32_t delay_ms) {
+            delayAtLeastMs(delay_ms);
+        });
 }
 
 void appendFormat(std::string& out, const char* format, ...)
@@ -472,7 +496,8 @@ bool sendDataFile(RadioManager& manager,
 
     uint8_t control_packet[AudioPacket::kPacketBytes] = {};
     size_t control_len = 0;
-    if (!StreamSync::encodeStart(stream_id, control_packet, control_len)) {
+    if (!StreamSync::encodeStart(stream_id, control_packet, control_len) ||
+        control_len != AudioPacket::kPacketBytes) {
         std::fclose(fp);
         ESP_LOGE(TAG, "Failed to build START packet for stream %u", stream_id);
         return false;
@@ -485,7 +510,7 @@ bool sendDataFile(RadioManager& manager,
             return false;
         }
 
-        if (!manager.sendPayload(control_packet, control_len)) {
+        if (!sendPayloadWithRetry(manager, control_packet, AudioPacket::kPacketBytes)) {
             std::fclose(fp);
             const RadioStatus status = manager.status();
             ESP_LOGE(TAG,
@@ -507,6 +532,7 @@ bool sendDataFile(RadioManager& manager,
     uint8_t file_chunk[AudioPacket::kAudioBytesPerPacket];
     uint8_t packet[AudioPacket::kPacketBytes];
     uint16_t sequence = 0;
+    uint32_t pacing_remainder_us = 0;
 
     while (true) {
         if (stop_requested && *stop_requested) {
@@ -544,7 +570,7 @@ bool sendDataFile(RadioManager& manager,
             return false;
         }
 
-        if (!manager.sendPayload(packet, AudioPacket::kPacketBytes)) {
+        if (!sendPayloadWithRetry(manager, packet, AudioPacket::kPacketBytes)) {
             std::fclose(fp);
             const RadioStatus status = manager.status();
             ESP_LOGE(TAG,
@@ -578,7 +604,7 @@ bool sendDataFile(RadioManager& manager,
 
             delayAtLeastMs(kDataPacketRepeatGapMs);
 
-            if (!manager.sendPayload(packet, AudioPacket::kPacketBytes)) {
+            if (!sendPayloadWithRetry(manager, packet, AudioPacket::kPacketBytes)) {
                 std::fclose(fp);
                 const RadioStatus status = manager.status();
                 ESP_LOGE(TAG,
@@ -598,11 +624,22 @@ bool sendDataFile(RadioManager& manager,
             break;
         }
 
-        vTaskDelay(kDataPacketGap);
+        const TxHelpers::PacingDelay pacing =
+            TxHelpers::calculateAudioPacingDelay(bytes_read, pacing_remainder_us);
+        pacing_remainder_us = pacing.remainder_us;
+        if (pacing.delay_ms > 0) {
+            delayAtLeastMs(pacing.delay_ms);
+        }
     }
 
-    if (StreamSync::encodeStop(stream_id, control_packet, control_len)) {
-        (void)manager.sendPayload(control_packet, control_len);
+    if (StreamSync::encodeStop(stream_id, control_packet, control_len) &&
+        control_len == AudioPacket::kPacketBytes) {
+        for (uint8_t i = 0; i < StreamSync::kRecommendedStopRepeats; ++i) {
+            (void)sendPayloadWithRetry(manager, control_packet, AudioPacket::kPacketBytes);
+            if ((i + 1u) < StreamSync::kRecommendedStopRepeats) {
+                delayAtLeastMs(StreamSync::kRecommendedStopGapMs);
+            }
+        }
     }
 
     std::fclose(fp);
@@ -1388,11 +1425,11 @@ private:
                     static_cast<unsigned>(stream_id),
                     errno);
             return false;
-    }
+        }
 
-    incoming_file_ = std::move(next);
-    return true;
-}
+        incoming_file_ = std::move(next);
+        return true;
+    }
     bool finalizeIncomingFileTransfer()
     {
         if (!incoming_file_.active) {
@@ -1404,6 +1441,7 @@ private:
         const uint16_t stream_id = incoming_file_.stream_id;
         const size_t bytes_written = incoming_file_.bytes_written;
         const uint32_t packet_count = incoming_file_.packet_count;
+        const uint32_t missing_packets = incoming_file_.missing_packets;
         const std::string partial_path = buildTrackPath(partial_name);
         const std::string final_path = buildTrackPath(final_name);
 
@@ -1425,37 +1463,56 @@ private:
         ++saved_rx_file_count_;
         saved_rx_byte_count_ += static_cast<uint32_t>(bytes_written);
         ESP_LOGI(TAG,
-                 "Saved RX file %s (%u bytes across %u packets) for stream %u",
+                 "Saved RX file %s (%u bytes across %u packets, missing=%u) for stream %u",
                  final_name.c_str(),
                  static_cast<unsigned>(bytes_written),
                  static_cast<unsigned>(packet_count),
+                 static_cast<unsigned>(missing_packets),
                  static_cast<unsigned>(stream_id));
         return true;
     }
 
-    bool appendIncomingFileChunk(uint16_t stream_id,
-                                 const AudioPacket::Header& header,
-                                 const uint8_t* data)
+    IncomingChunkResult appendIncomingFileChunk(uint16_t stream_id,
+                                                const AudioPacket::Header& header,
+                                                const uint8_t* data)
     {
         if (!data) {
-            return false;
+            return IncomingChunkResult::Rejected;
         }
 
         if (!incoming_file_.active || incoming_file_.stream_id != stream_id) {
             if (!startIncomingFileTransfer(stream_id)) {
-                return false;
+                return IncomingChunkResult::Rejected;
             }
         }
 
-        if (header.sequence != incoming_file_.next_sequence) {
+        if (header.sequence < incoming_file_.next_sequence) {
+            return IncomingChunkResult::IgnoredOld;
+        }
+
+        if (header.sequence > incoming_file_.next_sequence) {
+            const uint16_t gap =
+                static_cast<uint16_t>(header.sequence - incoming_file_.next_sequence);
+            if (gap > kMaxToleratedIncomingGap) {
+                ESP_LOGW(TAG,
+                         "RX sequence gap too large for stream=%u expected=%u got=%u gap=%u",
+                         static_cast<unsigned>(stream_id),
+                         static_cast<unsigned>(incoming_file_.next_sequence),
+                         static_cast<unsigned>(header.sequence),
+                         static_cast<unsigned>(gap));
+                discardIncomingFileTransfer("Discarding partial RX file after large sequence gap");
+                sync_gate_.reset();
+                return IncomingChunkResult::Rejected;
+            }
+
+            incoming_file_.missing_packets += gap;
+            missing_rx_packet_count_ += gap;
             ESP_LOGW(TAG,
-                     "RX sequence mismatch for stream=%u expected=%u got=%u",
+                     "RX sequence gap for stream=%u expected=%u got=%u missing=%u",
                      static_cast<unsigned>(stream_id),
                      static_cast<unsigned>(incoming_file_.next_sequence),
-                     static_cast<unsigned>(header.sequence));
-            discardIncomingFileTransfer("Discarding partial RX file after sequence mismatch");
-            sync_gate_.reset();
-            return false;
+                     static_cast<unsigned>(header.sequence),
+                     static_cast<unsigned>(gap));
         }
 
         const size_t written = std::fwrite(data, 1, header.audio_len, incoming_file_.file);
@@ -1469,14 +1526,14 @@ private:
                      errno);
             discardIncomingFileTransfer("Discarding partial RX file after write failure");
             sync_gate_.reset();
-            return false;
+            return IncomingChunkResult::Rejected;
         }
 
         incoming_file_.next_sequence = static_cast<uint16_t>(header.sequence + 1u);
         incoming_file_.packet_count += 1;
         incoming_file_.bytes_written += written;
         incoming_file_.saw_last_packet = (header.flags & AudioPacket::kLast) != 0;
-        return true;
+        return IncomingChunkResult::Accepted;
     }
 
     void resetRxSession()
@@ -1486,6 +1543,7 @@ private:
         carrier_event_count_ = 0;
         decoded_rx_packet_count_ = 0;
         raw_rx_packet_count_ = 0;
+        missing_rx_packet_count_ = 0;
         saved_rx_file_count_ = 0;
         saved_rx_byte_count_ = 0;
         sync_gate_.reset();
@@ -1668,6 +1726,7 @@ private:
         const uint32_t carrier_events = carrier_event_count_;
         const uint32_t decoded_packets = decoded_rx_packet_count_;
         const uint32_t raw_packets = raw_rx_packet_count_;
+        const uint32_t missing_packets = missing_rx_packet_count_;
         giveRadio();
         const LoopConfig loop = loopSnapshot();
         const char* irq_state =
@@ -1681,7 +1740,7 @@ private:
         } else {
             std::printf("power=unknown ");
         }
-        std::printf("selected=%s last_status=0x%02X fifo=0x%02X observe=0x%02X irq=%s tx_irq_seen=%s tx_ok=%s tx_timeout=%s rx_len=%u rx_packets=%u rx_stream=%u rx_raw=%u rx_saved=%u rx_saved_bytes=%u carrier_events=%u fault=%d",
+        std::printf("selected=%s last_status=0x%02X fifo=0x%02X observe=0x%02X irq=%s tx_irq_seen=%s tx_ok=%s tx_timeout=%s rx_len=%u rx_packets=%u rx_stream=%u rx_raw=%u rx_missing=%u rx_saved=%u rx_saved_bytes=%u carrier_events=%u fault=%d",
                     selected_track_.c_str(),
                     static_cast<unsigned>(status.last_status),
                     static_cast<unsigned>(status.last_fifo_status),
@@ -1694,6 +1753,7 @@ private:
                     static_cast<unsigned>(status.rx_packets),
                     static_cast<unsigned>(decoded_packets),
                     static_cast<unsigned>(raw_packets),
+                    static_cast<unsigned>(missing_packets),
                     static_cast<unsigned>(saved_rx_file_count_),
                     static_cast<unsigned>(saved_rx_byte_count_),
                     static_cast<unsigned>(carrier_events),
@@ -1765,6 +1825,7 @@ private:
         out.rx_packets = status.rx_packets;
         out.rx_stream = decoded_rx_packet_count_;
         out.rx_raw = raw_rx_packet_count_;
+        out.rx_missing = missing_rx_packet_count_;
         out.rx_saved = saved_rx_file_count_;
         out.rx_saved_bytes = saved_rx_byte_count_;
         out.last_fault = status.last_fault;
@@ -1786,7 +1847,7 @@ private:
                      "{\"node_name\":\"%s\",\"hostname\":\"%s\",\"state\":\"%s\",\"selected\":\"%s\",\"selected_bytes\":%u,"
                      "\"channel\":%u,\"power\":%d,"
                      "\"tx_ok\":%s,\"tx_timeout\":%s,\"rx_packets\":%u,"
-                     "\"rx_stream\":%u,\"rx_raw\":%u,\"rx_saved\":%u,"
+                     "\"rx_stream\":%u,\"rx_raw\":%u,\"rx_missing\":%u,\"rx_saved\":%u,"
                      "\"rx_saved_bytes\":%u,\"last_fault\":%d,"
                      "\"rx_pending\":%s,\"rpd\":%s}",
                      snapshot.node_name,
@@ -1801,6 +1862,7 @@ private:
                      static_cast<unsigned>(snapshot.rx_packets),
                      static_cast<unsigned>(snapshot.rx_stream),
                      static_cast<unsigned>(snapshot.rx_raw),
+                     static_cast<unsigned>(snapshot.rx_missing),
                      static_cast<unsigned>(snapshot.rx_saved),
                      static_cast<unsigned>(snapshot.rx_saved_bytes),
                      snapshot.last_fault,
@@ -1973,7 +2035,8 @@ private:
 
         uint8_t packet[AudioPacket::kPacketBytes] = {};
         size_t packet_len = 0;
-        if (!StreamSync::encodeRemoteCommand(request.c_str(), request.size(), packet, packet_len)) {
+        if (!StreamSync::encodeRemoteCommand(request.c_str(), request.size(), packet, packet_len) ||
+            packet_len != AudioPacket::kPacketBytes) {
             std::printf("Remote command is too long or has non-ASCII bytes. Limit is %u characters.\n",
                         static_cast<unsigned>(StreamSync::kRemoteCommandMaxBytes));
             return false;
@@ -1986,7 +2049,7 @@ private:
 
         bool ok = ensureStandbyLocked();
         if (ok) {
-            ok = manager_.sendPayload(packet, packet_len);
+            ok = sendPayloadWithRetry(manager_, packet, AudioPacket::kPacketBytes);
         }
 
         const RadioStatus status = manager_.status();
@@ -2888,21 +2951,20 @@ private:
             case StreamSync::ReceiverGate::Action::AudioAccepted: {
                 const uint16_t stream_id = sync_gate_.currentStreamId();
 
-                if (incoming_file_.active &&
-                    incoming_file_.stream_id == stream_id &&
-                    incoming_file_.next_sequence > 0 &&
-                    header.sequence == static_cast<uint16_t>(incoming_file_.next_sequence - 1u)) {
+                const IncomingChunkResult append_result =
+                    appendIncomingFileChunk(stream_id, header, data);
+                if (append_result == IncomingChunkResult::IgnoredOld) {
                     ++raw_rx_packet_count_;
                     return;
                 }
-
-                if (!appendIncomingFileChunk(stream_id, header, data)) {
+                if (append_result == IncomingChunkResult::Rejected) {
                     ++raw_rx_packet_count_;
                     return;
                 }
 
                 ++decoded_rx_packet_count_;
 
+#if RF3_VERBOSE_RX_LOG
                 if (header.sequence == 0 ||
                     incoming_file_.packet_count == 1 ||
                     (incoming_file_.packet_count % 64u) == 0 ||
@@ -2915,6 +2977,7 @@ private:
                              static_cast<unsigned>(incoming_file_.bytes_written),
                              static_cast<unsigned>(header.flags));
                 }
+#endif
 
                 if ((header.flags & AudioPacket::kLast) != 0) {
                     if (!finalizeIncomingFileTransfer()) {
@@ -2923,64 +2986,7 @@ private:
                     }
                 }
                 return;
-            
-            if (incoming_file_.active &&
-                incoming_file_.stream_id == stream_id &&
-                incoming_file_.next_sequence > 0 &&
-                header.sequence == static_cast<uint16_t>(incoming_file_.next_sequence - 1u)) {
-                ++raw_rx_packet_count_;
-                return;
             }
-
-            if (!appendIncomingFileChunk(stream_id, header, data)) {
-                ++raw_rx_packet_count_;
-                return;
-            }
-
-            ++decoded_rx_packet_count_;
-
-            if (header.sequence == 0 ||
-                incoming_file_.packet_count == 1 ||
-                (incoming_file_.packet_count % 64u) == 0 ||
-                (header.flags & AudioPacket::kLast) != 0) {
-                ESP_LOGI(TAG,
-                         "RX data stream=%u seq=%u bytes=%u total=%u flags=0x%02X",
-                         static_cast<unsigned>(stream_id),
-                         static_cast<unsigned>(header.sequence),
-                         static_cast<unsigned>(header.audio_len),
-                         static_cast<unsigned>(incoming_file_.bytes_written),
-                         static_cast<unsigned>(header.flags));
-            }
-
-            if ((header.flags & AudioPacket::kLast) != 0) {
-                if (!finalizeIncomingFileTransfer()) {
-                    ++raw_rx_packet_count_;
-                    sync_gate_.reset();
-                }
-            }
-            return;
-        
-                }
-                ++decoded_rx_packet_count_;
-                if (header.sequence == 0 ||
-                    incoming_file_.packet_count == 1 ||
-                    (incoming_file_.packet_count % 64u) == 0 ||
-                    (header.flags & AudioPacket::kLast) != 0) {
-                    ESP_LOGI(TAG,
-                             "RX data stream=%u seq=%u bytes=%u total=%u flags=0x%02X",
-                             static_cast<unsigned>(sync_gate_.currentStreamId()),
-                             static_cast<unsigned>(header.sequence),
-                             static_cast<unsigned>(header.audio_len),
-                             static_cast<unsigned>(incoming_file_.bytes_written),
-                             static_cast<unsigned>(header.flags));
-                }
-                if ((header.flags & AudioPacket::kLast) != 0) {
-                    if (!finalizeIncomingFileTransfer()) {
-                        ++raw_rx_packet_count_;
-                        sync_gate_.reset();
-                    }
-                }
-                return;
             case StreamSync::ReceiverGate::Action::Ignore:
                 ++raw_rx_packet_count_;
                 return;
@@ -2988,8 +2994,10 @@ private:
             case StreamSync::ReceiverGate::Action::Invalid:
             default:
                 ++raw_rx_packet_count_;
+#if RF3_VERBOSE_RX_LOG
                 ESP_LOGI(TAG, "RX payload len=%u (unrecognized frame)",
                          static_cast<unsigned>(len));
+#endif
                 return;
         }
     }
@@ -3016,24 +3024,36 @@ private:
                     }
                     last_carrier_detected_ = snapshot.carrier_detected;
 
-                    while (manager_.hasPendingRx()) {
-                        size_t out_len = 0;
-                        if (manager_.receivePayload(payload.data(), payload.size(), out_len)) {
-                            std::string_view remote_view;
-                            if (kWirelessControlEnabled &&
-                                StreamSync::decodeRemoteCommand(payload.data(), out_len, remote_view)) {
-                                remote_command.assign(remote_view.data(), remote_view.size());
-                                break;
+                    const RxDrain::DrainResult drain_result = RxDrain::drainPending(
+                        [&]() {
+                            return manager_.hasPendingRx();
+                        },
+                        [&]() {
+                            size_t out_len = 0;
+                            if (manager_.receivePayload(payload.data(), payload.size(), out_len)) {
+                                std::string_view remote_view;
+                                if (kWirelessControlEnabled &&
+                                    StreamSync::decodeRemoteCommand(payload.data(), out_len, remote_view)) {
+                                    remote_command.assign(remote_view.data(), remote_view.size());
+                                    return RxDrain::StepResult::Stop;
+                                }
+
+                                processRxPayload(payload.data(), out_len);
+                                return RxDrain::StepResult::Processed;
                             }
 
-                            processRxPayload(payload.data(), out_len);
-                        } else {
                             const RadioStatus status = manager_.status();
                             ESP_LOGW(TAG, "RX read failed, state=%s fault=%d",
                                      RadioManager::stateName(status.state),
                                      status.last_fault);
-                            break;
-                        }
+                            return RxDrain::StepResult::Failed;
+                        },
+                        RxDrain::kDefaultMaxPacketsPerPoll);
+
+                    if (drain_result.guard_exhausted) {
+                        ESP_LOGW(TAG,
+                                 "RX drain guard hit after %u packets",
+                                 static_cast<unsigned>(drain_result.processed));
                     }
                 } else {
                     last_carrier_detected_ = false;
@@ -3154,6 +3174,7 @@ private:
     IncomingFileTransfer incoming_file_{};    // Active file being reconstructed from RX packets.
     uint32_t decoded_rx_packet_count_ = 0;    // Payloads accepted as in-order stream data.
     uint32_t raw_rx_packet_count_ = 0;        // Payloads that were received but not accepted as stream data.
+    uint32_t missing_rx_packet_count_ = 0;    // Sequence slots skipped by tolerated forward gaps.
     uint32_t saved_rx_file_count_ = 0;        // Completed files written to SPIFFS in the current RX session.
     uint32_t saved_rx_byte_count_ = 0;        // Total bytes written across saved RX files in the current RX session.
     LoopConfig loop_config_{};

@@ -48,8 +48,8 @@ bool encode(uint16_t sequence,
 //
 // This validates the packet shape before exposing the payload pointer so higher
 // layers can safely append the recovered data bytes to a
-// reassembly buffer. Both compact packets and fixed-width padded packets are
-// accepted so host-side tests and radio reads can use the same decoder.
+// reassembly buffer. Any packet length from the compact header+payload size up
+// through the fixed nRF24 payload width is accepted; trailing bytes are padding.
 bool decode(const uint8_t* packet,
             size_t packet_len,
             Header& out_header,
