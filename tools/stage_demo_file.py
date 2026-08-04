@@ -157,6 +157,8 @@ def stage_data_directory(
     for entry in data_dir.iterdir():
         if not entry.is_file():
             continue
+        if entry.name.endswith(".part"):
+            continue
         if entry.name == staged_name:
             continue
         if replace_existing_files:
@@ -165,6 +167,24 @@ def stage_data_directory(
 
     shutil.copy2(source_file, stage_dir / staged_name)
     return stage_dir
+
+
+def commit_staged_file(
+    data_dir: Path,
+    output_path: Path,
+    source_file: Path,
+    replace_existing_files: bool,
+) -> None:
+    # Apply exactly the directory shape that passed validation. In particular,
+    # --replace-existing-files must not validate an empty temporary directory
+    # and then leave old files in the real PlatformIO data/ image source.
+    if replace_existing_files:
+        for entry in data_dir.iterdir():
+            if entry.is_file() and entry.resolve() != output_path.resolve():
+                entry.unlink()
+
+    if source_file.resolve() != output_path.resolve():
+        shutil.copy2(source_file, output_path)
 
 
 def validate_spiffs_fit(stage_dir: Path, spiffs_size: int, mkspiffs_path: str | None) -> tuple[bool, str]:
@@ -224,6 +244,8 @@ def main() -> int:
     spiffs_size = read_spiffs_partition_size(partitions_path)
     replace_existing_files = args.replace_existing_files or args.replace_existing_audio
     output_name = sanitize_output_name(args.output_name or source.name)
+    if output_name.endswith(".part"):
+        return fail("The .part suffix is reserved for incomplete received transfers")
     output_path = data_dir / output_name
 
     stage_dir = stage_data_directory(
@@ -240,8 +262,12 @@ def main() -> int:
     finally:
         shutil.rmtree(stage_dir.parent, ignore_errors=True)
 
-    if source.resolve() != output_path.resolve():
-        shutil.copy2(source, output_path)
+    commit_staged_file(
+        data_dir=data_dir,
+        output_path=output_path,
+        source_file=source,
+        replace_existing_files=replace_existing_files,
+    )
 
     staged_bytes = output_path.stat().st_size
     print(f"Staged {output_path.name}")
