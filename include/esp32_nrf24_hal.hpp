@@ -1,44 +1,18 @@
 #pragma once
 
 #include "nrf24_hal.hpp"
+#include "hardware_profile.hpp"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 
-#ifndef NRF24_SCK_PIN
-#define NRF24_SCK_PIN 18
-#endif
-
-#ifndef NRF24_MOSI_PIN
-#define NRF24_MOSI_PIN 23
-#endif
-
-#ifndef NRF24_MISO_PIN
-#define NRF24_MISO_PIN 19
-#endif
-
-#ifndef NRF24_CE_PIN
-#define NRF24_CE_PIN 17
-#endif
-
-#ifndef NRF24_CSN_PIN
-#define NRF24_CSN_PIN 27
-#endif
-
-#ifndef NRF24_IRQ_PIN
-#define NRF24_IRQ_PIN 16
-#endif
-
-#ifndef NRF24_PINSET_NAME
-#define NRF24_PINSET_NAME "pcb"
+#ifndef RF3_HARDWARE_PROFILE_ID
+#error "Select an RF3 hardware profile through a PlatformIO firmware environment"
 #endif
 
 // Esp32Nrf24Config collects the board-specific wiring choices for the radio.
 //
-// The defaults assume the ESP32's common Serial Peripheral Interface (SPI) bus
-// pins plus one General-Purpose Input/Output (GPIO) pin for Chip Enable (CE)
-// and one GPIO pin for Chip Select Not (CSN). Keeping this in a config struct
-// makes it easy to port the code to another board without touching the
-// higher-level radio logic.
+// Pin values are compile-time checked against the selected named profile in
+// hardware_profile.hpp so an incomplete or mixed pin assignment cannot build.
 struct Esp32Nrf24Config {
     static constexpr gpio_num_t kNoIrqPin = static_cast<gpio_num_t>(-1);
 
