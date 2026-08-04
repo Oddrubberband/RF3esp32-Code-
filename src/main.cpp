@@ -30,6 +30,7 @@
 
 #include "audio_packet.hpp"
 #include "esp32_nrf24_hal.hpp"
+#include "file_segmenter.hpp"
 #include "morse.hpp"
 #include "nrf24.hpp"
 #include "radio_manager.hpp"
@@ -477,6 +478,25 @@ bool mountSongFs()
     return true;
 }
 
+FileSegmentation::ReadResult readFileSegment(void* context,
+                                             uint8_t* out,
+                                             size_t capacity)
+{
+    std::FILE* fp = static_cast<std::FILE*>(context);
+    if (!fp || !out || capacity == 0) {
+        return {0, FileSegmentation::ReadState::Error};
+    }
+
+    const size_t bytes_read = std::fread(out, 1, capacity, fp);
+    if (std::ferror(fp)) {
+        return {bytes_read, FileSegmentation::ReadState::Error};
+    }
+    if (std::feof(fp)) {
+        return {bytes_read, FileSegmentation::ReadState::EndOfFile};
+    }
+    return {bytes_read, FileSegmentation::ReadState::MoreDataMayFollow};
+}
+
 bool sendDataFile(RadioManager& manager,
                   const char* path,
                   const volatile bool* stop_requested = nullptr)
@@ -484,6 +504,20 @@ bool sendDataFile(RadioManager& manager,
     std::FILE* fp = std::fopen(path, "rb");
     if (!fp) {
         ESP_LOGE(TAG, "Could not open %s. Stage a file into data/ and upload the filesystem image.", path);
+        return false;
+    }
+
+    FileSegmentation::Segmenter segmenter(fp, &readFileSegment);
+    FileSegmentation::Segment segment{};
+    FileSegmentation::NextResult segment_result = segmenter.next(segment);
+    if (segment_result == FileSegmentation::NextResult::EmptyInput) {
+        std::fclose(fp);
+        ESP_LOGE(TAG, "Cannot send empty file %s with the current protocol", path);
+        return false;
+    }
+    if (segment_result != FileSegmentation::NextResult::SegmentReady) {
+        std::fclose(fp);
+        ESP_LOGE(TAG, "Read failed before sending %s", path);
         return false;
     }
 
@@ -529,44 +563,33 @@ bool sendDataFile(RadioManager& manager,
 
     delayAtLeastMs(StreamSync::kRecommendedPostStartGapMs);
 
-    uint8_t file_chunk[AudioPacket::kAudioBytesPerPacket];
     uint8_t packet[AudioPacket::kPacketBytes];
-    uint16_t sequence = 0;
+    uint32_t packet_count = 0;
     uint32_t pacing_remainder_us = 0;
 
     while (true) {
         if (stop_requested && *stop_requested) {
             std::fclose(fp);
-            ESP_LOGI(TAG, "Stopped TX at packet %u for stream %u", sequence, stream_id);
+            ESP_LOGI(TAG,
+                     "Stopped TX at packet %u for stream %u",
+                     static_cast<unsigned>(segment.sequence),
+                     stream_id);
             return false;
         }
 
-        const size_t bytes_read =
-            std::fread(file_chunk, 1, AudioPacket::kAudioBytesPerPacket, fp);
-
-        if (bytes_read == 0) {
-            if (std::ferror(fp)) {
-                std::fclose(fp);
-                ESP_LOGE(TAG, "Read failed while sending %s", path);
-                return false;
-            }
-            break;
-        }
-
-        const bool is_last = bytes_read < AudioPacket::kAudioBytesPerPacket;
         size_t packet_len = 0;
 
         std::fill(packet, packet + AudioPacket::kPacketBytes, 0);
 
-        if (!AudioPacket::encode(sequence,
-                                 file_chunk,
-                                 bytes_read,
-                                 sequence == 0,
-                                 is_last,
+        if (!AudioPacket::encode(segment.sequence,
+                                 segment.payload.data(),
+                                 segment.payload_length,
+                                 segment.first,
+                                 segment.last,
                                  packet,
                                  packet_len)) {
             std::fclose(fp);
-            ESP_LOGE(TAG, "Failed to build packet %u", sequence);
+            ESP_LOGE(TAG, "Failed to build packet %u", segment.sequence);
             return false;
         }
 
@@ -575,7 +598,7 @@ bool sendDataFile(RadioManager& manager,
             const RadioStatus status = manager.status();
             ESP_LOGE(TAG,
                      "Transmit failed at packet %u, STATUS=0x%02X FIFO=0x%02X OBSERVE_TX=0x%02X IRQ=%s tx_irq_seen=%s timeout=%s",
-                     sequence,
+                     segment.sequence,
                      static_cast<unsigned>(status.last_status),
                      static_cast<unsigned>(status.last_fifo_status),
                      static_cast<unsigned>(status.last_observe_tx),
@@ -586,9 +609,9 @@ bool sendDataFile(RadioManager& manager,
         }
 
         uint8_t repeat_count = 0;
-        if (sequence == 0) {
+        if (segment.sequence == 0) {
             repeat_count = 2;  // seq0 total = 3 sends
-        } else if (sequence == 1) {
+        } else if (segment.sequence == 1) {
             repeat_count = 1;  // seq1 total = 2 sends
         }
 
@@ -597,7 +620,7 @@ bool sendDataFile(RadioManager& manager,
                 std::fclose(fp);
                 ESP_LOGI(TAG,
                          "Stopped TX during sequence %u repeat for stream %u",
-                         sequence,
+                         segment.sequence,
                          stream_id);
                 return false;
             }
@@ -609,7 +632,7 @@ bool sendDataFile(RadioManager& manager,
                 const RadioStatus status = manager.status();
                 ESP_LOGE(TAG,
                          "Sequence %u repeat %u failed, STATUS=0x%02X FIFO=0x%02X OBSERVE_TX=0x%02X",
-                         sequence,
+                         segment.sequence,
                          static_cast<unsigned>(repeat_index + 1u),
                          static_cast<unsigned>(status.last_status),
                          static_cast<unsigned>(status.last_fifo_status),
@@ -618,17 +641,27 @@ bool sendDataFile(RadioManager& manager,
             }
         }
 
-        ++sequence;
+        ++packet_count;
 
-        if (is_last) {
+        if (segment.last) {
             break;
         }
 
         const TxHelpers::PacingDelay pacing =
-            TxHelpers::calculateAudioPacingDelay(bytes_read, pacing_remainder_us);
+            TxHelpers::calculateAudioPacingDelay(segment.payload_length, pacing_remainder_us);
         pacing_remainder_us = pacing.remainder_us;
         if (pacing.delay_ms > 0) {
             delayAtLeastMs(pacing.delay_ms);
+        }
+
+        segment_result = segmenter.next(segment);
+        if (segment_result == FileSegmentation::NextResult::EndOfFile) {
+            break;
+        }
+        if (segment_result != FileSegmentation::NextResult::SegmentReady) {
+            std::fclose(fp);
+            ESP_LOGE(TAG, "Read failed while sending %s", path);
+            return false;
         }
     }
 
@@ -643,7 +676,10 @@ bool sendDataFile(RadioManager& manager,
     }
 
     std::fclose(fp);
-    ESP_LOGI(TAG, "Finished sending %u packets for stream %u", sequence, stream_id);
+    ESP_LOGI(TAG,
+             "Finished sending %u packets for stream %u",
+             static_cast<unsigned>(packet_count),
+             stream_id);
     return true;
 }
 

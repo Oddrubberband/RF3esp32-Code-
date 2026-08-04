@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -8,6 +9,7 @@
 #include "../include/fake_hal.hpp"
 #include "audio_packet.hpp"
 #include "audio_reassembler.hpp"
+#include "file_segmenter.hpp"
 #include "frame_io.hpp"
 #include "morse.hpp"
 #include "nrf24.hpp"
@@ -66,6 +68,282 @@ static void assertBytes(const std::vector<uint8_t>& actual, std::initializer_lis
         TEST_ASSERT_EQUAL_UINT8(value, actual[index]);
         ++index;
     }
+}
+
+namespace {
+
+using FileSegmentation::NextResult;
+using FileSegmentation::ReadResult;
+using FileSegmentation::ReadState;
+using FileSegmentation::Segment;
+using FileSegmentation::Segmenter;
+
+struct BufferReadContext {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    size_t offset = 0;
+
+    BufferReadContext(const uint8_t* source_data = nullptr,
+                      size_t source_size = 0,
+                      size_t source_offset = 0)
+        : data(source_data), size(source_size), offset(source_offset)
+    {
+    }
+};
+
+ReadResult readBuffer(void* context, uint8_t* out, size_t capacity)
+{
+    BufferReadContext* source = static_cast<BufferReadContext*>(context);
+    if (!source || !out || capacity == 0) {
+        return {0, ReadState::Error};
+    }
+    if (source->offset == source->size) {
+        return {0, ReadState::EndOfFile};
+    }
+
+    const size_t remaining = source->size - source->offset;
+    const size_t count = std::min(capacity, remaining);
+    std::copy(source->data + source->offset,
+              source->data + source->offset + count,
+              out);
+    source->offset += count;
+
+    // Match fread(): EOF is known on this read only when the read is short.
+    const ReadState state = count < capacity ? ReadState::EndOfFile
+                                             : ReadState::MoreDataMayFollow;
+    return {count, state};
+}
+
+ReadResult readError(void*, uint8_t*, size_t)
+{
+    return {0, ReadState::Error};
+}
+
+uint8_t generatedByte(uint64_t offset)
+{
+    return static_cast<uint8_t>((offset * 131u + 17u) & 0xFFu);
+}
+
+struct GeneratedReadContext {
+    uint64_t size = 0;
+    uint64_t offset = 0;
+
+    GeneratedReadContext(uint64_t source_size, uint64_t source_offset)
+        : size(source_size), offset(source_offset)
+    {
+    }
+};
+
+ReadResult readGenerated(void* context, uint8_t* out, size_t capacity)
+{
+    GeneratedReadContext* source = static_cast<GeneratedReadContext*>(context);
+    if (!source || !out || capacity == 0) {
+        return {0, ReadState::Error};
+    }
+    if (source->offset == source->size) {
+        return {0, ReadState::EndOfFile};
+    }
+
+    const uint64_t remaining = source->size - source->offset;
+    const size_t count = static_cast<size_t>(
+        std::min<uint64_t>(remaining, static_cast<uint64_t>(capacity)));
+    for (size_t index = 0; index < count; ++index) {
+        out[index] = generatedByte(source->offset + index);
+    }
+    source->offset += count;
+
+    const ReadState state = count < capacity ? ReadState::EndOfFile
+                                             : ReadState::MoreDataMayFollow;
+    return {count, state};
+}
+
+std::vector<uint8_t> incrementingFixture(size_t size)
+{
+    std::vector<uint8_t> data(size);
+    for (size_t index = 0; index < data.size(); ++index) {
+        data[index] = static_cast<uint8_t>(index & 0xFFu);
+    }
+    return data;
+}
+
+void assertSegmentedFixture(const std::vector<uint8_t>& source)
+{
+    TEST_ASSERT_FALSE(source.empty());
+
+    BufferReadContext read_context{source.data(), source.size(), 0};
+    Segmenter segmenter(&read_context, &readBuffer);
+    const size_t expected_count =
+        (source.size() + AudioPacket::kAudioBytesPerPacket - 1u) /
+        AudioPacket::kAudioBytesPerPacket;
+    std::vector<uint8_t> reconstructed;
+    reconstructed.reserve(source.size());
+
+    for (size_t packet_index = 0; packet_index < expected_count; ++packet_index) {
+        Segment segment{};
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(NextResult::SegmentReady),
+                              static_cast<int>(segmenter.next(segment)));
+        TEST_ASSERT_EQUAL_UINT16(static_cast<uint16_t>(packet_index), segment.sequence);
+        TEST_ASSERT_EQUAL(packet_index == 0, segment.first);
+
+        const size_t source_offset = packet_index * AudioPacket::kAudioBytesPerPacket;
+        const size_t expected_length = std::min<size_t>(
+            AudioPacket::kAudioBytesPerPacket, source.size() - source_offset);
+        TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(expected_length),
+                                segment.payload_length);
+
+        for (size_t index = 0; index < expected_length; ++index) {
+            TEST_ASSERT_EQUAL_UINT8(source[source_offset + index], segment.payload[index]);
+            reconstructed.push_back(segment.payload[index]);
+        }
+        TEST_ASSERT_EQUAL(packet_index + 1u == expected_count, segment.last);
+    }
+
+    Segment unused{};
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(NextResult::EndOfFile),
+                          static_cast<int>(segmenter.next(unused)));
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(source.size()),
+                             static_cast<uint32_t>(reconstructed.size()));
+    for (size_t index = 0; index < source.size(); ++index) {
+        TEST_ASSERT_EQUAL_UINT8(source[index], reconstructed[index]);
+    }
+}
+
+}  // namespace
+
+void test_fileSegmenter_empty_input_is_explicitly_rejected(void)
+{
+    BufferReadContext read_context{};
+    Segmenter segmenter(&read_context, &readBuffer);
+    Segment segment{};
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(NextResult::EmptyInput),
+                          static_cast<int>(segmenter.next(segment)));
+}
+
+void test_fileSegmenter_read_error_is_distinct_from_clean_eof(void)
+{
+    Segmenter segmenter(nullptr, &readError);
+    Segment segment{};
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(NextResult::ReadError),
+                          static_cast<int>(segmenter.next(segment)));
+}
+
+void test_fileSegmenter_one_byte_round_trips(void)
+{
+    assertSegmentedFixture(incrementingFixture(1));
+}
+
+void test_fileSegmenter_27_bytes_round_trip(void)
+{
+    assertSegmentedFixture(incrementingFixture(27));
+}
+
+void test_fileSegmenter_exact_28_bytes_marks_final_segment_last(void)
+{
+    assertSegmentedFixture(incrementingFixture(28));
+}
+
+void test_fileSegmenter_29_bytes_round_trip(void)
+{
+    assertSegmentedFixture(incrementingFixture(29));
+}
+
+void test_fileSegmenter_55_bytes_round_trip(void)
+{
+    assertSegmentedFixture(incrementingFixture(55));
+}
+
+void test_fileSegmenter_exact_56_bytes_marks_final_segment_last(void)
+{
+    assertSegmentedFixture(incrementingFixture(56));
+}
+
+void test_fileSegmenter_57_bytes_round_trip(void)
+{
+    assertSegmentedFixture(incrementingFixture(57));
+}
+
+void test_fileSegmenter_binary_fixtures_round_trip(void)
+{
+    assertSegmentedFixture(std::vector<uint8_t>(57, 0x00));
+    assertSegmentedFixture(std::vector<uint8_t>(57, 0xFF));
+    assertSegmentedFixture(incrementingFixture(256));
+
+    std::vector<uint8_t> seeded_random(1025);
+    uint32_t state = 0x6D2B79F5u;
+    for (uint8_t& value : seeded_random) {
+        state = state * 1664525u + 1013904223u;
+        value = static_cast<uint8_t>(state >> 24u);
+    }
+    assertSegmentedFixture(seeded_random);
+}
+
+void test_fileSegmenter_maximum_size_completes_with_final_last(void)
+{
+    constexpr uint64_t kPacketCount = static_cast<uint64_t>(UINT16_MAX) + 1u;
+    constexpr uint64_t kMaximumBytes =
+        kPacketCount * AudioPacket::kAudioBytesPerPacket;
+    GeneratedReadContext read_context{kMaximumBytes, 0};
+    Segmenter segmenter(&read_context, &readGenerated);
+
+    for (uint32_t packet_index = 0; packet_index < kPacketCount; ++packet_index) {
+        Segment segment{};
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(NextResult::SegmentReady),
+                              static_cast<int>(segmenter.next(segment)));
+        TEST_ASSERT_EQUAL_UINT16(static_cast<uint16_t>(packet_index), segment.sequence);
+        TEST_ASSERT_EQUAL_UINT8(AudioPacket::kAudioBytesPerPacket,
+                                segment.payload_length);
+        TEST_ASSERT_EQUAL(packet_index == 0, segment.first);
+
+        const uint64_t source_offset =
+            static_cast<uint64_t>(packet_index) * AudioPacket::kAudioBytesPerPacket;
+        for (size_t index = 0; index < segment.payload_length; ++index) {
+            TEST_ASSERT_EQUAL_UINT8(generatedByte(source_offset + index),
+                                    segment.payload[index]);
+        }
+        TEST_ASSERT_EQUAL_MESSAGE(packet_index + 1u == kPacketCount,
+                                  segment.last,
+                                  "maximum-size final segment must be LAST");
+    }
+
+    Segment unused{};
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(NextResult::EndOfFile),
+                          static_cast<int>(segmenter.next(unused)));
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(kMaximumBytes),
+                             static_cast<uint32_t>(read_context.offset));
+}
+
+void test_fileSegmenter_over_maximum_is_rejected_before_sequence_wrap(void)
+{
+    constexpr uint64_t kPacketCount = static_cast<uint64_t>(UINT16_MAX) + 1u;
+    constexpr uint64_t kMaximumBytes =
+        kPacketCount * AudioPacket::kAudioBytesPerPacket;
+    GeneratedReadContext read_context{kMaximumBytes + 1u, 0};
+    Segmenter segmenter(&read_context, &readGenerated);
+
+    for (uint32_t packet_index = 0; packet_index < kPacketCount; ++packet_index) {
+        Segment segment{};
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(NextResult::SegmentReady),
+                              static_cast<int>(segmenter.next(segment)));
+        TEST_ASSERT_EQUAL_UINT16(static_cast<uint16_t>(packet_index), segment.sequence);
+        TEST_ASSERT_EQUAL_UINT8(AudioPacket::kAudioBytesPerPacket,
+                                segment.payload_length);
+        TEST_ASSERT_EQUAL(packet_index == 0, segment.first);
+        TEST_ASSERT_FALSE(segment.last);
+
+        const uint64_t source_offset =
+            static_cast<uint64_t>(packet_index) * AudioPacket::kAudioBytesPerPacket;
+        for (size_t index = 0; index < segment.payload_length; ++index) {
+            TEST_ASSERT_EQUAL_UINT8(generatedByte(source_offset + index),
+                                    segment.payload[index]);
+        }
+    }
+
+    Segment overflow{};
+    TEST_ASSERT_EQUAL_INT_MESSAGE(static_cast<int>(NextResult::UnsupportedSize),
+                                  static_cast<int>(segmenter.next(overflow)),
+                                  "input beyond 65,536 packets must be rejected");
 }
 
 void test_readReg_reads_value_and_formats_spi_command(void)
@@ -1492,6 +1770,18 @@ void test_streamSync_gate_stop_returns_to_waiting_for_start(void)
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_fileSegmenter_empty_input_is_explicitly_rejected);
+    RUN_TEST(test_fileSegmenter_read_error_is_distinct_from_clean_eof);
+    RUN_TEST(test_fileSegmenter_one_byte_round_trips);
+    RUN_TEST(test_fileSegmenter_27_bytes_round_trip);
+    RUN_TEST(test_fileSegmenter_exact_28_bytes_marks_final_segment_last);
+    RUN_TEST(test_fileSegmenter_29_bytes_round_trip);
+    RUN_TEST(test_fileSegmenter_55_bytes_round_trip);
+    RUN_TEST(test_fileSegmenter_exact_56_bytes_marks_final_segment_last);
+    RUN_TEST(test_fileSegmenter_57_bytes_round_trip);
+    RUN_TEST(test_fileSegmenter_binary_fixtures_round_trip);
+    RUN_TEST(test_fileSegmenter_maximum_size_completes_with_final_last);
+    RUN_TEST(test_fileSegmenter_over_maximum_is_rejected_before_sequence_wrap);
     RUN_TEST(test_readReg_reads_value_and_formats_spi_command);
     RUN_TEST(test_readRfPowerLevel_decodes_rf_setup_bits);
     RUN_TEST(test_setRfPowerLevel_updates_packet_setup_and_register);
