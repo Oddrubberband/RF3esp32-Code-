@@ -20,6 +20,7 @@
 #include "stream_sync.hpp"
 
 void runReceiverSafetyTests();
+void runProtocolV2Tests();
 
 void setUp(void)
 {
@@ -1785,6 +1786,7 @@ int main(void)
     RUN_TEST(test_fileSegmenter_maximum_size_completes_with_final_last);
     RUN_TEST(test_fileSegmenter_over_maximum_is_rejected_before_sequence_wrap);
     runReceiverSafetyTests();
+    runProtocolV2Tests();
     RUN_TEST(test_readReg_reads_value_and_formats_spi_command);
     RUN_TEST(test_readRfPowerLevel_decodes_rf_setup_bits);
     RUN_TEST(test_setRfPowerLevel_updates_packet_setup_and_register);
