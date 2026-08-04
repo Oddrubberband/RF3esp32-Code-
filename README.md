@@ -1,135 +1,69 @@
-# RF3 ESP32 nRF24 File Transfer Demo
+# RF3 ESP32 nRF24 File Transfer
 
-This repository contains an ESP-IDF firmware project for an ESP32 that stages
-files in SPIFFS and moves them over an nRF24L01-style radio as packetized data.
+RF3 is an ESP-IDF firmware project for transferring arbitrary binary files
+over an nRF24L01+ radio. Audio files, including .u8 samples, remain supported
+as ordinary binary payloads.
 
-## What It Does
+## Capabilities
 
-- Mounts a SPIFFS partition containing staged files
-- Exposes a serial console for selecting files and controlling the radio
-- Packs file bytes into fixed-size nRF24 payloads
-- Saves completed RX streams back into SPIFFS as `rx_####.bin`
-- Supports RX mode, TX mode, standby, sleep, power-down, and CW test mode
-- Optionally exposes a small Wi-Fi HTTP control plane on the devboard build
+- Protocol v2 START/READY, stop-and-wait DATA/ACK, and END/COMPLETE flow
+- Transfer IDs, bounded retries, cancellation, inactivity timeouts, and CRC32
+- Streaming sources and verified, collision-safe SPIFFS publication
+- Serial commands for file transfer, RX, Morse, CW, and radio diagnostics
+- Optional development-only Wi-Fi HTTP controls, disabled by default
 
-## Project Layout
+## Supported hardware profiles
 
-- `src/`: firmware sources and ESP-IDF component registration
-- `include/`: shared headers for the firmware and native tests
-- `tools/`: host-side helpers for staging files and PlatformIO integration
-- `data/`: files packed into the SPIFFS partition
-- `test/`: native-side tests for packet and radio helper logic
+The rf3_custom_pcb environment selects the custom ESP32-WROOM-32UE-N16 PCB:
 
-## Hardware Defaults
+- CE 17, CSN 5, IRQ 27
+- SCK 18, MOSI 23, MISO 19
 
-The default devboard nRF24 wiring in the firmware is:
+The rf3_esp32_devboard environment selects the ESP32 development-board setup:
 
-- `SCK = GPIO18`
-- `MISO = GPIO19`
-- `MOSI = GPIO23`
-- `CE = GPIO27`
-- `CSN = GPIO5`
-- `IRQ = GPIO26` (set `irq_pin` to `kNoIrqPin` if you do not wire it)
-- plus `3.3V` and `GND`
+- CE 27, CSN 5, IRQ 26
+- SCK 18, MOSI 23, MISO 19
 
-The custom PCB environment overrides CE/CSN/IRQ in `platformio.ini`.
+Each firmware environment selects and compile-time checks exactly one profile.
+Radio channel, data rate, address, power, payload width, and SPI behavior remain
+common to both.
 
-## Build And Flash
+## Build
 
-Firmware build:
+    platformio run -e rf3_custom_pcb
+    platformio run -e rf3_esp32_devboard
+    platformio test -e native -v
 
-```powershell
-C:\Users\dman2\.platformio\penv\Scripts\platformio.exe run -e esp32wroom32d
-```
+Upload ports are local choices and are not stored in the repository:
 
-Firmware flash:
+    platformio run -e rf3_custom_pcb -t upload --upload-port COMx
+    platformio run -e rf3_custom_pcb -t uploadfs --upload-port COMx
+    platformio device monitor --baud 115200 --port COMx
 
-```powershell
-C:\Users\dman2\.platformio\penv\Scripts\platformio.exe run -e esp32wroom32d -t upload
-```
+## File staging
 
-SPIFFS upload:
+Stage any host file into the PlatformIO data directory:
 
-```powershell
-C:\Users\dman2\.platformio\penv\Scripts\platformio.exe run -e esp32wroom32d -t uploadfs
-```
+    python tools\stage_demo_file.py C:\path\to\payload.bin
 
-Serial monitor:
+The helper sanitizes the destination name, excludes receiver .part files,
+validates replacement and capacity behavior, and checks the SPIFFS image fit.
 
-```powershell
-C:\Users\dman2\.platformio\penv\Scripts\platformio.exe device monitor -b 115200 -p COM5
-```
+## Console
 
-## File Staging Workflow
+The serial console supports HELP, STATUS, STOP, FILES, SELECT, TX, TX LOOP,
+MORSE, RX, STANDBY, SLEEP, WAKE, POWERDOWN, CHANNEL, CW START, and CW LOOP.
+If SPIFFS or the radio is unavailable, the console remains available and
+reports the failed subsystem.
 
-Stage any host file into `data/`:
+## Wi-Fi control security
 
-```powershell
-python tools\stage_demo_file.py "C:\path\to\payload.bin"
-```
+Wi-Fi and HTTP control are disabled in every tracked environment. The existing
+HTTP endpoints are unauthenticated and can start transfer or change device
+state. To opt in on an isolated development network, copy
+include/wifi_control_config.local.example.hpp to the ignored
+include/wifi_control_config.local.hpp, supply local credentials, and explicitly
+define RF3_WIFI_CONTROL_ENABLED=1 for that local build.
 
-Optional destination name:
-
-```powershell
-python tools\stage_demo_file.py "C:\path\to\report.pdf" --output-name report.pdf
-```
-
-Then upload the SPIFFS image again so the staged file is available on the
-board.
-
-The helper:
-
-- accepts arbitrary input files
-- copies them into `data/`
-- verifies the resulting SPIFFS image still fits
-- keeps the over-the-air payload as raw bytes rather than audio semantics
-
-## Serial Console Commands
-
-- `HELP`
-- `STATUS`
-- `STOP`
-- `FILES`
-- `SELECT <file>`
-- `TX [file]`
-- `TX LOOP [count|INF] [file]`
-- `MORSE <text>`
-- `RX`
-- `STANDBY`
-- `SLEEP`
-- `WAKE`
-- `POWERDOWN`
-- `CHANNEL <0-125>`
-- `CW START [channel] [power0-3]`
-- `CW LOOP <on_ms> <off_ms> [channel] [power0-3] [EVERY <loops>]`
-
-## RX Behavior
-
-When the board is in `RX` mode:
-
-- accepted packet streams are written to a temporary SPIFFS file
-- a completed stream is renamed to `rx_####.bin`
-- partial or corrupt streams are discarded
-- `STATUS` and the HTTP `/status` endpoint report stream counters and saved-byte totals
-
-## Wi-Fi Control
-
-The devboard build enables Wi-Fi HTTP control by default. Once connected to the
-configured network, it serves:
-
-- `GET /status`
-- `POST /rx/start`
-- `POST /tx/start`
-- `POST /stop`
-- `POST /channel?value=<0-125>`
-
-The PCB build disables Wi-Fi control unless you turn it back on with build
-flags.
-
-## Notes
-
-- If SPIFFS is missing, the app asks you to upload a filesystem image.
-- If the nRF24 is not connected, the app still boots so SPIFFS and serial/Wi-Fi
-  controls remain testable.
-- Some source files still use names like `AudioPacket` for historical reasons,
-  but the transfer path now treats payloads as generic bytes.
+See docs/build_and_test.md, docs/file_transfer_api.md, docs/protocol_v2.md, and
+docs/security.md for integration and validation details.

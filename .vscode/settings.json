@@ -2,7 +2,5 @@
     "idf.customExtraVars": {
         "IDF_TARGET": "esp32"
     },
-    "idf.currentSetup": "C:\\esp\\v5.5.3\\esp-idf",
-    "idf.portWin": "COM3",
     "idf.flashType": "UART"
 }
