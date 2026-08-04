@@ -1,0 +1,49 @@
+name: validate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Install pinned PlatformIO Core
+        run: python -m pip install --disable-pip-version-check platformio==6.1.19
+
+      - name: Native Unity tests
+        run: platformio test -e native -v
+
+      - name: Staging helper tests
+        run: python -m unittest discover -s test -p "test_*.py"
+
+      - name: Build custom PCB firmware
+        run: platformio run -e rf3_custom_pcb
+
+      - name: Build ESP32 devboard firmware
+        run: platformio run -e rf3_esp32_devboard
+
+      - name: Build both SPIFFS images
+        run: |
+          platformio run -e rf3_custom_pcb -t buildfs
+          platformio run -e rf3_esp32_devboard -t buildfs
+
+      - name: Check repository hygiene and removed credentials
+        run: python tools/check_repository_hygiene.py
+
+      - name: Check whitespace and generated files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          git diff --check "$BASE_SHA"...HEAD
+          test -z "$(git status --porcelain)"
