@@ -21,6 +21,7 @@
 #include "esp_netif.h"
 #include "esp_netif_ip_addr.h"
 #include "esp_spiffs.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -30,6 +31,7 @@
 
 #include "audio_packet.hpp"
 #include "esp32_nrf24_hal.hpp"
+#include "file_receiver.hpp"
 #include "file_segmenter.hpp"
 #include "morse.hpp"
 #include "nrf24.hpp"
@@ -69,7 +71,6 @@ namespace {
 constexpr const char* TAG = "APP";
 constexpr uint32_t kDataPacketRepeatGapMs = 8;
 constexpr uint32_t kAudioBytesPerSecond = 8000;
-constexpr uint16_t kMaxToleratedIncomingGap = StreamSync::kMaxToleratedSequenceGap;
 constexpr uint32_t kPacketsPerSecond =
     (kAudioBytesPerSecond + AudioPacket::kAudioBytesPerPacket - 1u) /
     AudioPacket::kAudioBytesPerPacket;
@@ -82,6 +83,7 @@ constexpr const char* kDefaultTrack = "payload.bin";
 constexpr const char* kReceivedFilePrefix = "rx_";
 constexpr const char* kReceivedFileExtension = ".bin";
 constexpr const char* kReceivedPartialExtension = ".part";
+constexpr uint16_t kMaxReceivedFileCollisionIndex = 999;
 constexpr uint32_t kDefaultMorseDotMs = 120;
 constexpr uint8_t kDefaultMorsePowerLevel = 3;
 constexpr TickType_t kLoopWorkerPeriod = pdMS_TO_TICKS(20);
@@ -161,23 +163,11 @@ struct HttpStatusSnapshot {
     int last_fault = 0;
 };
 
-struct IncomingFileTransfer {
-    bool active = false;
-    bool saw_last_packet = false;
+struct IncomingFileStorage {
     uint16_t stream_id = 0;
-    uint16_t next_sequence = 0;
-    uint32_t packet_count = 0;
-    uint32_t missing_packets = 0;
-    size_t bytes_written = 0;
     std::string final_name;
     std::string partial_name;
     std::FILE* file = nullptr;
-};
-
-enum class IncomingChunkResult {
-    Accepted,
-    IgnoredOld,
-    Rejected
 };
 
 const char* loopModeName(LoopMode mode)
@@ -315,6 +305,12 @@ bool statFileSize(const std::string& path, size_t& bytes)
     return true;
 }
 
+uint64_t monotonicMilliseconds()
+{
+    const int64_t microseconds = esp_timer_get_time();
+    return microseconds > 0 ? static_cast<uint64_t>(microseconds) / 1000u : 0u;
+}
+
 void delayAtLeastMs(uint32_t duration_ms)
 {
     const TickType_t ticks = pdMS_TO_TICKS(duration_ms);
@@ -366,15 +362,27 @@ std::string buildTrackPath(std::string_view name)
     return std::string(kSpiffsRoot) + "/" + std::string(name);
 }
 
-std::string buildReceivedFileName(uint16_t stream_id, bool partial)
+std::string buildReceivedFileName(uint16_t stream_id,
+                                  bool partial,
+                                  uint16_t collision_index = 0)
 {
-    char buffer[24] = {};
-    std::snprintf(buffer,
-                  sizeof(buffer),
-                  "%s%04u%s",
-                  kReceivedFilePrefix,
-                  static_cast<unsigned>(stream_id),
-                  partial ? kReceivedPartialExtension : kReceivedFileExtension);
+    char buffer[32] = {};
+    if (partial || collision_index == 0) {
+        std::snprintf(buffer,
+                      sizeof(buffer),
+                      "%s%04u%s",
+                      kReceivedFilePrefix,
+                      static_cast<unsigned>(stream_id),
+                      partial ? kReceivedPartialExtension : kReceivedFileExtension);
+    } else {
+        std::snprintf(buffer,
+                      sizeof(buffer),
+                      "%s%04u_%03u%s",
+                      kReceivedFilePrefix,
+                      static_cast<unsigned>(stream_id),
+                      static_cast<unsigned>(collision_index),
+                      kReceivedFileExtension);
+    }
     return std::string(buffer);
 }
 
@@ -388,6 +396,9 @@ bool resolveTrack(std::string request, TrackInfo& out)
         request.erase(0, std::strlen("/spiffs/"));
     }
     if (request.find('/') != std::string::npos || request.find('\\') != std::string::npos) {
+        return false;
+    }
+    if (FileReceiver::isInternalTransferName(request)) {
         return false;
     }
 
@@ -415,6 +426,9 @@ std::vector<TrackInfo> listTracks()
         }
 
         const std::string name(entry->d_name);
+        if (FileReceiver::isInternalTransferName(name)) {
+            continue;
+        }
 
         size_t bytes = 0;
         if (!statFileSize(buildTrackPath(name), bytes)) {
@@ -429,6 +443,35 @@ std::vector<TrackInfo> listTracks()
         return lhs.name < rhs.name;
     });
     return tracks;
+}
+
+void cleanupStaleIncomingFiles()
+{
+    DIR* dir = opendir(kSpiffsRoot);
+    if (!dir) {
+        ESP_LOGW(TAG, "Could not inspect SPIFFS for stale RX partial files: errno=%d", errno);
+        return;
+    }
+
+    while (dirent* entry = readdir(dir)) {
+        const std::string name(entry->d_name);
+        if (!FileReceiver::isInternalTransferName(name)) {
+            continue;
+        }
+
+        const std::string path = buildTrackPath(name);
+        errno = 0;
+        if (std::remove(path.c_str()) == 0 || errno == ENOENT) {
+            ESP_LOGI(TAG, "Removed stale RX partial file %s", name.c_str());
+        } else {
+            ESP_LOGW(TAG,
+                     "Could not remove stale RX partial file %s: errno=%d",
+                     name.c_str(),
+                     errno);
+        }
+    }
+
+    closedir(dir);
 }
 
 void printTrackTable(const std::vector<TrackInfo>& tracks, std::string_view selected_track)
@@ -686,7 +729,8 @@ bool sendDataFile(RadioManager& manager,
 class DemoConsoleApp {
 public:
     explicit DemoConsoleApp(RadioManager& manager)
-        : manager_(manager)
+        : manager_(manager),
+          receiver_(this, incomingStorageCallbacks())
     {
     }
 
@@ -724,6 +768,7 @@ public:
             ESP_LOGE(TAG, "Mount SPIFFS failed. Upload a filesystem image first.");
             return false;
         }
+        cleanupStaleIncomingFiles();
 
         if (!takeRadio()) {
             ESP_LOGE(TAG, "Could not acquire radio mutex during init");
@@ -1403,178 +1448,219 @@ private:
         loop_config_ = LoopConfig{};
     }
 
-    void closeIncomingFileHandle()
+    static FileReceiver::PrepareResult prepareIncomingStorageEntry(void* context,
+                                                                    uint16_t stream_id)
     {
-        if (incoming_file_.file) {
-            std::fclose(incoming_file_.file);
-            incoming_file_.file = nullptr;
-        }
+        return static_cast<DemoConsoleApp*>(context)->prepareIncomingStorage(stream_id);
     }
 
-    void discardIncomingFileTransfer(const char* reason)
+    static size_t writeIncomingStorageEntry(void* context,
+                                            const uint8_t* data,
+                                            size_t length)
     {
-        if (incoming_file_.active && reason && *reason) {
-            ESP_LOGW(TAG,
-                     "%s stream=%u file=%s bytes=%u packets=%u",
-                     reason,
-                     static_cast<unsigned>(incoming_file_.stream_id),
-                     incoming_file_.partial_name.c_str(),
-                     static_cast<unsigned>(incoming_file_.bytes_written),
-                     static_cast<unsigned>(incoming_file_.packet_count));
-        }
-
-        const std::string partial_path =
-            incoming_file_.partial_name.empty() ? std::string{} : buildTrackPath(incoming_file_.partial_name);
-
-        closeIncomingFileHandle();
-        if (!partial_path.empty()) {
-            (void)std::remove(partial_path.c_str());
-        }
-
-        incoming_file_ = IncomingFileTransfer{};
+        return static_cast<DemoConsoleApp*>(context)->writeIncomingStorage(data, length);
     }
 
-    bool startIncomingFileTransfer(uint16_t stream_id)
+    static bool closeIncomingStorageEntry(void* context)
     {
-        if (incoming_file_.active && incoming_file_.stream_id == stream_id) {
+        return static_cast<DemoConsoleApp*>(context)->closeIncomingStorage();
+    }
+
+    static bool publishIncomingStorageEntry(void* context)
+    {
+        return static_cast<DemoConsoleApp*>(context)->publishIncomingStorage();
+    }
+
+    static bool removeIncomingPartialEntry(void* context)
+    {
+        return static_cast<DemoConsoleApp*>(context)->removeIncomingPartial();
+    }
+
+    static FileReceiver::StorageCallbacks incomingStorageCallbacks()
+    {
+        return {
+            &DemoConsoleApp::prepareIncomingStorageEntry,
+            &DemoConsoleApp::writeIncomingStorageEntry,
+            &DemoConsoleApp::closeIncomingStorageEntry,
+            &DemoConsoleApp::publishIncomingStorageEntry,
+            &DemoConsoleApp::removeIncomingPartialEntry,
+        };
+    }
+
+    bool selectAvailableFinalName(uint16_t stream_id, std::string& out_name)
+    {
+        for (uint16_t collision = 0;
+             collision <= kMaxReceivedFileCollisionIndex;
+             ++collision) {
+            const std::string candidate = buildReceivedFileName(stream_id, false, collision);
+            const std::string path = buildTrackPath(candidate);
+            struct stat info {};
+            errno = 0;
+            if (::stat(path.c_str(), &info) == 0) {
+                continue;
+            }
+            if (errno == ENOENT) {
+                out_name = candidate;
+                return true;
+            }
+
+            ESP_LOGE(TAG,
+                     "Could not inspect RX final path %s: errno=%d",
+                     path.c_str(),
+                     errno);
+            return false;
+        }
+
+        ESP_LOGE(TAG,
+                 "No collision-free RX final name is available for stream %u",
+                 static_cast<unsigned>(stream_id));
+        return false;
+    }
+
+    FileReceiver::PrepareResult prepareIncomingStorage(uint16_t stream_id)
+    {
+        incoming_file_ = IncomingFileStorage{};
+        incoming_file_.stream_id = stream_id;
+        incoming_file_.partial_name = buildReceivedFileName(stream_id, true);
+        if (!selectAvailableFinalName(stream_id, incoming_file_.final_name)) {
+            return FileReceiver::PrepareResult::OpenFailed;
+        }
+
+        const std::string partial_path = buildTrackPath(incoming_file_.partial_name);
+        struct stat info {};
+        errno = 0;
+        if (::stat(partial_path.c_str(), &info) == 0) {
+            if (std::remove(partial_path.c_str()) != 0) {
+                ESP_LOGE(TAG,
+                         "Could not remove stale RX partial %s: errno=%d",
+                         partial_path.c_str(),
+                         errno);
+                return FileReceiver::PrepareResult::CleanupFailed;
+            }
+        } else if (errno != ENOENT) {
+            ESP_LOGE(TAG,
+                     "Could not inspect RX partial %s: errno=%d",
+                     partial_path.c_str(),
+                     errno);
+            return FileReceiver::PrepareResult::CleanupFailed;
+        }
+
+        incoming_file_.file = std::fopen(partial_path.c_str(), "wb");
+        if (!incoming_file_.file) {
+            ESP_LOGE(TAG,
+                     "Could not open %s for RX stream %u: errno=%d",
+                     partial_path.c_str(),
+                     static_cast<unsigned>(stream_id),
+                     errno);
+            return FileReceiver::PrepareResult::OpenFailed;
+        }
+        return FileReceiver::PrepareResult::Ready;
+    }
+
+    size_t writeIncomingStorage(const uint8_t* data, size_t length)
+    {
+        if (!incoming_file_.file || !data || length == 0) {
+            return 0;
+        }
+        return std::fwrite(data, 1, length, incoming_file_.file);
+    }
+
+    bool closeIncomingStorage()
+    {
+        if (!incoming_file_.file) {
             return true;
         }
 
-        if (incoming_file_.active) {
-            discardIncomingFileTransfer("Discarding partial RX file before switching streams");
+        std::FILE* file = incoming_file_.file;
+        incoming_file_.file = nullptr;
+        bool ok = true;
+        if (std::fflush(file) != 0) {
+            ESP_LOGE(TAG, "Could not flush RX partial file: errno=%d", errno);
+            ok = false;
         }
-
-        IncomingFileTransfer next{};
-        next.active = true;
-        next.stream_id = stream_id;
-        next.final_name = buildReceivedFileName(stream_id, false);
-        next.partial_name = buildReceivedFileName(stream_id, true);
-
-        const std::string partial_path = buildTrackPath(next.partial_name);
-        (void)std::remove(partial_path.c_str());
-
-        next.file = std::fopen(partial_path.c_str(), "wb");
-        if (!next.file) {
-            ESP_LOGE(TAG,
-                    "Could not open %s for RX stream %u: errno=%d",
-                    partial_path.c_str(),
-                    static_cast<unsigned>(stream_id),
-                    errno);
-            return false;
+        if (std::fclose(file) != 0) {
+            ESP_LOGE(TAG, "Could not close RX partial file: errno=%d", errno);
+            ok = false;
         }
-
-        incoming_file_ = std::move(next);
-        return true;
+        return ok;
     }
-    bool finalizeIncomingFileTransfer()
+
+    bool publishIncomingStorage()
     {
-        if (!incoming_file_.active) {
+        if (incoming_file_.file || incoming_file_.partial_name.empty()) {
             return false;
         }
 
-        const std::string partial_name = incoming_file_.partial_name;
-        const std::string final_name = incoming_file_.final_name;
-        const uint16_t stream_id = incoming_file_.stream_id;
-        const size_t bytes_written = incoming_file_.bytes_written;
-        const uint32_t packet_count = incoming_file_.packet_count;
-        const uint32_t missing_packets = incoming_file_.missing_packets;
-        const std::string partial_path = buildTrackPath(partial_name);
-        const std::string final_path = buildTrackPath(final_name);
+        if (!selectAvailableFinalName(incoming_file_.stream_id,
+                                      incoming_file_.final_name)) {
+            return false;
+        }
 
-        closeIncomingFileHandle();
-        (void)std::remove(final_path.c_str());
+        const std::string partial_path = buildTrackPath(incoming_file_.partial_name);
+        const std::string final_path = buildTrackPath(incoming_file_.final_name);
         if (std::rename(partial_path.c_str(), final_path.c_str()) != 0) {
             ESP_LOGE(TAG,
-                     "Could not finalize RX file %s -> %s for stream %u: errno=%d",
+                     "Could not publish RX file %s -> %s for stream %u: errno=%d",
                      partial_path.c_str(),
                      final_path.c_str(),
-                     static_cast<unsigned>(stream_id),
+                     static_cast<unsigned>(incoming_file_.stream_id),
                      errno);
-            (void)std::remove(partial_path.c_str());
-            incoming_file_ = IncomingFileTransfer{};
             return false;
         }
 
-        incoming_file_ = IncomingFileTransfer{};
-        ++saved_rx_file_count_;
-        saved_rx_byte_count_ += static_cast<uint32_t>(bytes_written);
-        ESP_LOGI(TAG,
-                 "Saved RX file %s (%u bytes across %u packets, missing=%u) for stream %u",
-                 final_name.c_str(),
-                 static_cast<unsigned>(bytes_written),
-                 static_cast<unsigned>(packet_count),
-                 static_cast<unsigned>(missing_packets),
-                 static_cast<unsigned>(stream_id));
+        incoming_file_.partial_name.clear();
         return true;
     }
 
-    IncomingChunkResult appendIncomingFileChunk(uint16_t stream_id,
-                                                const AudioPacket::Header& header,
-                                                const uint8_t* data)
+    bool removeIncomingPartial()
     {
-        if (!data) {
-            return IncomingChunkResult::Rejected;
+        bool ok = closeIncomingStorage();
+        if (incoming_file_.partial_name.empty()) {
+            return ok;
         }
 
-        if (!incoming_file_.active || incoming_file_.stream_id != stream_id) {
-            if (!startIncomingFileTransfer(stream_id)) {
-                return IncomingChunkResult::Rejected;
-            }
-        }
-
-        if (header.sequence < incoming_file_.next_sequence) {
-            return IncomingChunkResult::IgnoredOld;
-        }
-
-        if (header.sequence > incoming_file_.next_sequence) {
-            const uint16_t gap =
-                static_cast<uint16_t>(header.sequence - incoming_file_.next_sequence);
-            if (gap > kMaxToleratedIncomingGap) {
-                ESP_LOGW(TAG,
-                         "RX sequence gap too large for stream=%u expected=%u got=%u gap=%u",
-                         static_cast<unsigned>(stream_id),
-                         static_cast<unsigned>(incoming_file_.next_sequence),
-                         static_cast<unsigned>(header.sequence),
-                         static_cast<unsigned>(gap));
-                discardIncomingFileTransfer("Discarding partial RX file after large sequence gap");
-                sync_gate_.reset();
-                return IncomingChunkResult::Rejected;
-            }
-
-            incoming_file_.missing_packets += gap;
-            missing_rx_packet_count_ += gap;
-            ESP_LOGW(TAG,
-                     "RX sequence gap for stream=%u expected=%u got=%u missing=%u",
-                     static_cast<unsigned>(stream_id),
-                     static_cast<unsigned>(incoming_file_.next_sequence),
-                     static_cast<unsigned>(header.sequence),
-                     static_cast<unsigned>(gap));
-        }
-
-        const size_t written = std::fwrite(data, 1, header.audio_len, incoming_file_.file);
-        if (written != header.audio_len) {
+        const std::string partial_path = buildTrackPath(incoming_file_.partial_name);
+        errno = 0;
+        if (std::remove(partial_path.c_str()) != 0 && errno != ENOENT) {
             ESP_LOGE(TAG,
-                     "RX write failed for stream=%u file=%s wrote=%u expected=%u errno=%d",
-                     static_cast<unsigned>(stream_id),
-                     incoming_file_.partial_name.c_str(),
-                     static_cast<unsigned>(written),
-                     static_cast<unsigned>(header.audio_len),
+                     "Could not remove RX partial %s: errno=%d",
+                     partial_path.c_str(),
                      errno);
-            discardIncomingFileTransfer("Discarding partial RX file after write failure");
-            sync_gate_.reset();
-            return IncomingChunkResult::Rejected;
+            return false;
+        }
+        incoming_file_.partial_name.clear();
+        return ok;
+    }
+
+    void discardIncomingFileTransfer(
+        const char* reason,
+        FileReceiver::Failure failure = FileReceiver::Failure::Cancelled)
+    {
+        if ((receiver_.active() || receiver_.state() == FileReceiver::State::Failed) &&
+            reason && *reason) {
+            ESP_LOGW(TAG,
+                     "%s stream=%u file=%s bytes=%u packets=%u",
+                     reason,
+                     static_cast<unsigned>(receiver_.streamId()),
+                     incoming_file_.partial_name.c_str(),
+                     static_cast<unsigned>(receiver_.acceptedBytes()),
+                     static_cast<unsigned>(receiver_.acceptedPackets()));
         }
 
-        incoming_file_.next_sequence = static_cast<uint16_t>(header.sequence + 1u);
-        incoming_file_.packet_count += 1;
-        incoming_file_.bytes_written += written;
-        incoming_file_.saw_last_packet = (header.flags & AudioPacket::kLast) != 0;
-        return IncomingChunkResult::Accepted;
+        (void)receiver_.abort(failure);
+        if (receiver_.cleanupFailed()) {
+            ESP_LOGE(TAG,
+                     "RX partial cleanup failed stream=%u file=%s",
+                     static_cast<unsigned>(receiver_.streamId()),
+                     incoming_file_.partial_name.c_str());
+        }
     }
 
     void resetRxSession()
     {
-        discardIncomingFileTransfer(nullptr);
+        if (!receiver_.reset()) {
+            ESP_LOGE(TAG, "RX session reset could not remove its partial file");
+        }
         last_carrier_detected_ = false;
         carrier_event_count_ = 0;
         decoded_rx_packet_count_ = 0;
@@ -1582,7 +1668,6 @@ private:
         missing_rx_packet_count_ = 0;
         saved_rx_file_count_ = 0;
         saved_rx_byte_count_ = 0;
-        sync_gate_.reset();
     }
 
     bool isLoopActive()
@@ -1673,7 +1758,6 @@ private:
                 return false;
             }
             discardIncomingFileTransfer("Discarding partial RX file while leaving RX");
-            sync_gate_.reset();
             status = manager_.status();
         }
         if (status.state == RadioState::Sleep || status.state == RadioState::PowerDown) {
@@ -2507,7 +2591,6 @@ private:
         }
 
         discardIncomingFileTransfer("Discarding partial RX file before channel change");
-        sync_gate_.reset();
         const bool ok = manager_.boot(channel);
         const RadioStatus status = manager_.status();
         giveRadio();
@@ -2971,70 +3054,137 @@ private:
 
     void processRxPayload(const uint8_t* payload, size_t len)
     {
+        const uint64_t now_ms = monotonicMilliseconds();
+        StreamSync::ControlFrame control{};
+
+        if (StreamSync::decodeStart(payload, len, control)) {
+            const FileReceiver::Result result = receiver_.start(control.stream_id, now_ms);
+            if (result == FileReceiver::Result::Started) {
+                ESP_LOGI(TAG,
+                         "RX START stream=%u partial=%s final=%s timeout_ms=%u",
+                         static_cast<unsigned>(control.stream_id),
+                         incoming_file_.partial_name.c_str(),
+                         incoming_file_.final_name.c_str(),
+                         static_cast<unsigned>(receiver_.timeoutMs()));
+            } else if (result == FileReceiver::Result::StartRejectedActive) {
+                ESP_LOGW(TAG,
+                         "RX START rejected stream=%u active_stream=%u",
+                         static_cast<unsigned>(control.stream_id),
+                         static_cast<unsigned>(receiver_.streamId()));
+            } else {
+                ESP_LOGE(TAG,
+                         "RX START failed stream=%u reason=%s cleanup_failed=%s",
+                         static_cast<unsigned>(control.stream_id),
+                         FileReceiver::failureName(receiver_.failure()),
+                         receiver_.cleanupFailed() ? "true" : "false");
+            }
+            return;
+        }
+
+        if (StreamSync::decodeStop(payload, len, control)) {
+            const FileReceiver::Result result = receiver_.stop(control.stream_id);
+            if (result == FileReceiver::Result::Stopped) {
+                ESP_LOGW(TAG,
+                         "RX STOP cancelled stream=%u",
+                         static_cast<unsigned>(control.stream_id));
+            } else if (result == FileReceiver::Result::IgnoredStop) {
+                ESP_LOGW(TAG,
+                         "RX STOP ignored stream=%u active_stream=%u",
+                         static_cast<unsigned>(control.stream_id),
+                         static_cast<unsigned>(receiver_.streamId()));
+            } else {
+                ESP_LOGI(TAG,
+                         "RX STOP ignored stream=%u no matching active transfer",
+                         static_cast<unsigned>(control.stream_id));
+            }
+            return;
+        }
+
         AudioPacket::Header header{};
         const uint8_t* data = nullptr;
-
-        switch (sync_gate_.accept(payload, len, &header, &data)) {
-            case StreamSync::ReceiverGate::Action::StartAccepted:
-                return;
-            case StreamSync::ReceiverGate::Action::StopAccepted:
-                if (incoming_file_.active && !incoming_file_.saw_last_packet) {
-                    discardIncomingFileTransfer("Discarding partial RX file after STOP");
-                }
-                ESP_LOGI(TAG, "RX STOP");
-                return;
-
-            case StreamSync::ReceiverGate::Action::AudioAccepted: {
-                const uint16_t stream_id = sync_gate_.currentStreamId();
-
-                const IncomingChunkResult append_result =
-                    appendIncomingFileChunk(stream_id, header, data);
-                if (append_result == IncomingChunkResult::IgnoredOld) {
-                    ++raw_rx_packet_count_;
-                    return;
-                }
-                if (append_result == IncomingChunkResult::Rejected) {
-                    ++raw_rx_packet_count_;
-                    return;
-                }
-
-                ++decoded_rx_packet_count_;
-
-#if RF3_VERBOSE_RX_LOG
-                if (header.sequence == 0 ||
-                    incoming_file_.packet_count == 1 ||
-                    (incoming_file_.packet_count % 64u) == 0 ||
-                    (header.flags & AudioPacket::kLast) != 0) {
-                    ESP_LOGI(TAG,
-                             "RX data stream=%u seq=%u bytes=%u total=%u flags=0x%02X",
-                             static_cast<unsigned>(stream_id),
-                             static_cast<unsigned>(header.sequence),
-                             static_cast<unsigned>(header.audio_len),
-                             static_cast<unsigned>(incoming_file_.bytes_written),
-                             static_cast<unsigned>(header.flags));
-                }
-#endif
-
-                if ((header.flags & AudioPacket::kLast) != 0) {
-                    if (!finalizeIncomingFileTransfer()) {
-                        ++raw_rx_packet_count_;
-                        sync_gate_.reset();
-                    }
-                }
-                return;
-            }
-            case StreamSync::ReceiverGate::Action::Ignore:
-                ++raw_rx_packet_count_;
-                return;
-
-            case StreamSync::ReceiverGate::Action::Invalid:
-            default:
-                ++raw_rx_packet_count_;
-#if RF3_VERBOSE_RX_LOG
-                ESP_LOGI(TAG, "RX payload len=%u (unrecognized frame)",
+        if (!AudioPacket::decode(payload, len, header, data)) {
+            ++raw_rx_packet_count_;
+            if (receiver_.rejectMalformedPacket() == FileReceiver::Result::Aborted) {
+                ESP_LOGE(TAG,
+                         "RX transfer aborted stream=%u reason=invalid-packet len=%u",
+                         static_cast<unsigned>(receiver_.streamId()),
                          static_cast<unsigned>(len));
+            }
+            return;
+        }
+
+        const uint32_t expected_before = receiver_.expectedSequence();
+        const FileReceiver::Packet packet{
+            header.sequence,
+            header.audio_len,
+            header.flags,
+        };
+        const FileReceiver::Result result = receiver_.accept(packet, data, now_ms);
+
+        if (result == FileReceiver::Result::Accepted ||
+            result == FileReceiver::Result::Completed) {
+            ++decoded_rx_packet_count_;
+#if RF3_VERBOSE_RX_LOG
+            if (header.sequence == 0 ||
+                (receiver_.acceptedPackets() % 64u) == 0 ||
+                result == FileReceiver::Result::Completed) {
+                ESP_LOGI(TAG,
+                         "RX data stream=%u seq=%u bytes=%u total=%u flags=0x%02X",
+                         static_cast<unsigned>(receiver_.streamId()),
+                         static_cast<unsigned>(header.sequence),
+                         static_cast<unsigned>(header.audio_len),
+                         static_cast<unsigned>(receiver_.acceptedBytes()),
+                         static_cast<unsigned>(header.flags));
+            }
 #endif
-                return;
+            if (result == FileReceiver::Result::Completed) {
+                ++saved_rx_file_count_;
+                saved_rx_byte_count_ += receiver_.acceptedBytes();
+                ESP_LOGI(TAG,
+                         "Saved RX file %s (%u bytes across %u contiguous packets) for stream %u",
+                         incoming_file_.final_name.c_str(),
+                         static_cast<unsigned>(receiver_.acceptedBytes()),
+                         static_cast<unsigned>(receiver_.acceptedPackets()),
+                         static_cast<unsigned>(receiver_.streamId()));
+            }
+            return;
+        }
+
+        ++raw_rx_packet_count_;
+        if (result == FileReceiver::Result::Duplicate) {
+            ESP_LOGW(TAG,
+                     "RX duplicate ignored stream=%u seq=%u expected=%u",
+                     static_cast<unsigned>(receiver_.streamId()),
+                     static_cast<unsigned>(header.sequence),
+                     static_cast<unsigned>(expected_before));
+            return;
+        }
+        if (result == FileReceiver::Result::NoActiveSession) {
+            ESP_LOGW(TAG,
+                     "RX data rejected without active START seq=%u flags=0x%02X",
+                     static_cast<unsigned>(header.sequence),
+                     static_cast<unsigned>(header.flags));
+            return;
+        }
+        if (result == FileReceiver::Result::AlreadyComplete) {
+            ESP_LOGW(TAG,
+                     "RX data ignored after completion seq=%u",
+                     static_cast<unsigned>(header.sequence));
+            return;
+        }
+        if (result == FileReceiver::Result::Aborted) {
+            if (receiver_.failure() == FileReceiver::Failure::SequenceGap &&
+                static_cast<uint32_t>(header.sequence) > expected_before) {
+                missing_rx_packet_count_ +=
+                    static_cast<uint32_t>(header.sequence) - expected_before;
+            }
+            ESP_LOGE(TAG,
+                     "RX transfer aborted stream=%u reason=%s expected=%u got=%u cleanup_failed=%s",
+                     static_cast<unsigned>(receiver_.streamId()),
+                     FileReceiver::failureName(receiver_.failure()),
+                     static_cast<unsigned>(expected_before),
+                     static_cast<unsigned>(header.sequence),
+                     receiver_.cleanupFailed() ? "true" : "false");
         }
     }
 
@@ -3093,6 +3243,15 @@ private:
                     }
                 } else {
                     last_carrier_detected_ = false;
+                }
+
+                if (receiver_.checkTimeout(monotonicMilliseconds()) ==
+                    FileReceiver::Result::TimedOut) {
+                    ESP_LOGE(TAG,
+                             "RX transfer timed out stream=%u after %u ms cleanup_failed=%s",
+                             static_cast<unsigned>(receiver_.streamId()),
+                             static_cast<unsigned>(receiver_.timeoutMs()),
+                             receiver_.cleanupFailed() ? "true" : "false");
                 }
                 giveRadio();
             }
@@ -3206,8 +3365,8 @@ private:
     std::string last_morse_text_;              // Most recent MORSE text for STATUS output.
     bool last_carrier_detected_ = false;      // Edge detector for RPD logging while in RX.
     uint32_t carrier_event_count_ = 0;        // Number of distinct RPD-high events seen while listening.
-    StreamSync::ReceiverGate sync_gate_{};    // RX stream gate for START/STOP/file synchronization.
-    IncomingFileTransfer incoming_file_{};    // Active file being reconstructed from RX packets.
+    IncomingFileStorage incoming_file_{};     // SPIFFS adapter state for the current RX partial file.
+    FileReceiver::Transfer receiver_;         // Fixed-state validation and publication boundary.
     uint32_t decoded_rx_packet_count_ = 0;    // Payloads accepted as in-order stream data.
     uint32_t raw_rx_packet_count_ = 0;        // Payloads that were received but not accepted as stream data.
     uint32_t missing_rx_packet_count_ = 0;    // Sequence slots skipped by tolerated forward gaps.
