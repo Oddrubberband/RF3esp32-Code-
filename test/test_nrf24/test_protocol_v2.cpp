@@ -541,7 +541,7 @@ void test_protocol_v2_source_inspection_covers_zero_boundaries_and_partial_reads
         source.maximum_chunk = 3;
         const Metadata metadata = inspect(source);
         TEST_ASSERT_EQUAL_UINT32(size, metadata.total_size);
-        TEST_ASSERT_EQUAL_UINT32(ProtocolV2::packetCountForSize(size),
+        TEST_ASSERT_EQUAL_UINT32(ProtocolV2::packetCountForSize(static_cast<uint32_t>(size)),
                                  metadata.total_packets);
         TEST_ASSERT_EQUAL_UINT64(0, source.position);
     }

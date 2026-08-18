@@ -32,6 +32,7 @@
 #include "nvs_flash.h"
 
 #include "audio_packet.hpp"
+#include "command_parser.hpp"
 #include "esp32_nrf24_hal.hpp"
 #include "file_transfer_service.hpp"
 #include "hardware_profile.hpp"
@@ -77,6 +78,13 @@
 // Most of the project's user-visible behavior lives here, while lower-level
 // files keep packet formatting and radio access focused and testable.
 namespace {
+using CommandParsing::parseLoopCountToken;
+using CommandParsing::parseUint32Arg;
+using CommandParsing::parseUint8Arg;
+using CommandParsing::splitWords;
+using CommandParsing::trimAscii;
+using CommandParsing::uppercaseCopy;
+
 constexpr const char* TAG = "APP";
 constexpr const char* kSpiffsRoot = "/spiffs";
 constexpr const char* kDefaultFile = "payload.bin";
@@ -193,113 +201,6 @@ const char* loopModeName(LoopMode mode)
         default:
             return "None";
     }
-}
-
-// ---- small string and parsing helpers ------------------------------------
-
-std::string trimAscii(std::string value)
-{
-    // Command parsing is intentionally American Standard Code for Information
-    // Interchange (ASCII)-centric because all console commands and filenames
-    // in this project are plain ASCII tokens.
-    const auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
-    while (!value.empty() && is_space(static_cast<unsigned char>(value.front()))) {
-        value.erase(value.begin());
-    }
-    while (!value.empty() && is_space(static_cast<unsigned char>(value.back()))) {
-        value.pop_back();
-    }
-    return value;
-}
-
-std::string uppercaseCopy(std::string_view text)
-{
-    // Commands are matched case-insensitively by normalizing once up front.
-    std::string out(text);
-    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::toupper(ch));
-    });
-    return out;
-}
-
-std::vector<std::string> splitWords(const std::string& line)
-{
-    // The console syntax is intentionally simple: tokens are whitespace
-    // separated, with no quoting or escaping rules.
-    std::vector<std::string> words;
-    std::string current;
-
-    for (char ch : line) {
-        if (std::isspace(static_cast<unsigned char>(ch))) {
-            if (!current.empty()) {
-                words.push_back(current);
-                current.clear();
-            }
-            continue;
-        }
-        current.push_back(ch);
-    }
-
-    if (!current.empty()) {
-        words.push_back(current);
-    }
-
-    return words;
-}
-
-bool parseUint8Arg(std::string_view text, uint8_t minimum, uint8_t maximum, uint8_t& out)
-{
-    // Many console commands take one byte-sized numeric argument such as a
-    // channel or power level, so this helper centralizes the range checking.
-    if (text.empty()) {
-        return false;
-    }
-
-    char* end = nullptr;
-    const std::string value(text);
-    const long parsed = std::strtol(value.c_str(), &end, 10);
-    if (!end || *end != '\0' || parsed < minimum || parsed > maximum) {
-        return false;
-    }
-
-    out = static_cast<uint8_t>(parsed);
-    return true;
-}
-
-bool parseUint32Arg(std::string_view text, uint32_t minimum, uint32_t maximum, uint32_t& out)
-{
-    if (text.empty()) {
-        return false;
-    }
-
-    char* end = nullptr;
-    const std::string value(text);
-    const unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
-    if (!end || *end != '\0' || parsed < minimum || parsed > maximum) {
-        return false;
-    }
-
-    out = static_cast<uint32_t>(parsed);
-    return true;
-}
-
-bool parseLoopCountToken(std::string_view text, bool& infinite, uint32_t& count)
-{
-    const std::string upper = uppercaseCopy(text);
-    if (upper == "INF" || upper == "FOREVER") {
-        infinite = true;
-        count = 0;
-        return true;
-    }
-
-    uint32_t parsed = 0;
-    if (!parseUint32Arg(text, 1, UINT32_MAX, parsed)) {
-        return false;
-    }
-
-    infinite = false;
-    count = parsed;
-    return true;
 }
 
 bool statFileSize(const std::string& path, size_t& bytes)
@@ -909,6 +810,7 @@ public:
         // dispatched after Enter is pressed.
         std::string pending_line;
         pending_line.reserve(kConsoleLineBytes);
+        bool line_too_long = false;
         bool prompt_visible = false;
 
         while (true) {
@@ -930,7 +832,11 @@ public:
                 std::fflush(stdout);
                 const std::string command_line = trimAscii(pending_line);
                 pending_line.clear();
-                if (!command_line.empty()) {
+                if (line_too_long) {
+                    std::printf("Command rejected: maximum length is %u characters.\n",
+                                static_cast<unsigned>(kConsoleLineBytes - 1));
+                    line_too_long = false;
+                } else if (!command_line.empty()) {
                     dispatchCommand(command_line, CommandOrigin::Local);
                 }
                 prompt_visible = false;
@@ -938,7 +844,7 @@ public:
             }
 
             if (ch == '\b' || static_cast<unsigned char>(ch) == 0x7F) {
-                if (!pending_line.empty()) {
+                if (!line_too_long && !pending_line.empty()) {
                     pending_line.pop_back();
                     std::printf("\b \b");
                     std::fflush(stdout);
@@ -950,6 +856,11 @@ public:
                 pending_line.push_back(ch);
                 std::printf("%c", ch);
                 std::fflush(stdout);
+            } else {
+                // Never execute a silently truncated command. Once the input
+                // exceeds the fixed console bound, discard it through Enter
+                // and report the error as one rejected line.
+                line_too_long = true;
             }
         }
     }
@@ -2810,7 +2721,13 @@ private:
                 return false;
             }
 
-            uint8_t channel = manager_.status().channel;
+            uint8_t channel = 76;
+            if (!takeRadio(pdMS_TO_TICKS(100))) {
+                std::printf("Radio is busy; could not read the current channel.\n");
+                return false;
+            }
+            channel = manager_.status().channel;
+            giveRadio();
             uint8_t power_level = 3;
             uint32_t report_every = 0;
             bool parsed_channel = false;

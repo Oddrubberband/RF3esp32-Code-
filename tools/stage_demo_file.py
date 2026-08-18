@@ -11,6 +11,10 @@ from pathlib import Path
 
 SPIFFS_BLOCK_SIZE = 4096
 SPIFFS_PAGE_SIZE = 256
+SPIFFS_MAX_FILENAME_BYTES = 31
+PROTOCOL_V2_DATA_BYTES = 20
+PROTOCOL_V2_MAX_PACKETS = 65536
+PROTOCOL_V2_MAX_FILE_BYTES = PROTOCOL_V2_DATA_BYTES * PROTOCOL_V2_MAX_PACKETS
 DEFAULT_MARGIN_BYTES = 64 * 1024
 
 
@@ -92,7 +96,21 @@ def sanitize_output_name(name: str) -> str:
     if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix or ""):
         suffix = ".bin"
 
+    maximum_stem_bytes = SPIFFS_MAX_FILENAME_BYTES - len(suffix.encode("ascii"))
+    cleaned_stem = cleaned_stem[:maximum_stem_bytes].rstrip("_") or "payload"
     return f"{cleaned_stem}{suffix}"
+
+
+def validate_transfer_size(size_bytes: int) -> tuple[bool, str]:
+    if size_bytes < 0:
+        return False, "The source size cannot be negative"
+    if size_bytes > PROTOCOL_V2_MAX_FILE_BYTES:
+        return False, (
+            f"Source file is {human_bytes(size_bytes)}, but RF3 Protocol v2 supports at most "
+            f"{human_bytes(PROTOCOL_V2_MAX_FILE_BYTES)} per transfer "
+            f"({PROTOCOL_V2_MAX_PACKETS:,} packets x {PROTOCOL_V2_DATA_BYTES} bytes)"
+        )
+    return True, ""
 
 
 def select_source_path(args: argparse.Namespace) -> Path | None:
@@ -239,6 +257,10 @@ def main() -> int:
     source = source.expanduser().resolve()
     if not source.exists() or not source.is_file():
         return fail(f"Source file does not exist: {source}")
+
+    size_supported, size_error = validate_transfer_size(source.stat().st_size)
+    if not size_supported:
+        return fail(size_error)
 
     mkspiffs_path = locate_tool(args.mkspiffs, project_root, ["mkspiffs_espressif32_espidf", "mkspiffs"])
     spiffs_size = read_spiffs_partition_size(partitions_path)

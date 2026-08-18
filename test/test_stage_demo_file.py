@@ -6,9 +6,12 @@ from pathlib import Path
 
 from tools.stage_demo_file import (
     DEFAULT_MARGIN_BYTES,
+    PROTOCOL_V2_MAX_FILE_BYTES,
+    SPIFFS_MAX_FILENAME_BYTES,
     commit_staged_file,
     sanitize_output_name,
     stage_data_directory,
+    validate_transfer_size,
     validate_spiffs_fit,
 )
 
@@ -58,6 +61,16 @@ class StageDemoFileTests(unittest.TestCase):
     def test_binary_filename_is_sanitized_without_forcing_audio_extension(self) -> None:
         self.assertEqual("firmware_image.bin", sanitize_output_name("firmware image.bin"))
         self.assertEqual("payload.bin", sanitize_output_name("���.invalid-extension"))
+
+    def test_long_filename_is_bounded_for_spiffs_and_preserves_extension(self) -> None:
+        sanitized = sanitize_output_name("a" * 100 + ".u8")
+        self.assertLessEqual(len(sanitized.encode("ascii")), SPIFFS_MAX_FILENAME_BYTES)
+        self.assertTrue(sanitized.endswith(".u8"))
+
+    def test_protocol_v2_transfer_size_boundary_is_enforced(self) -> None:
+        self.assertTrue(validate_transfer_size(0)[0])
+        self.assertTrue(validate_transfer_size(PROTOCOL_V2_MAX_FILE_BYTES)[0])
+        self.assertFalse(validate_transfer_size(PROTOCOL_V2_MAX_FILE_BYTES + 1)[0])
 
     def test_replace_existing_commits_validated_directory_shape(self) -> None:
         with tempfile.TemporaryDirectory() as root:

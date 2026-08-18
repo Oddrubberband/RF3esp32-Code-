@@ -1,5 +1,9 @@
 # RF3 Integration Readiness Report
 
+> Historical report from 2026-08-03. For the current pinned toolchain, final
+> validation results, open risks, and bench recommendation, use
+> `docs/pre_hardware_readiness.md` and `docs/hardware_validation.md`.
+
 Date: 2026-08-03
 Branch: `codex/integration-readiness`
 Base merge: `b067afa4f01c29c2e556f20ff28c9277141019e5`

@@ -76,7 +76,6 @@ void RadioManager::refreshSnapshot()
 bool RadioManager::enterRx()
 {
     status_.last_rx_len = 0;
-    status_.rx_packets = 0;
     status_.carrier_detected = false;
 
     if (radio_.startRx()) {

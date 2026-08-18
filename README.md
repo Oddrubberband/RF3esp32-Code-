@@ -30,6 +30,12 @@ common to both.
 
 ## Build
 
+Install the tracked PlatformIO Core version into an isolated environment first:
+
+    python -m venv .venv
+    .venv\Scripts\python -m pip install -r requirements.txt
+    .venv\Scripts\Activate.ps1
+
     platformio run -e rf3_custom_pcb
     platformio run -e rf3_esp32_devboard
     platformio test -e native -v
@@ -65,5 +71,6 @@ include/wifi_control_config.local.example.hpp to the ignored
 include/wifi_control_config.local.hpp, supply local credentials, and explicitly
 define RF3_WIFI_CONTROL_ENABLED=1 for that local build.
 
-See docs/build_and_test.md, docs/file_transfer_api.md, docs/protocol_v2.md, and
-docs/security.md for integration and validation details.
+See docs/build_and_test.md, docs/pre_hardware_readiness.md,
+docs/hardware_validation.md, docs/file_transfer_api.md, docs/protocol_v2.md,
+and docs/security.md for integration and validation details.

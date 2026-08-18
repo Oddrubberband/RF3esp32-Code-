@@ -34,5 +34,10 @@ In the PlatformIO sidebar, use `Upload Filesystem Image`.
 Notes:
 - The firmware lists every regular staged file from `/spiffs`.
 - Partial RX saves use `.part` temporarily and are hidden from `FILES`.
-- Completed RX streams are saved as `rx_####.bin`.
-- Each packet uses 4 bytes of header and up to 28 bytes of payload.
+- Completed RX streams are saved as `rx_<8-hex-digit-transfer-id>.bin`, with a
+  collision suffix when needed.
+- Protocol v2 uses fixed 32-byte nRF24 frames with a 12-byte DATA header and up
+  to 20 data bytes. One transfer is limited to 1,310,720 bytes (65,536 DATA
+  packets).
+- SPIFFS filenames are limited to 31 ASCII bytes; the staging helper sanitizes
+  and bounds destination names before copying.

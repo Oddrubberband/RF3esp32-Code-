@@ -9,6 +9,7 @@
 #include "../include/fake_hal.hpp"
 #include "audio_packet.hpp"
 #include "audio_reassembler.hpp"
+#include "command_parser.hpp"
 #include "file_segmenter.hpp"
 #include "frame_io.hpp"
 #include "morse.hpp"
@@ -783,6 +784,26 @@ void test_radioManager_receivePayload_updates_rx_length(void)
     TEST_ASSERT_EQUAL_UINT32(4, static_cast<uint32_t>(out_len));
     TEST_ASSERT_EQUAL_UINT32(4, static_cast<uint32_t>(status.last_rx_len));
     TEST_ASSERT_EQUAL(static_cast<int>(RadioState::RxListening), static_cast<int>(status.state));
+}
+
+void test_radioManager_rx_packet_count_survives_rx_mode_reentry(void)
+{
+    FakeHal hal;
+    Nrf24 radio(hal);
+    radio.setStaticPayloadSize(4);
+    RadioManager manager(radio);
+
+    TEST_ASSERT_TRUE(manager.boot(76));
+    TEST_ASSERT_TRUE(manager.enterRx());
+    hal.loadRxPayload({0x21, 0x22, 0x23, 0x24});
+
+    uint8_t out[4] = {};
+    size_t out_len = 0;
+    TEST_ASSERT_TRUE(manager.receivePayload(out, sizeof(out), out_len));
+    TEST_ASSERT_EQUAL_UINT32(1, manager.status().rx_packets);
+
+    TEST_ASSERT_TRUE(manager.enterRx());
+    TEST_ASSERT_EQUAL_UINT32(1, manager.status().rx_packets);
 }
 
 void test_radioManager_hasPendingRx_reports_fifo_backlog_after_irq_clear(void)
@@ -1769,7 +1790,72 @@ void test_streamSync_gate_stop_returns_to_waiting_for_start(void)
                       static_cast<int>(gate.accept(stop_packet, stop_len)));
     TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::State::WaitingForStart),
                       static_cast<int>(gate.state()));
-}                 
+}
+
+void test_commandParsing_tokenizes_real_console_input(void)
+{
+    const std::vector<std::string> words =
+        CommandParsing::splitWords("  tx\tloop   12  payload.u8  ");
+    TEST_ASSERT_EQUAL_UINT32(4, static_cast<uint32_t>(words.size()));
+    TEST_ASSERT_EQUAL_STRING("TX", CommandParsing::uppercaseCopy(words[0]).c_str());
+    TEST_ASSERT_EQUAL_STRING("loop", words[1].c_str());
+    TEST_ASSERT_EQUAL_STRING("12", words[2].c_str());
+    TEST_ASSERT_EQUAL_STRING("payload.u8", words[3].c_str());
+    TEST_ASSERT_EQUAL_STRING("MORSE SOS",
+                             CommandParsing::trimAscii("\r\n  MORSE SOS \t").c_str());
+}
+
+void test_commandParsing_uint32_accepts_exact_boundaries(void)
+{
+    uint32_t value = 99;
+    TEST_ASSERT_TRUE(CommandParsing::parseUint32Arg("0", 0, UINT32_MAX, value));
+    TEST_ASSERT_EQUAL_UINT32(0, value);
+    TEST_ASSERT_TRUE(CommandParsing::parseUint32Arg("4294967295", 0, UINT32_MAX, value));
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, value);
+}
+
+void test_commandParsing_uint32_rejects_signed_values(void)
+{
+    uint32_t value = 17;
+    TEST_ASSERT_FALSE(CommandParsing::parseUint32Arg("-1", 0, UINT32_MAX, value));
+    TEST_ASSERT_EQUAL_UINT32(17, value);
+    TEST_ASSERT_FALSE(CommandParsing::parseUint32Arg("+1", 0, UINT32_MAX, value));
+    TEST_ASSERT_EQUAL_UINT32(17, value);
+}
+
+void test_commandParsing_uint32_rejects_overflow_and_trailing_text(void)
+{
+    uint32_t value = 17;
+    TEST_ASSERT_FALSE(CommandParsing::parseUint32Arg("4294967296", 0, UINT32_MAX, value));
+    TEST_ASSERT_FALSE(CommandParsing::parseUint32Arg("12ms", 0, UINT32_MAX, value));
+    TEST_ASSERT_FALSE(CommandParsing::parseUint32Arg("", 0, UINT32_MAX, value));
+    TEST_ASSERT_FALSE(CommandParsing::parseUint32Arg("5", 6, 4, value));
+    TEST_ASSERT_EQUAL_UINT32(17, value);
+}
+
+void test_commandParsing_uint8_enforces_radio_ranges(void)
+{
+    uint8_t value = 0;
+    TEST_ASSERT_TRUE(CommandParsing::parseUint8Arg("125", 0, 125, value));
+    TEST_ASSERT_EQUAL_UINT8(125, value);
+    TEST_ASSERT_FALSE(CommandParsing::parseUint8Arg("126", 0, 125, value));
+    TEST_ASSERT_FALSE(CommandParsing::parseUint8Arg("-1", 0, 125, value));
+    TEST_ASSERT_FALSE(CommandParsing::parseUint8Arg("4", 0, 3, value));
+}
+
+void test_commandParsing_loop_count_handles_finite_and_infinite_forms(void)
+{
+    bool infinite = false;
+    uint32_t count = 99;
+    TEST_ASSERT_TRUE(CommandParsing::parseLoopCountToken("inf", infinite, count));
+    TEST_ASSERT_TRUE(infinite);
+    TEST_ASSERT_EQUAL_UINT32(0, count);
+    TEST_ASSERT_TRUE(CommandParsing::parseLoopCountToken("12", infinite, count));
+    TEST_ASSERT_FALSE(infinite);
+    TEST_ASSERT_EQUAL_UINT32(12, count);
+    TEST_ASSERT_FALSE(CommandParsing::parseLoopCountToken("0", infinite, count));
+    TEST_ASSERT_FALSE(CommandParsing::parseLoopCountToken("-1", infinite, count));
+}
 
 int main(void)
 {
@@ -1815,6 +1901,7 @@ int main(void)
     RUN_TEST(test_radioManager_sendPayload_success_updates_status);
     RUN_TEST(test_radioManager_refreshSnapshot_reports_live_irq_state);
     RUN_TEST(test_radioManager_receivePayload_updates_rx_length);
+    RUN_TEST(test_radioManager_rx_packet_count_survives_rx_mode_reentry);
     RUN_TEST(test_radioManager_hasPendingRx_reports_fifo_backlog_after_irq_clear);
     RUN_TEST(test_radioManager_hasPendingRx_true_when_rx_dr_set);
     RUN_TEST(test_radioManager_hasPendingRx_true_when_fifo_not_empty_without_rx_dr);
@@ -1865,5 +1952,11 @@ int main(void)
     RUN_TEST(test_streamSync_gate_ignores_duplicate_seq0_after_stream_starts);
     RUN_TEST(test_streamSync_gate_new_start_resets_current_stream);
     RUN_TEST(test_streamSync_gate_stop_returns_to_waiting_for_start);
+    RUN_TEST(test_commandParsing_tokenizes_real_console_input);
+    RUN_TEST(test_commandParsing_uint32_accepts_exact_boundaries);
+    RUN_TEST(test_commandParsing_uint32_rejects_signed_values);
+    RUN_TEST(test_commandParsing_uint32_rejects_overflow_and_trailing_text);
+    RUN_TEST(test_commandParsing_uint8_enforces_radio_ranges);
+    RUN_TEST(test_commandParsing_loop_count_handles_finite_and_infinite_forms);
     return UNITY_END();
 }

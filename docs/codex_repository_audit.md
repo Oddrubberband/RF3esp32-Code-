@@ -1,5 +1,10 @@
 # RF3 Repository Audit
 
+> Historical audit of revision `aae7af5`. Its v1 packet-path findings and build
+> results do not describe the current Protocol v2 implementation. Use
+> `docs/pre_hardware_readiness.md` and `docs/hardware_validation.md` for the
+> current state.
+
 Audit date: 2026-08-03  
 Repository: https://github.com/Oddrubberband/RF3esp32-Code-  
 Audited revision: main at aae7af5f4a53ae0ff82247dc1f3aae6ccb3b2f10, committed 2026-06-11 14:09:21 UTC  
