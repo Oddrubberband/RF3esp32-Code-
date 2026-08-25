@@ -910,6 +910,7 @@ public:
         std::string pending_line;
         pending_line.reserve(kConsoleLineBytes);
         bool prompt_visible = false;
+        bool swallow_lf_after_cr = false;
 
         while (true) {
             if (!prompt_visible) {
@@ -924,8 +925,15 @@ public:
                 continue;
             }
 
-            const char ch = static_cast<char>(raw);
+            char ch = static_cast<char>(raw);
+            const unsigned char byte = static_cast<unsigned char>(ch);
+            if (ch == '\n' && swallow_lf_after_cr) {
+                swallow_lf_after_cr = false;
+                continue;
+            }
+
             if (ch == '\r' || ch == '\n') {
+                swallow_lf_after_cr = ch == '\r';
                 std::printf("\n");
                 std::fflush(stdout);
                 const std::string command_line = trimAscii(pending_line);
@@ -937,7 +945,8 @@ public:
                 continue;
             }
 
-            if (ch == '\b' || static_cast<unsigned char>(ch) == 0x7F) {
+            if (ch == '\b' || byte == 0x7F) {
+                swallow_lf_after_cr = false;
                 if (!pending_line.empty()) {
                     pending_line.pop_back();
                     std::printf("\b \b");
@@ -945,6 +954,14 @@ public:
                 }
                 continue;
             }
+
+            if (ch == '\t') {
+                ch = ' ';
+            } else if (byte < 0x20 || byte > 0x7E) {
+                continue;
+            }
+
+            swallow_lf_after_cr = false;
 
             if (pending_line.size() + 1 < kConsoleLineBytes) {
                 pending_line.push_back(ch);
