@@ -24,7 +24,10 @@ jobs:
       - name: Native Unity tests
         run: platformio test -e native -v
 
-      - name: Staging helper tests
+      - name: Software-only firmware qualification
+        run: python tools/run_firmware_qualification.py
+
+      - name: Python host tooling tests
         run: python -m unittest discover -s test -p "test_*.py"
 
       - name: Build custom PCB firmware
@@ -37,6 +40,9 @@ jobs:
         run: |
           platformio run -e rf3_custom_pcb -t buildfs
           platformio run -e rf3_esp32_devboard -t buildfs
+
+      - name: Prepare and inspect offline board handoff images
+        run: python tools/prepare_board_handoff.py
 
       - name: Check repository hygiene and removed credentials
         run: python tools/check_repository_hygiene.py

@@ -10,6 +10,8 @@
 #include <string_view>
 #include <vector>
 
+#include "radio_channel.hpp"
+
 namespace CommandParsing {
 
 inline std::string trimAscii(std::string value)
@@ -107,6 +109,34 @@ inline bool parseLoopCountToken(std::string_view text, bool& infinite, uint32_t&
 
     infinite = false;
     count = parsed;
+    return true;
+}
+
+enum class ChannelAction { Select, Preview };
+
+struct ChannelRequest {
+    ChannelAction action = ChannelAction::Select;
+    uint8_t channel = 0;
+};
+
+// Parse the entire request before allowing any radio or transfer side effects.
+inline bool parseChannelCommand(const std::vector<std::string>& words, ChannelRequest& out)
+{
+    if (words.empty() || uppercaseCopy(words[0]) != "CHANNEL") {
+        return false;
+    }
+
+    ChannelRequest request{};
+    if (words.size() == 3 && uppercaseCopy(words[1]) == "PREVIEW") {
+        request.action = ChannelAction::Preview;
+    } else if (words.size() != 2) {
+        return false;
+    }
+
+    if (!parseUint8Arg(words.back(), 0, RadioChannel::kMaximum, request.channel)) {
+        return false;
+    }
+    out = request;
     return true;
 }
 

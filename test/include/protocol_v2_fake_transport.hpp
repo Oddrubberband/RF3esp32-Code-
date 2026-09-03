@@ -74,6 +74,8 @@ public:
                 continue;
             }
 
+            ++rule_applications_[index];
+
             switch (rule.kind) {
                 case FaultKind::Drop:
                     return true;
@@ -134,6 +136,13 @@ public:
     uint32_t senderResetCount() const { return sender_reset_count_; }
     uint32_t receiverResetCount() const { return receiver_reset_count_; }
 
+    // Count faults actually selected by send(), not merely configured rules or
+    // matching packets. Read-only instrumentation shared by qualification/tests.
+    uint32_t ruleApplications(size_t index) const
+    {
+        return index < rule_count_ ? rule_applications_[index] : 0;
+    }
+
 private:
     struct QueuedFrame {
         Destination destination = Destination::Receiver;
@@ -193,6 +202,7 @@ private:
 
     std::array<QueuedFrame, kMaxQueuedFrames> queue_{};
     std::array<FaultRule, kMaxRules> rules_{};
+    std::array<uint32_t, kMaxRules> rule_applications_{};
     size_t queue_count_ = 0;
     size_t rule_count_ = 0;
     uint32_t random_state_ = 1;

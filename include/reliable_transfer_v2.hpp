@@ -633,7 +633,6 @@ public:
         }
 
         if (active()) {
-            last_activity_ms_ = now_ms;
             return makeError(packet.transfer_id,
                              ProtocolV2::ErrorCode::UnexpectedPacket,
                              expected_sequence_, response)
@@ -730,7 +729,6 @@ private:
 
         if (active()) {
             if (packet.transfer_id == transfer_id_ && metadataEqual(incoming, metadata_)) {
-                last_activity_ms_ = now_ms;
                 return makeReady(packet.transfer_id, true, expected_sequence_,
                                  ProtocolV2::ErrorCode::None, response)
                            ? ReceiverEvent::ResponseReady : ReceiverEvent::Failed;
@@ -789,7 +787,6 @@ private:
         if (!active()) {
             return ReceiverEvent::Ignored;
         }
-        last_activity_ms_ = now_ms;
 
         const uint32_t sequence = packet.sequence;
         if (sequence < expected_sequence_) {
@@ -825,6 +822,10 @@ private:
         ++accepted_packets_;
         accepted_bytes_ += packet.payload_length;
         ++expected_sequence_;
+        // Only forward progress refreshes the inactivity deadline. Duplicate,
+        // out-of-order, and unexpected traffic must not keep a partial file
+        // alive forever if the peer has stopped advancing the transfer.
+        last_activity_ms_ = now_ms;
         if (expected_sequence_ == metadata_.total_packets) {
             state_ = ReceiverState::WaitingForEnd;
         }
@@ -833,7 +834,7 @@ private:
     }
 
     ReceiverEvent handleEnd(const ProtocolV2::Packet& packet,
-                            uint64_t now_ms,
+                            uint64_t,
                             ProtocolV2::Frame& response)
     {
         if (state_ == ReceiverState::Completed) {
@@ -848,7 +849,6 @@ private:
         if (!active()) {
             return ReceiverEvent::Ignored;
         }
-        last_activity_ms_ = now_ms;
         if (state_ != ReceiverState::WaitingForEnd) {
             return makeNack(expected_sequence_,
                             ProtocolV2::ErrorCode::UnexpectedSequence, response)

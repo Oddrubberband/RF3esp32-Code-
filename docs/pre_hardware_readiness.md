@@ -2,6 +2,12 @@
 
 Date: 2026-08-18
 
+2026-08-30 follow-up: the separate
+[firmware qualification](firmware_qualification_results.md) passed all 264 cases.
+Use [board_bringup.md](board_bringup.md) for current image preparation and manual
+programming steps. The historical results below are retained; they do not mean
+the physical PCB/RF gates have been passed.
+
 ## Recommendation
 
 **Conditional Go** for controlled bench validation. The software is buildable
@@ -59,8 +65,8 @@ also built rather than assumed equivalent.
 
 | Environment | Profile | Result |
 | --- | --- | --- |
-| `rf3_custom_pcb` | 16 MB custom PCB | PASS; RAM 14,620/327,680 B, app 258,025/1,572,864 B |
-| `rf3_esp32_devboard` | 4 MB devboard | PASS; RAM 14,752/327,680 B, app 258,125/1,572,864 B |
+| `rf3_custom_pcb` | 16 MB custom PCB | PASS; RAM 14,188/327,680 B, app 256,665/1,572,864 B |
+| `rf3_esp32_devboard` | 4 MB devboard | PASS; RAM 14,320/327,680 B, app 256,765/1,572,864 B |
 | `esp32wroom32d` | custom-PCB alias | PASS |
 | `esp32wroom32d_manual_boot` | custom-PCB alias | PASS |
 | `esp32wroom32d_devboard` | devboard alias | PASS |
@@ -74,8 +80,8 @@ Final host validation:
 
 | Check | Result |
 | --- | --- |
-| PlatformIO native Unity suite | 181/181 PASS |
-| Python staging tests | 8/8 PASS |
+| PlatformIO native Unity suite | 189/189 PASS |
+| Python staging and handoff tests | 16/16 PASS |
 | Repository hygiene check | PASS |
 | `git diff --check` | PASS |
 | Strict host warning pass | PASS for RF3 production/test sources; third-party Unity emits its own conversion warnings |

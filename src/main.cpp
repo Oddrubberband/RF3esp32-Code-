@@ -39,6 +39,7 @@
 #include "morse.hpp"
 #include "nrf24.hpp"
 #include "protocol_v2.hpp"
+#include "radio_channel.hpp"
 #include "radio_manager.hpp"
 #include "reliable_transfer_v2.hpp"
 #include "rx_drain.hpp"
@@ -96,11 +97,15 @@ constexpr uint32_t kDefaultMorseDotMs = 120;
 constexpr uint8_t kDefaultMorsePowerLevel = 3;
 constexpr TickType_t kLoopWorkerPeriod = pdMS_TO_TICKS(20);
 constexpr TickType_t kLoopStopPollPeriod = pdMS_TO_TICKS(20);
-constexpr TickType_t kLoopStopTimeout = pdMS_TO_TICKS(2000);
+// A peerless CANCEL can consume six 500 ms control-response windows (the first
+// attempt plus five bounded retries). Allow that state machine to terminate.
+constexpr TickType_t kLoopStopTimeout = pdMS_TO_TICKS(4000);
 constexpr TickType_t kWifiControlPollPeriod = pdMS_TO_TICKS(100);
 // The nRF24 RX FIFO is only three packets deep, so polling much slower than
 // the packet cadence will overrun the queue during live data transfer.
-constexpr TickType_t kRxPollPeriod = pdMS_TO_TICKS(2) > 0 ? pdMS_TO_TICKS(2) : 1;
+static_assert(pdMS_TO_TICKS(2) > 0,
+              "RF3 requires a FreeRTOS tick rate that represents its 2 ms transfer poll");
+constexpr TickType_t kRxPollPeriod = pdMS_TO_TICKS(2);
 constexpr TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(15000);
 constexpr size_t kConsoleLineBytes = 160;
 constexpr bool kWirelessControlEnabled = WIRELESS_CONTROL_ENABLED != 0;
@@ -165,6 +170,8 @@ struct HttpStatusSnapshot {
     uint32_t rx_stream = 0;
     uint32_t rx_raw = 0;
     uint32_t rx_missing = 0;
+    uint32_t rx_duplicates = 0;
+    uint32_t rx_drain_limit_hits = 0;
     uint32_t rx_saved = 0;
     uint32_t rx_saved_bytes = 0;
     uint32_t selected_bytes = 0;
@@ -188,6 +195,8 @@ struct ProtocolTransferReport {
     uint32_t total_packets = 0;
     uint32_t retry_count = 0;
     uint32_t crc32 = 0;
+    uint64_t elapsed_ms = 0;
+    uint32_t throughput_bps = 0;
     bool peer_complete = false;
 };
 
@@ -465,10 +474,16 @@ ReliableTransferV2::ReadResult readFileSource(void* context,
 uint32_t nextTransferId()
 {
     static uint32_t previous = 0;
-    uint32_t candidate = 0;
-    do {
+    uint32_t candidate = esp_random();
+    if (candidate == 0 || candidate == previous) {
         candidate = esp_random();
-    } while (candidate == 0 || candidate == previous);
+    }
+    if (candidate == 0 || candidate == previous) {
+        candidate = previous + 1u;
+        if (candidate == 0) {
+            candidate = 1;
+        }
+    }
     previous = candidate;
     return candidate;
 }
@@ -480,7 +495,8 @@ uint32_t nextTransferIdEntry(void*)
 
 void updateTransferReport(ProtocolTransferReport* report,
                           FileTransfer::Service& service,
-                          uint64_t now_ms)
+                          uint64_t now_ms,
+                          uint64_t start_ms)
 {
     service.refreshSenderStatus(now_ms);
     if (!report) {
@@ -496,6 +512,12 @@ void updateTransferReport(ProtocolTransferReport* report,
     report->total_packets = sender.totalPackets();
     report->retry_count = sender.totalRetries();
     report->crc32 = sender.crc32();
+    report->elapsed_ms = now_ms >= start_ms ? now_ms - start_ms : 0;
+    report->throughput_bps = report->elapsed_ms == 0
+                                 ? 0
+                                 : static_cast<uint32_t>(
+                                       (static_cast<uint64_t>(report->bytes_transferred) * 1000u) /
+                                       report->elapsed_ms);
     report->peer_complete = sender.peerComplete();
 }
 
@@ -560,7 +582,7 @@ bool sendDataFile(RadioManager& manager,
         ProtocolV2::Frame outbound{};
         if (!sender.outboundFrame(outbound)) {
             (void)sender.tick(monotonicMilliseconds());
-            updateTransferReport(report, transfer_service, monotonicMilliseconds());
+            updateTransferReport(report, transfer_service, monotonicMilliseconds(), start_ms);
             delayAtLeastMs(2);
             continue;
         }
@@ -581,7 +603,7 @@ bool sendDataFile(RadioManager& manager,
         const uint64_t send_time_ms = monotonicMilliseconds();
         if (!manager.sendPayload(outbound.data(), outbound.size())) {
             (void)sender.onTransportFailure(send_time_ms);
-            updateTransferReport(report, transfer_service, monotonicMilliseconds());
+            updateTransferReport(report, transfer_service, monotonicMilliseconds(), start_ms);
             delayAtLeastMs(2);
             continue;
         }
@@ -597,7 +619,7 @@ bool sendDataFile(RadioManager& manager,
 
         if (!manager.enterRx()) {
             (void)sender.onTransportFailure(monotonicMilliseconds());
-            updateTransferReport(report, transfer_service, monotonicMilliseconds());
+            updateTransferReport(report, transfer_service, monotonicMilliseconds(), start_ms);
             continue;
         }
 
@@ -643,32 +665,43 @@ bool sendDataFile(RadioManager& manager,
         if (manager.status().state == RadioState::RxListening && !manager.leaveRx()) {
             (void)sender.onTransportFailure(monotonicMilliseconds());
         }
-        updateTransferReport(report, transfer_service, monotonicMilliseconds());
+        updateTransferReport(report, transfer_service, monotonicMilliseconds(), start_ms);
     }
 
-    updateTransferReport(report, transfer_service, monotonicMilliseconds());
+    const uint64_t finish_ms = monotonicMilliseconds();
+    updateTransferReport(report, transfer_service, finish_ms, start_ms);
+    const uint64_t elapsed_ms = finish_ms >= start_ms ? finish_ms - start_ms : 0;
+    const uint32_t throughput_bps = elapsed_ms == 0
+                                        ? 0
+                                        : static_cast<uint32_t>(
+                                              (static_cast<uint64_t>(sender.acknowledgedBytes()) * 1000u) /
+                                              elapsed_ms);
     std::fclose(file);
     if (sender.state() == ReliableTransferV2::SenderState::Completed &&
         sender.peerComplete()) {
         ESP_LOGI(TAG,
-                 "Protocol v2 remote receiver verified and published id=%08lX bytes=%lu packets=%lu crc32=%08lX retries=%lu",
+                 "Protocol v2 remote receiver verified and published id=%08lX bytes=%lu packets=%lu crc32=%08lX retries=%lu elapsed_ms=%llu throughput_bps=%lu",
                  static_cast<unsigned long>(sender.transferId()),
                  static_cast<unsigned long>(sender.acknowledgedBytes()),
                  static_cast<unsigned long>(sender.acknowledgedPackets()),
                  static_cast<unsigned long>(sender.crc32()),
-                 static_cast<unsigned long>(sender.totalRetries()));
+                 static_cast<unsigned long>(sender.totalRetries()),
+                 static_cast<unsigned long long>(elapsed_ms),
+                 static_cast<unsigned long>(throughput_bps));
         return true;
     }
 
     ESP_LOGE(TAG,
-             "Protocol v2 transfer did not complete id=%08lX state=%s error=%s bytes=%lu/%lu seq=%lu retries=%lu",
+             "Protocol v2 transfer did not complete id=%08lX state=%s error=%s bytes=%lu/%lu seq=%lu retries=%lu elapsed_ms=%llu throughput_bps=%lu",
              static_cast<unsigned long>(sender.transferId()),
              ReliableTransferV2::senderStateName(sender.state()),
              ProtocolV2::errorName(sender.error()),
              static_cast<unsigned long>(sender.acknowledgedBytes()),
              static_cast<unsigned long>(sender.totalSize()),
              static_cast<unsigned long>(sender.currentSequence()),
-             static_cast<unsigned long>(sender.totalRetries()));
+             static_cast<unsigned long>(sender.totalRetries()),
+             static_cast<unsigned long long>(elapsed_ms),
+             static_cast<unsigned long>(throughput_bps));
     return false;
 }
 
@@ -1043,6 +1076,9 @@ private:
         channel_uri.handler = &DemoConsoleApp::httpChannelHandlerEntry;
         channel_uri.user_ctx = this;
 
+        httpd_uri_t channel_preview_uri = channel_uri;
+        channel_preview_uri.method = HTTP_GET;
+
         httpd_uri_t power_uri{};
         power_uri.uri = "/power";
         power_uri.method = HTTP_POST;
@@ -1060,6 +1096,7 @@ private:
         if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &tx_uri);
         if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &stop_uri);
         if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &channel_uri);
+        if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &channel_preview_uri);
         if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &power_uri);
         if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &command_uri);
 
@@ -1293,8 +1330,18 @@ private:
         }
 
         uint8_t channel = 0;
-        if (!parseUint8Arg(value_buf, 0, 125, channel)) {
+        if (!parseUint8Arg(value_buf, 0, RadioChannel::kMaximum, channel)) {
             return sendHttpJson(req, "{\"error\":\"invalid_channel\"}", "400 Bad Request");
+        }
+
+        if (req->method == HTTP_GET) {
+            // Preview bypasses command dispatch and status reads entirely. It
+            // must not stop a loop, reset a receiver, or touch any radio register.
+            std::string json;
+            appendFormat(json, "{\"preview\":true,\"channel\":%u,\"frequency_mhz\":%u}",
+                         static_cast<unsigned>(channel),
+                         static_cast<unsigned>(RadioChannel::frequencyMHz(channel)));
+            return sendHttpJson(req, json);
         }
 
         std::string command = "CHANNEL ";
@@ -1377,6 +1424,7 @@ private:
             "  POWER <0-3>          Set packet TX power level\n"
             "  POWERDOWN            Fully power down the radio\n"
             "  CHANNEL <0-125>      Reinitialize the radio on a new channel\n"
+            "  CHANNEL PREVIEW <0-125>  Show nominal MHz without changing the radio\n"
             "  CW START [ch] [0-3]  Start a continuous-wave test on a channel/power level\n"
             "  CW LOOP <on> <off>   Repeat CW bursts; optional [ch] [pwr] [EVERY <loops>]\n");
 
@@ -1671,6 +1719,8 @@ private:
         decoded_rx_packet_count_ = 0;
         raw_rx_packet_count_ = 0;
         missing_rx_packet_count_ = 0;
+        duplicate_rx_packet_count_ = 0;
+        rx_drain_limit_hit_count_ = 0;
         saved_rx_file_count_ = 0;
         saved_rx_byte_count_ = 0;
     }
@@ -1852,6 +1902,8 @@ private:
         const uint32_t decoded_packets = decoded_rx_packet_count_;
         const uint32_t raw_packets = raw_rx_packet_count_;
         const uint32_t missing_packets = missing_rx_packet_count_;
+        const uint32_t duplicate_packets = duplicate_rx_packet_count_;
+        const uint32_t drain_limit_hits = rx_drain_limit_hit_count_;
         const ProtocolTransferReport tx_report = last_tx_report_;
         const ReliableTransferV2::ReceiverState receiver_state = receiver_.state();
         const ProtocolV2::ErrorCode receiver_error = receiver_.error();
@@ -1866,18 +1918,19 @@ private:
         const char* irq_state =
             !status.irq_connected ? "disabled" : (status.irq_asserted ? "low" : "high");
 
-        std::printf("profile=%s filesystem=%s http_control=%s State=%s channel=%u ",
+        std::printf("profile=%s filesystem=%s http_control=%s State=%s channel=%u frequency_mhz=%u ",
                     HardwareProfile::kSelectedName,
                     filesystem_ready_ ? "ready" : "unavailable",
                     kWifiControlEnabled ? "enabled" : "disabled",
                     RadioManager::stateName(status.state),
-                    static_cast<unsigned>(status.channel));
+                    static_cast<unsigned>(status.channel),
+                    static_cast<unsigned>(RadioChannel::frequencyMHz(status.channel)));
         if (status.power_level >= 0) {
             std::printf("power=%d ", status.power_level);
         } else {
             std::printf("power=unknown ");
         }
-        std::printf("selected=%s last_status=0x%02X fifo=0x%02X observe=0x%02X irq=%s tx_irq_seen=%s tx_ok=%s tx_timeout=%s rx_len=%u rx_packets=%u rx_stream=%u rx_raw=%u rx_missing=%u rx_saved=%u rx_saved_bytes=%u carrier_events=%u fault=%d",
+        std::printf("selected=%s last_status=0x%02X fifo=0x%02X observe=0x%02X irq=%s tx_irq_seen=%s tx_ok=%s tx_timeout=%s rx_len=%u rx_packets=%u rx_stream=%u rx_raw=%u rx_missing=%u rx_duplicates=%u rx_drain_hits=%u rx_saved=%u rx_saved_bytes=%u carrier_events=%u fault=%d",
                     selected_file_.c_str(),
                     static_cast<unsigned>(status.last_status),
                     static_cast<unsigned>(status.last_fifo_status),
@@ -1891,11 +1944,13 @@ private:
                     static_cast<unsigned>(decoded_packets),
                     static_cast<unsigned>(raw_packets),
                     static_cast<unsigned>(missing_packets),
+                    static_cast<unsigned>(duplicate_packets),
+                    static_cast<unsigned>(drain_limit_hits),
                     static_cast<unsigned>(saved_rx_file_count_),
                     static_cast<unsigned>(saved_rx_byte_count_),
                     static_cast<unsigned>(carrier_events),
                     status.last_fault);
-        std::printf(" protocol=%u tx_id=%08lX tx_state=%s tx_bytes=%lu/%lu tx_seq=%lu/%lu tx_retries=%lu tx_error=%s tx_crc32=%08lX peer_complete=%s rx_id=%08lX rx_state=%s rx_bytes=%lu/%lu rx_seq=%lu/%lu rx_error=%s rx_crc32=%08lX",
+        std::printf(" protocol=%u tx_id=%08lX tx_state=%s tx_bytes=%lu/%lu tx_seq=%lu/%lu tx_retries=%lu tx_error=%s tx_crc32=%08lX tx_elapsed_ms=%llu tx_bps=%lu peer_complete=%s rx_id=%08lX rx_state=%s rx_bytes=%lu/%lu rx_seq=%lu/%lu rx_error=%s rx_crc32=%08lX",
                     static_cast<unsigned>(ProtocolV2::kVersion),
                     static_cast<unsigned long>(tx_report.transfer_id),
                     ReliableTransferV2::senderStateName(tx_report.state),
@@ -1906,6 +1961,8 @@ private:
                     static_cast<unsigned long>(tx_report.retry_count),
                     ProtocolV2::errorName(tx_report.error),
                     static_cast<unsigned long>(tx_report.crc32),
+                    static_cast<unsigned long long>(tx_report.elapsed_ms),
+                    static_cast<unsigned long>(tx_report.throughput_bps),
                     tx_report.peer_complete ? "true" : "false",
                     static_cast<unsigned long>(receiver_id),
                     ReliableTransferV2::receiverStateName(receiver_state),
@@ -1983,6 +2040,8 @@ private:
         out.rx_stream = decoded_rx_packet_count_;
         out.rx_raw = raw_rx_packet_count_;
         out.rx_missing = missing_rx_packet_count_;
+        out.rx_duplicates = duplicate_rx_packet_count_;
+        out.rx_drain_limit_hits = rx_drain_limit_hit_count_;
         out.rx_saved = saved_rx_file_count_;
         out.rx_saved_bytes = saved_rx_byte_count_;
         out.last_fault = status.last_fault;
@@ -2002,9 +2061,10 @@ private:
         std::string json;
                 appendFormat(json,
                      "{\"node_name\":\"%s\",\"hostname\":\"%s\",\"state\":\"%s\",\"selected\":\"%s\",\"selected_bytes\":%u,"
-                     "\"channel\":%u,\"power\":%d,"
+                     "\"channel\":%u,\"frequency_mhz\":%u,\"power\":%d,"
                      "\"tx_ok\":%s,\"tx_timeout\":%s,\"rx_packets\":%u,"
-                     "\"rx_stream\":%u,\"rx_raw\":%u,\"rx_missing\":%u,\"rx_saved\":%u,"
+                     "\"rx_stream\":%u,\"rx_raw\":%u,\"rx_missing\":%u,\"rx_duplicates\":%u,"
+                     "\"rx_drain_hits\":%u,\"rx_saved\":%u,"
                      "\"rx_saved_bytes\":%u,\"last_fault\":%d,"
                      "\"rx_pending\":%s,\"rpd\":%s}",
                      snapshot.node_name,
@@ -2013,6 +2073,7 @@ private:
                      snapshot.selected_name,
                      static_cast<unsigned>(snapshot.selected_bytes),
                      static_cast<unsigned>(snapshot.channel),
+                     static_cast<unsigned>(RadioChannel::frequencyMHz(snapshot.channel)),
                      snapshot.power_level,
                      snapshot.tx_ok ? "true" : "false",
                      snapshot.tx_timeout ? "true" : "false",
@@ -2020,6 +2081,8 @@ private:
                      static_cast<unsigned>(snapshot.rx_stream),
                      static_cast<unsigned>(snapshot.rx_raw),
                      static_cast<unsigned>(snapshot.rx_missing),
+                     static_cast<unsigned>(snapshot.rx_duplicates),
+                     static_cast<unsigned>(snapshot.rx_drain_limit_hits),
                      static_cast<unsigned>(snapshot.rx_saved),
                      static_cast<unsigned>(snapshot.rx_saved_bytes),
                      snapshot.last_fault,
@@ -2603,20 +2666,26 @@ private:
 
     bool commandChannel(const std::vector<std::string>& words)
     {
+        CommandParsing::ChannelRequest request{};
+        if (!CommandParsing::parseChannelCommand(words, request)) {
+            std::printf("Usage: CHANNEL <0-125> | CHANNEL PREVIEW <0-125>\n");
+            return false;
+        }
+
+        const uint8_t channel = request.channel;
+        if (request.action == CommandParsing::ChannelAction::Preview) {
+            // Return before taking the radio lock or changing any transfer state.
+            std::printf("Channel %u: %u MHz (nominal center frequency). Radio unchanged.\n"
+                        "Use CHANNEL %u to select it.\n",
+                        static_cast<unsigned>(channel),
+                        static_cast<unsigned>(RadioChannel::frequencyMHz(channel)),
+                        static_cast<unsigned>(channel));
+            return true;
+        }
+
         // Changing channels is implemented as a full re-boot of the radio so
         // packet mode returns to a known baseline on the new channel while
         // preserving the selected TX power level.
-        if (words.size() < 2) {
-            std::printf("Usage: CHANNEL <0-125>\n");
-            return false;
-        }
-
-        uint8_t channel = 0;
-        if (!parseUint8Arg(words[1], 0, 125, channel)) {
-            std::printf("Channel must be in the range 0-125.\n");
-            return false;
-        }
-
         if (!stopLoopAndWait()) {
             std::printf("Could not stop the current loop cleanly.\n");
             return false;
@@ -2639,7 +2708,9 @@ private:
             return false;
         }
 
-        std::printf("Radio reinitialized on channel %u\n", static_cast<unsigned>(status.channel));
+        std::printf("Radio reinitialized on channel %u (%u MHz)\n",
+                    static_cast<unsigned>(status.channel),
+                    static_cast<unsigned>(RadioChannel::frequencyMHz(status.channel)));
         return true;
     }
 
@@ -3178,11 +3249,7 @@ private:
 
         if (event == ReliableTransferV2::ReceiverEvent::Duplicate) {
             ++raw_rx_packet_count_;
-            ESP_LOGW(TAG,
-                     "Protocol v2 duplicate DATA re-ACKed id=%08lX seq=%u expected=%lu",
-                     static_cast<unsigned long>(receiver_.transferId()),
-                     static_cast<unsigned>(incoming.sequence),
-                     static_cast<unsigned long>(expected_before));
+            ++duplicate_rx_packet_count_;
             return;
         }
 
@@ -3290,9 +3357,14 @@ private:
                         RxDrain::kDefaultMaxPacketsPerPoll);
 
                     if (drain_result.guard_exhausted) {
-                        ESP_LOGW(TAG,
-                                 "RX drain guard hit after %u packets",
-                                 static_cast<unsigned>(drain_result.processed));
+                        ++rx_drain_limit_hit_count_;
+                        if (rx_drain_limit_hit_count_ == 1 ||
+                            (rx_drain_limit_hit_count_ % 64u) == 0) {
+                            ESP_LOGW(TAG,
+                                     "RX drain guard hits=%lu limit=%u",
+                                     static_cast<unsigned long>(rx_drain_limit_hit_count_),
+                                     static_cast<unsigned>(drain_result.processed));
+                        }
                     }
                 } else {
                     last_carrier_detected_ = false;
@@ -3408,7 +3480,13 @@ private:
 
         const bool ok = handleCommand(line, origin);
         if (ok && origin == CommandOrigin::Remote) {
-            tryResumeWirelessRx("Remote control RX resumed");
+            CommandParsing::ChannelRequest request{};
+            const bool channel_preview =
+                CommandParsing::parseChannelCommand(splitWords(line), request) &&
+                request.action == CommandParsing::ChannelAction::Preview;
+            if (!channel_preview) {
+                tryResumeWirelessRx("Remote control RX resumed");
+            }
         }
         giveCommand();
         return ok;
@@ -3433,6 +3511,8 @@ private:
     uint32_t decoded_rx_packet_count_ = 0;    // Payloads accepted as in-order stream data.
     uint32_t raw_rx_packet_count_ = 0;        // Payloads that were received but not accepted as stream data.
     uint32_t missing_rx_packet_count_ = 0;    // Sequence slots skipped by tolerated forward gaps.
+    uint32_t duplicate_rx_packet_count_ = 0;  // Duplicate DATA packets re-ACKed without rewriting.
+    uint32_t rx_drain_limit_hit_count_ = 0;   // Service passes that stopped at the bounded drain cap.
     uint32_t saved_rx_file_count_ = 0;        // Completed files written to SPIFFS in the current RX session.
     uint32_t saved_rx_byte_count_ = 0;        // Total bytes written across saved RX files in the current RX session.
     LoopConfig loop_config_{};

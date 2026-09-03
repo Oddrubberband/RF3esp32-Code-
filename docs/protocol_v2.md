@@ -264,6 +264,18 @@ Named defaults are:
 All times use monotonic milliseconds supplied to the state machines. Timeout
 and retry constants are centralized in `protocol_v2.hpp`.
 
+The five-retry budget is per outstanding START, DATA, END, or CANCEL exchange;
+it resets after READY or the matching DATA ACK. `totalRetries()` is diagnostic
+only, so transient errors accumulated across a large file do not exhaust a
+whole-transfer error budget. The firmware services RX every 2 ms, drains at
+most 32 packets per pass, and counts passes that reach that cap.
+
+Receiver inactivity is measured from the last accepted START or in-order DATA
+packet. Duplicate START/DATA, out-of-order DATA, and unexpected packets are
+answered as before but do not extend the 10-second partial-file lifetime. TX
+completion logs and `STATUS` expose elapsed milliseconds and effective bytes
+per second for bench comparisons.
+
 ## Sender state machine
 
 The sender states are:

@@ -1107,6 +1107,24 @@ void test_protocol_v2_lost_start_ready_data_ack_end_and_complete_recover()
     }
 }
 
+void test_protocol_v2_retry_budget_resets_per_packet_not_per_file()
+{
+    FakeSource source;
+    source.generated = true;
+    source.generated_size = ProtocolV2::kDataPayloadCapacity * 6u;
+    FakeSink sink;
+    Harness harness(source, sink);
+    for (uint32_t sequence = 0; sequence < 6; ++sequence) {
+        TEST_ASSERT_TRUE(harness.transport.addRule(dropRule(
+            Destination::Sender, PacketType::Ack, sequence, false)));
+    }
+
+    TEST_ASSERT_TRUE(harness.begin());
+    assertSuccessfulTransfer(harness);
+    TEST_ASSERT_EQUAL_UINT32(6, harness.sender.totalRetries());
+    TEST_ASSERT_EQUAL_UINT8(0, harness.sender.retryCount());
+}
+
 void test_protocol_v2_duplicate_start_data_ack_and_end_are_idempotent()
 {
     struct Scenario { Destination destination; PacketType type; uint32_t sequence; bool any; };
@@ -1208,6 +1226,49 @@ void test_protocol_v2_delay_and_reordering_support_is_deterministic()
     TEST_ASSERT_TRUE(harness.sender.totalRetries() >= 1);
 }
 
+void test_protocol_v2_nonprogress_traffic_does_not_extend_receiver_timeout()
+{
+    FakeSource source;
+    source.bytes.resize(40, 0x5Au);
+    const Metadata metadata = inspect(source);
+    FakeSink sink;
+    ReceiverSession receiver(&sink, sinkCallbacks(), 100);
+    Frame response{};
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ReceiverEvent::ResponseReady),
+                          static_cast<int>(receiver.onPacket(
+                              startPacket(0x55u, metadata), 0, response)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ReceiverEvent::DataAccepted),
+                          static_cast<int>(receiver.onPacket(
+                              dataPacket(0x55u, 0, source.bytes.data(), 20),
+                              10, response)));
+    TEST_ASSERT_EQUAL_UINT64(10, receiver.lastActivityMs());
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ReceiverEvent::ResponseReady),
+                          static_cast<int>(receiver.onPacket(
+                              startPacket(0x55u, metadata), 40, response)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ReceiverEvent::Duplicate),
+                          static_cast<int>(receiver.onPacket(
+                              dataPacket(0x55u, 0, source.bytes.data(), 20),
+                              60, response)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ReceiverEvent::ResponseReady),
+                          static_cast<int>(receiver.onPacket(
+                              dataPacket(0x55u, 2, source.bytes.data(), 20),
+                              80, response)));
+    Packet unexpected{};
+    unexpected.type = PacketType::Ack;
+    unexpected.transfer_id = 0x55u;
+    unexpected.sequence = 0;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ReceiverEvent::ResponseReady),
+                          static_cast<int>(receiver.onPacket(
+                              unexpected, 90, response)));
+    TEST_ASSERT_EQUAL_UINT64(10, receiver.lastActivityMs());
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ReceiverEvent::TimedOut),
+                          static_cast<int>(receiver.tick(110, response)));
+    TEST_ASSERT_FALSE(sink.partial_exists);
+}
+
 void test_protocol_v2_fake_transport_supports_selective_rules_and_endpoint_resets()
 {
     FakeDuplexTransport transport(7);
@@ -1245,6 +1306,30 @@ void test_protocol_v2_maximum_transfer_streams_without_full_allocation()
     TEST_ASSERT_EQUAL_UINT32(ProtocolV2::kMaxPacketCount,
                              harness.receiver.acceptedPackets());
     TEST_ASSERT_EQUAL_UINT32(65536, harness.sender.currentSequence());
+}
+
+void test_protocol_v2_fault_metrics_count_applied_rules_not_matches()
+{
+    FakeDuplexTransport transport(7);
+    FaultRule loss = dropRule(Destination::Sender, PacketType::Ack, 9, false, 2);
+    loss.occurrence = 2;
+    TEST_ASSERT_TRUE(transport.addRule(loss));
+    Packet packet{};
+    packet.type = PacketType::Ack;
+    packet.transfer_id = 1;
+    packet.sequence = 8;
+    TEST_ASSERT_TRUE(transport.send(Destination::Sender, encoded(packet), 0));
+    TEST_ASSERT_EQUAL_UINT32(0, transport.ruleApplications(0));
+    packet.sequence = 9;
+    for (uint32_t occurrence = 1; occurrence <= 4; ++occurrence) {
+        TEST_ASSERT_TRUE(transport.send(Destination::Sender, encoded(packet), 0));
+        TEST_ASSERT_EQUAL_UINT32(occurrence == 1 ? 0 : (occurrence == 2 ? 1 : 2),
+                                 transport.ruleApplications(0));
+    }
+    TEST_ASSERT_EQUAL_UINT32(3, transport.queuedFrames());
+    TEST_ASSERT_EQUAL_UINT32(0, transport.ruleApplications(1));
+    transport.resetSender();
+    TEST_ASSERT_EQUAL_UINT32(2, transport.ruleApplications(0));
 }
 
 void test_protocol_v2_back_to_back_transfers_and_collision_safe_adapter_contract()
@@ -1307,11 +1392,14 @@ void runProtocolV2Tests()
     RUN_TEST(test_protocol_v2_end_to_end_zero_one_exact_full_and_binary_files);
     RUN_TEST(test_protocol_v2_end_to_end_all_byte_values_and_seeded_random_data);
     RUN_TEST(test_protocol_v2_lost_start_ready_data_ack_end_and_complete_recover);
+    RUN_TEST(test_protocol_v2_retry_budget_resets_per_packet_not_per_file);
     RUN_TEST(test_protocol_v2_duplicate_start_data_ack_and_end_are_idempotent);
     RUN_TEST(test_protocol_v2_corrupted_data_is_detected_by_end_to_end_crc);
     RUN_TEST(test_protocol_v2_retry_exhaustion_fails_without_publication);
     RUN_TEST(test_protocol_v2_delay_and_reordering_support_is_deterministic);
+    RUN_TEST(test_protocol_v2_nonprogress_traffic_does_not_extend_receiver_timeout);
     RUN_TEST(test_protocol_v2_fake_transport_supports_selective_rules_and_endpoint_resets);
     RUN_TEST(test_protocol_v2_maximum_transfer_streams_without_full_allocation);
+    RUN_TEST(test_protocol_v2_fault_metrics_count_applied_rules_not_matches);
     RUN_TEST(test_protocol_v2_back_to_back_transfers_and_collision_safe_adapter_contract);
 }

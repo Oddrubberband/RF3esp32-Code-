@@ -23,6 +23,20 @@ not read by these PlatformIO builds.
 The native environment requires a host C and C++ compiler (gcc/g++, Clang, or
 an appropriately configured MSVC toolchain).
 
+## Software-only firmware qualification
+
+    python tools/run_firmware_qualification.py
+
+This separate C++17 executable requires GCC or Clang (`--cxx clang++` selects
+Clang; `CXX` may also name the compiler executable). It exercises the production
+Protocol v2 file-transfer service and sessions with deterministic fake transport
+faults and host files. It prints measured PASS/FAIL results and returns nonzero
+on failure. JSON records, exact fault rules, checksums, logs, and final host files
+are retained in a unique ignored `.pio/qualification/run-*` directory.
+
+See [firmware_qualification.md](firmware_qualification.md) for the campaign,
+reproducibility settings, and the explicit limits of this software evidence.
+
 ## Firmware
 
     platformio run -e rf3_custom_pcb -t clean
@@ -35,6 +49,11 @@ The custom PCB is the ESP32-WROOM-32UE-N16 target. The devboard profile is the
 different and compile-time checked.
 
 ## SPIFFS images
+
+For physical bring-up, `python tools/prepare_board_handoff.py` builds and checks
+both profiles and creates separate sender/receiver images without modifying
+`data/` or accessing a board. See [board_bringup.md](board_bringup.md). The lean
+receiver image avoids filling a devboard's SPIFFS with the sender's fixtures.
 
 PlatformIO packs the repository data directory:
 

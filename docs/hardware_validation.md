@@ -4,6 +4,12 @@ This procedure applies to the current `rf3_custom_pcb` image on two custom
 ESP32-WROOM-32UE-N16 boards. Call them node A and node B. Do not flash the
 devboard environment onto the custom PCB: its CE and IRQ pins are different.
 
+Start with [board_bringup.md](board_bringup.md) for checked image preparation,
+manual BOOT/EN steps, separate sender/receiver filesystem images, and storage
+headroom. Physical readiness remains conditional until the actual schematic,
+module ratings, power, SPI and RF tests have passed. A successful host build or
+software qualification is not evidence that these hardware gates have passed.
+
 Keep a bench log with firmware commit, environment, node, serial port, supply
 voltage/current, radio module identity, antenna, command, result, and any STATUS
 line. Stop at the first failed dependency; later RF tests will otherwise obscure
@@ -12,7 +18,8 @@ the cause.
 ## Bench prerequisites
 
 - Two assembled RF3 boards, two nRF24L01+PA+LNA modules, and their antennas.
-- Two USB data connections and two 115200-baud serial sessions.
+- Two USB-UART connections (on-board bridges or external 3.3 V logic adapters)
+  and two 115200-baud serial sessions. Verify programming access on the actual PCB.
 - Current-limited bench supply and DMM; oscilloscope is strongly recommended.
 - Logic analyzer capable of SPI mode 0 at 1 MHz.
 - Optional 2.4 GHz spectrum analyzer/SDR, attenuator or shield box for CW.
@@ -29,6 +36,13 @@ platformio run -e rf3_custom_pcb -t buildfs
 ```
 
 Upload and monitor each node, substituting its COM port:
+
+Do this only after the unpowered inspection and safe-power gates below. The
+custom profile uses `no_reset`: hold GPIO0/BOOT low through an EN/reset pulse to
+enter download mode before each upload, then release BOOT and reset for normal
+execution. Save wanted files first; `uploadfs` replaces their filesystem.
+For the lean receiver image, use the generated handoff instructions instead of
+the default `uploadfs` command below.
 
 ```powershell
 platformio run -e rf3_custom_pcb -t upload --upload-port COMx
@@ -106,8 +120,10 @@ Repeat on the second node.
 
 **Expected result**
 
-The radio rail is stable near 3.3 V, remains within the nRF24 3.0–3.6 V supply
-range, and the ESP32 boots normally on every reset.
+The radio rail is stable near the intended 3.3 V and stays within the exact
+PA+LNA module manufacturer's operating limits. Do not substitute a generic IC
+supply range for the assembled module's rating. The ESP32 boots normally on
+every reset. See the power-design references in [board_bringup.md](board_bringup.md).
 
 **Pass criterion**
 
@@ -116,7 +132,8 @@ normal serial boot five of five times with the radio connected.
 
 **Fail indications**
 
-Rail below 3.0 V, oscillation, regulator overheating, bootloader-only output,
+Rail outside the approved module/board operating limits, oscillation, regulator
+overheating, bootloader-only output,
 brownout/reset loop, or boot behavior changing when the radio is installed.
 
 **Most likely causes**
@@ -291,14 +308,18 @@ PA+LNA antennas directly against each other. Create and stage a one-byte file,
 then build/upload the filesystem to both nodes:
 
 ```powershell
-python -c "open('one.bin','wb').write(bytes([0x5A]))"
-python tools\stage_demo_file.py one.bin --output-name one.bin
+python -c "from pathlib import Path; p=Path('.pio/bench'); p.mkdir(parents=True, exist_ok=True); (p/'one.bin').write_bytes(bytes([0x5A]))"
+python tools\stage_demo_file.py .pio\bench\one.bin --output-name one.bin
 platformio run -e rf3_custom_pcb -t buildfs
 platformio run -e rf3_custom_pcb -t uploadfs --upload-port COM_A
 platformio run -e rf3_custom_pcb -t uploadfs --upload-port COM_B
 ```
 
 Set `CHANNEL 76` and `POWER 0` on both.
+
+Alternatively, the board handoff already includes `one.bin` in both role
+images without changing `data/`. Its CRC32 is `59BC5767`. Use the lean receiver
+image before large-file testing, especially with a 4 MB devboard receiver.
 
 **Action**
 
@@ -308,8 +329,9 @@ then enter `STATUS` on both and `FILES` on B.
 **Expected result**
 
 A logs one DATA packet and `remote receiver verified and published` with
-`peer_complete=true`. B logs a verified one-byte `rx_XXXXXXXX.bin` publication.
-No retry is required in a clean close-range setup.
+`peer_complete=true`, `elapsed_ms`, and `throughput_bps`. B logs a verified
+one-byte `rx_XXXXXXXX.bin` publication. No retry is required in a clean
+close-range setup.
 
 **Pass criterion**
 
@@ -329,9 +351,11 @@ publication error, or a received file not exactly one byte.
 
 **Next diagnostic step**
 
-Compare final STATUS fields (`tx_state`, `tx_error`, `tx_retries`, `rx_state`,
-`rx_error`, `fault`). If no frames are seen, repeat at power 0 and 2 m; if frames
-arrive but fail, capture both serial logs and SPI/IRQ around the first mismatch.
+Compare final STATUS fields (`tx_state`, `tx_error`, `tx_retries`,
+`tx_elapsed_ms`, `tx_bps`, `rx_state`, `rx_error`, `rx_duplicates`,
+`rx_drain_hits`, `fault`). If no frames are seen, repeat at power 0 and 2 m; if
+frames arrive but fail, capture both serial logs and SPI/IRQ around the first
+mismatch.
 
 ## Stage 6 — Repeated packet transfer
 
@@ -597,8 +621,8 @@ packets of 20 bytes.
 **Action**
 
 On A run `TX speech_test.u8`. Allow it to finish without another command. Record
-the TX start/completion lines and B's verified publication line. Run STATUS on
-both and FILES on B.
+the TX start/completion lines, including `elapsed_ms` and `throughput_bps`, and
+B's verified publication line. Run STATUS on both and FILES on B.
 
 **Expected result**
 

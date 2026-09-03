@@ -108,8 +108,14 @@ bool RadioManager::hasPendingRx()
     status_.last_status = radio_.getStatus();
     status_.last_fifo_status = radio_.readReg(0x17);
 
-    return (status_.last_status & (1 << 6)) != 0 ||
-           (status_.last_fifo_status & 0x01) == 0;
+    const bool fifo_has_payload = (status_.last_fifo_status & 0x01) == 0;
+    if (!fifo_has_payload && (status_.last_status & (1 << 6)) != 0) {
+        // RX_DR is only a notification latch; clear it when FIFO_STATUS proves
+        // there is no payload so callers cannot attempt an empty FIFO read.
+        radio_.clearIrq(true, false, false);
+        status_.last_status = radio_.getStatus();
+    }
+    return fifo_has_payload;
 }
 
 bool RadioManager::sendPayload(const uint8_t* payload, size_t len)

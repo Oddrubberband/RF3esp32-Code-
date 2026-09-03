@@ -823,7 +823,7 @@ void test_radioManager_hasPendingRx_reports_fifo_backlog_after_irq_clear(void)
     TEST_ASSERT_TRUE(manager.hasPendingRx());
 }
 
-void test_radioManager_hasPendingRx_true_when_rx_dr_set(void)
+void test_radioManager_hasPendingRx_clears_stale_rx_dr_when_fifo_empty(void)
 {
     FakeHal hal;
     Nrf24 radio(hal);
@@ -832,7 +832,8 @@ void test_radioManager_hasPendingRx_true_when_rx_dr_set(void)
     hal.regs[0x07] |= (1 << 6);
     hal.regs[0x17] |= 0x01;
 
-    TEST_ASSERT_TRUE(manager.hasPendingRx());
+    TEST_ASSERT_FALSE(manager.hasPendingRx());
+    TEST_ASSERT_EQUAL_UINT8(0, static_cast<uint8_t>(hal.regs[0x07] & (1 << 6)));
 }
 
 void test_radioManager_hasPendingRx_true_when_fifo_not_empty_without_rx_dr(void)
@@ -1038,6 +1039,23 @@ void test_rxDrain_exits_on_receive_failure(void)
     TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(result.processed));
     TEST_ASSERT_EQUAL(2, step_calls);
     TEST_ASSERT_TRUE(result.receive_failed);
+}
+
+void test_rxDrain_default_limit_is_32_and_reports_remaining_backlog(void)
+{
+    int pending = 33;
+    const RxDrain::DrainResult result = RxDrain::drainPending(
+        [&]() { return pending > 0; },
+        [&]() {
+            --pending;
+            return RxDrain::StepResult::Processed;
+        });
+
+    TEST_ASSERT_EQUAL_UINT32(32, RxDrain::kDefaultMaxPacketsPerPoll);
+    TEST_ASSERT_EQUAL_UINT32(32, static_cast<uint32_t>(result.processed));
+    TEST_ASSERT_EQUAL(1, pending);
+    TEST_ASSERT_TRUE(result.guard_exhausted);
+    TEST_ASSERT_FALSE(result.receive_failed);
 }
 
 void test_frame_io_round_trip_preserves_record(void)
@@ -1431,6 +1449,24 @@ void test_readOnePacket_returns_false_when_no_pending_data(void)
 
     TEST_ASSERT_FALSE(radio.readOnePacket(out, sizeof(out), out_len));
     TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(out_len));
+}
+
+void test_readOnePacket_never_reads_empty_fifo_when_rx_dr_is_stale(void)
+{
+    FakeHal hal;
+    Nrf24 radio(hal);
+    radio.setStaticPayloadSize(4);
+    hal.regs[0x07] |= (1 << 6);
+    hal.regs[0x17] |= 0x01;
+
+    uint8_t out[4] = {};
+    size_t out_len = 0;
+    TEST_ASSERT_FALSE(radio.readOnePacket(out, sizeof(out), out_len));
+    TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(out_len));
+    for (const auto& transaction : hal.tx_log) {
+        TEST_ASSERT_TRUE(transaction.empty() || transaction[0] != 0x61);
+    }
+    TEST_ASSERT_EQUAL_UINT8(0, static_cast<uint8_t>(hal.regs[0x07] & (1 << 6)));
 }
 
 void test_radioManager_receivePayload_without_data_sets_fault(void)
@@ -1857,6 +1893,51 @@ void test_commandParsing_loop_count_handles_finite_and_infinite_forms(void)
     TEST_ASSERT_FALSE(CommandParsing::parseLoopCountToken("-1", infinite, count));
 }
 
+void test_channelPreview_reports_nominal_frequency_and_range(void)
+{
+    TEST_ASSERT_EQUAL_UINT16(2400, RadioChannel::frequencyMHz(0));
+    TEST_ASSERT_EQUAL_UINT16(2476, RadioChannel::frequencyMHz(76));
+    TEST_ASSERT_EQUAL_UINT16(2525, RadioChannel::frequencyMHz(125));
+    TEST_ASSERT_EQUAL_UINT16(0, RadioChannel::frequencyMHz(126));
+    TEST_ASSERT_EQUAL_UINT16(0, RadioChannel::frequencyMHz(255));
+}
+
+void test_channelCommand_distinguishes_preview_from_selection(void)
+{
+    CommandParsing::ChannelRequest request{};
+    TEST_ASSERT_TRUE(CommandParsing::parseChannelCommand(
+        CommandParsing::splitWords("  channel\tpreview 76  "), request));
+    TEST_ASSERT_TRUE(request.action == CommandParsing::ChannelAction::Preview);
+    TEST_ASSERT_EQUAL_UINT8(76, request.channel);
+
+    TEST_ASSERT_TRUE(CommandParsing::parseChannelCommand({"CHANNEL", "0"}, request));
+    TEST_ASSERT_TRUE(request.action == CommandParsing::ChannelAction::Select);
+    TEST_ASSERT_EQUAL_UINT8(0, request.channel);
+    TEST_ASSERT_TRUE(CommandParsing::parseChannelCommand({"CHANNEL", "PREVIEW", "125"}, request));
+    TEST_ASSERT_TRUE(request.action == CommandParsing::ChannelAction::Preview);
+    TEST_ASSERT_EQUAL_UINT8(125, request.channel);
+    TEST_ASSERT_TRUE(CommandParsing::parseChannelCommand({"CHANNEL", "125"}, request));
+    TEST_ASSERT_TRUE(request.action == CommandParsing::ChannelAction::Select);
+    TEST_ASSERT_EQUAL_UINT8(125, request.channel);
+}
+
+void test_channelCommand_rejects_ambiguous_or_invalid_input_without_selection(void)
+{
+    const char* invalid[] = {
+        "", "CHANNEL", "CHANNEL PREVIEW", "CHANNEL PREVIEW -1", "CHANNEL PREVIEW +1",
+        "CHANNEL PREVIEW 126", "CHANNEL PREVIEW 256", "CHANNEL PREVIEW 4294967296",
+        "CHANNEL PREVIEW 76MHz", "CHANNEL PREVIEW 76 extra", "CHANNEL 76 PREVIEW",
+        "CHANNEL 76 extra", "CHANNEL 126", "CHANNEL -1", "CHANNEL SELECT 76", "POWER 76"
+    };
+    for (const char* line : invalid) {
+        CommandParsing::ChannelRequest request{CommandParsing::ChannelAction::Preview, 42};
+        TEST_ASSERT_FALSE_MESSAGE(CommandParsing::parseChannelCommand(
+            CommandParsing::splitWords(line), request), line);
+        TEST_ASSERT_TRUE(request.action == CommandParsing::ChannelAction::Preview);
+        TEST_ASSERT_EQUAL_UINT8(42, request.channel);
+    }
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1903,7 +1984,7 @@ int main(void)
     RUN_TEST(test_radioManager_receivePayload_updates_rx_length);
     RUN_TEST(test_radioManager_rx_packet_count_survives_rx_mode_reentry);
     RUN_TEST(test_radioManager_hasPendingRx_reports_fifo_backlog_after_irq_clear);
-    RUN_TEST(test_radioManager_hasPendingRx_true_when_rx_dr_set);
+    RUN_TEST(test_radioManager_hasPendingRx_clears_stale_rx_dr_when_fifo_empty);
     RUN_TEST(test_radioManager_hasPendingRx_true_when_fifo_not_empty_without_rx_dr);
     RUN_TEST(test_radioManager_hasPendingRx_false_when_rx_dr_clear_and_fifo_empty);
     RUN_TEST(test_readOnePacket_does_not_flush_rx_after_successful_read);
@@ -1917,6 +1998,7 @@ int main(void)
     RUN_TEST(test_txHelpers_retry_fails_after_all_attempts);
     RUN_TEST(test_rxDrain_processes_multiple_pending_packets);
     RUN_TEST(test_rxDrain_exits_on_receive_failure);
+    RUN_TEST(test_rxDrain_default_limit_is_32_and_reports_remaining_backlog);
     RUN_TEST(test_frame_io_round_trip_preserves_record);
     RUN_TEST(test_validation_rejects_oversized_payload);
     RUN_TEST(test_morse_encode_e_creates_single_dot_event);
@@ -1938,6 +2020,7 @@ int main(void)
     RUN_TEST(test_audioPacket_decode_accepts_zero_audio_len);
     RUN_TEST(test_audioReassembler_accepts_padded_packets_in_order);
     RUN_TEST(test_readOnePacket_returns_false_when_no_pending_data);
+    RUN_TEST(test_readOnePacket_never_reads_empty_fifo_when_rx_dr_is_stale);
     RUN_TEST(test_radioManager_receivePayload_without_data_sets_fault);
     RUN_TEST(test_transmitOnce_timeout_without_irq_returns_false_and_sets_timeout);
     RUN_TEST(test_radioManager_boot_probe_failure_sets_fault_code_1);
@@ -1958,5 +2041,8 @@ int main(void)
     RUN_TEST(test_commandParsing_uint32_rejects_overflow_and_trailing_text);
     RUN_TEST(test_commandParsing_uint8_enforces_radio_ranges);
     RUN_TEST(test_commandParsing_loop_count_handles_finite_and_infinite_forms);
+    RUN_TEST(test_channelPreview_reports_nominal_frequency_and_range);
+    RUN_TEST(test_channelCommand_distinguishes_preview_from_selection);
+    RUN_TEST(test_channelCommand_rejects_ambiguous_or_invalid_input_without_selection);
     return UNITY_END();
 }

@@ -4,7 +4,10 @@
 
 namespace RxDrain {
 
-constexpr size_t kDefaultMaxPacketsPerPoll = 8;
+// Bound one service pass so a continuously refilled FIFO cannot monopolize the
+// application task. Thirty-two leaves headroom above the three-packet hardware
+// FIFO while still yielding predictably to the rest of the firmware.
+constexpr size_t kDefaultMaxPacketsPerPoll = 32;
 
 enum class StepResult {
     Processed,
@@ -24,6 +27,7 @@ DrainResult drainPending(HasPendingFn hasPending,
                          size_t max_packets = kDefaultMaxPacketsPerPoll)
 {
     DrainResult result{};
+    bool stopped_early = false;
 
     while (result.processed < max_packets && hasPending()) {
         const StepResult step_result = step();
@@ -34,11 +38,13 @@ DrainResult drainPending(HasPendingFn hasPending,
 
         ++result.processed;
         if (step_result == StepResult::Stop) {
+            stopped_early = true;
             break;
         }
     }
 
-    result.guard_exhausted = result.processed >= max_packets && hasPending();
+    result.guard_exhausted = !stopped_early && !result.receive_failed &&
+                             result.processed >= max_packets && hasPending();
     return result;
 }
 

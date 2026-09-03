@@ -439,10 +439,14 @@ bool Nrf24::readOnePacket(uint8_t* out, size_t capacity, size_t& outLen)
         return false;
     }
 
-    // Treat either RX_DR asserted or RX FIFO not empty as pending data.
+    // FIFO_STATUS is authoritative. RX_DR can remain asserted after the last
+    // payload has gone, and R_RX_PAYLOAD must never be issued to an empty FIFO.
     const uint8_t status = getStatus();
     const uint8_t fifo_status = readReg(0x17);
-    if ((status & (1 << 6)) == 0 && (fifo_status & 0x01) != 0) {
+    if ((fifo_status & 0x01) != 0) {
+        if ((status & (1 << 6)) != 0) {
+            clearIrq(true, false, false);
+        }
         return false;
     }
 
