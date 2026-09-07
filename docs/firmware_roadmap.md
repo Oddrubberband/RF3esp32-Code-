@@ -8,7 +8,7 @@ The intended product lets a user import an arbitrary binary file through an offl
 
 ### Current position
 
-Phase 1 is implemented locally on **codex/phase-one-reliability**, commit **6ba0315**, starting from **aa911c3**. It has not been merged into the active checkout. The current code pinout is authoritative and was preserved. Phases 2 through 7 below are proposed work, not completed features or measured hardware results. Creating this guide makes no firmware changes.
+Phase 1 implementation commit **6ba0315**, starting from **aa911c3**, was integrated into active branch **agent/rf3-pre-hardware-readiness** and freshly validated on September 7, 2026. The pre-integration state is preserved by tag **rf3-before-phase-one-integration-20260907**. The current code pinout is authoritative and was preserved. Phases 2 through 7 below are proposed work, not completed features or measured hardware results. Creating this guide made no firmware changes.
 
 | Phase | Primary outcome | Page |
 | --- | --- | --- |
@@ -28,11 +28,11 @@ The main sequence is reliability, hardware evidence, storage, browser access, en
 
 Each phase should produce a reviewable commit, focused regression coverage, reproducible evidence, and a short handoff describing remaining limits. Agree on test conditions before measuring performance. Continue using isolated branches/worktrees until changes are deliberately integrated. This guide does not authorize merging or flashing.
 
-Basis: the project audit, the agreed seven-phase plan, and the committed Phase 1 handoff at docs/phase_one_reliability.md on the isolated branch identified on page 2.
+Basis: the project audit, the agreed seven-phase plan, and the committed Phase 1 handoff at docs/phase_one_reliability.md.
 
 ---
 
-PHASE 1 / IMPLEMENTED LOCALLY
+PHASE 1 / INTEGRATED AND SOFTWARE-COMPLETE
 
 ## Fix the reliability baseline
 
@@ -60,10 +60,10 @@ The branch also removes the machine-specific documentation path that failed repo
 
 ### Gate and next dependency
 
-The implementation and software gate are complete on the isolated branch. Review and integration are still separate decisions. Phase 2 must test live task scheduling, status responsiveness, SPI failures, and RF behavior. Keep the existing pinout and wire format while establishing that baseline.
+The implementation is integrated and the software gate is complete. Phase 2 must test live task scheduling, status responsiveness, SPI failures, and RF behavior. Keep the existing pinout and wire format while establishing that baseline.
 
 Commit: 6ba0315276a46c27e15a4b7cde044c1c8764d14c
-Branch: codex/phase-one-reliability
+Active branch: agent/rf3-pre-hardware-readiness
 Start here on another computer: docs/project_handoff.md
 Implementation details and reproducible commands: docs/phase_one_reliability.md.
 

@@ -4,29 +4,34 @@ Last substantive documentation update: 2026-09-07.
 
 ## Current state
 
-- Development branch: `codex/phase-one-reliability`.
-- Latest firmware implementation: `6ba0315276a46c27e15a4b7cde044c1c8764d14c`
+- Active development branch: `agent/rf3-pre-hardware-readiness`.
+- Phase 1 firmware implementation: `6ba0315276a46c27e15a4b7cde044c1c8764d14c`
   (`Fix Phase 1 transfer reliability and status reporting`).
-- Starting revision: `aa911c3` on `agent/rf3-pre-hardware-readiness`.
-- Phase 1 is implemented and locally validated in an isolated worktree. It has
-  not been merged into the active development checkout or flashed to hardware.
+- The active branch was fast-forwarded through Phase 1 documentation revision
+  `8698618` on 2026-09-07. Use `git log -3 --oneline` for this handoff update's
+  final commit.
+- Phase 1 is software-complete, integrated into the active checkout, and freshly
+  validated. It has not been flashed to or exercised on hardware.
+- The annotated rollback tag `rf3-before-phase-one-integration-20260907` points
+  to pre-integration revision `aa911c3`.
 - The existing code pinout is correct according to the user. Both pin profiles,
   tracked Wi-Fi defaults, partitions, and board definitions were preserved.
 - Phases 2-7 are plans. The full browser file manager and SoftAP file workflow
   have not been implemented.
-- This documentation update adds the detailed phase guide, this handoff, and
-  persistent instructions in `AGENTS.md`. It changes no firmware source.
+- This handoff refresh records integration and fresh validation; it changes no
+  firmware source.
 
 Use `git log -3 --oneline` for the latest documentation revision rather than
 assuming the implementation commit above is also the current branch tip.
 Confirm remote availability with the steps below; a local commit is not proof
 that another computer has it.
 
-Synchronization at this documentation handoff: work is local; no remote push
-was performed. A remote-branch lookup could not connect from the sandbox, so
-remote availability was not verified. A portable `RF3_Phase_One.bundle` export
-is supplied separately for transferring this branch, including its history.
-The bundle is a snapshot: recreate it after later commits when using this route.
+Synchronization at this handoff: work is local; no remote push was performed.
+Before this handoff commit, the active branch was three commits ahead of its
+local `origin/agent/rf3-pre-hardware-readiness` tracking ref at `5300d40` and
+zero commits behind. The handoff commit adds one more local commit. A local
+tracking ref is not proof that the remote server has the work. Push explicitly
+or create a fresh Git bundle before moving to another computer.
 
 ## Read in this order
 
@@ -48,14 +53,20 @@ Serial/HTTP status uses owned snapshots under a separate lock, with sender
 progress and periodic idle diagnostics. JSON strings are escaped, and the
 repository hygiene failure from a machine-specific document path is fixed.
 
-## Validation already completed
+## Validation completed after integration
 
-The implementation passed **211 native tests**, **16 Python tests**, and
-**264 software qualification cases**. Both canonical firmware builds, both
-SPIFFS builds, and both offline board handoff checks passed. A custom-PCB
-Wi-Fi-enabled validation image compiled and linked the HTTP server using dummy
-validation settings; tracked Wi-Fi remains disabled. Independent Python JSON
-decoding, repository hygiene, and whitespace checks passed.
+On 2026-09-07, the integrated active checkout passed **211 native tests**, **16
+Python tests**, and **264 software qualification cases**. Qualification evidence
+is under ignored path `.pio/qualification/run-0g43fdix`. Both canonical firmware
+builds and both SPIFFS builds passed. The offline checker built and inspected
+both board packages at `.pio/board_handoff/run-wh6j6pl5` and reported
+`HOST_ARTIFACT_CHECKS_PASS`; it did not connect to, erase, or flash a board.
+
+The ignored Wi-Fi-enabled custom-PCB validation environment compiled and linked
+the HTTP status server using dummy validation-only credentials. Tracked Wi-Fi
+remains disabled. Independent Python JSON decoding is included in the Python
+suite. Repository hygiene and whitespace checks passed before integration and
+are rerun for the final handoff commit.
 
 These are recorded results from the Phase 1 session, not a fresh test run each
 time this file is read. Live RF, power stability, ESP32 scheduling, and HTTP
@@ -64,12 +75,11 @@ changes using the commands in the Phase 1 document.
 
 ## Next concrete work
 
-Review the isolated Phase 1 commit, then establish the Phase 2 hardware baseline
-under the user's hardware authorization. Record board identity, firmware
-revision, power/link conditions, byte-comparison results, failure behavior,
-retries, and measured timing. Start small and test both directions. Investigate
-reported power instability with measurements. Do not treat host simulation time
-as physical RF throughput.
+Establish the Phase 2 hardware baseline under the user's hardware authorization.
+Record board identity, firmware revision, power/link conditions, byte-comparison
+results, failure behavior, retries, and measured timing. Start small and test
+both directions. Investigate reported power instability with measurements. Do
+not treat host simulation time as physical RF throughput.
 
 Host-side Phase 3 storage design can proceed while a board issue is investigated,
 but the Phase 5 release requires real-board evidence. Do not begin later phases
@@ -77,24 +87,34 @@ just because the current request was to document them.
 
 ## Resume on the laptop
 
-For the supplied bundle, copy it beside an existing laptop clone and run these
-commands from that clone. They preserve the active checkout:
+If the active branch has not been pushed, create a fresh portable bundle on the
+source computer after the final handoff commit:
+
+```sh
+git bundle create ../RF3_Phase_One.bundle agent/rf3-pre-hardware-readiness
+```
+
+Copy it beside an existing laptop clone, then verify and fetch it without
+changing the laptop's active checkout:
 
 ```sh
 git status --short
 git bundle verify ../RF3_Phase_One.bundle
-git fetch ../RF3_Phase_One.bundle refs/heads/codex/phase-one-reliability
+git fetch ../RF3_Phase_One.bundle refs/heads/agent/rf3-pre-hardware-readiness
 git worktree add -b codex/phase-one-laptop ../rf3-phase-one-laptop FETCH_HEAD
 ```
 
 Use an unused branch/directory name, or inspect and reuse an existing worktree.
-Without an existing clone, use
-`git clone -b codex/phase-one-reliability RF3_Phase_One.bundle rf3-phase-one-laptop`.
+Without an existing clone, use:
+
+```sh
+git clone -b agent/rf3-pre-hardware-readiness RF3_Phase_One.bundle rf3-phase-one-laptop
+```
+
 A bundle clone's origin points to the bundle; inspect `git remote -v` before
 configuring a GitHub remote. The bundle does not include uncommitted files,
 ignored build artifacts, or credentials. To recreate it on the source computer
-after committing the latest work, run
-`git bundle create ../RF3_Phase_One.bundle codex/phase-one-reliability`.
+after committing later work, rerun the bundle creation command above.
 
 Alternatively, if the branch has subsequently been pushed, use the remote:
 
@@ -104,7 +124,7 @@ From an existing clone, inspect its working tree before switching anything:
 ```sh
 git status --short
 git fetch origin
-git log -3 --oneline origin/codex/phase-one-reliability
+git log -3 --oneline origin/agent/rf3-pre-hardware-readiness
 ```
 
 If that remote branch is absent, the branch has not reached this clone's remote;
@@ -113,7 +133,7 @@ To preserve the laptop's active checkout, create another worktree using an
 unused local branch name:
 
 ```sh
-git worktree add -b codex/phase-one-laptop ../rf3-phase-one-laptop origin/codex/phase-one-reliability
+git worktree add -b codex/phase-one-laptop ../rf3-phase-one-laptop origin/agent/rf3-pre-hardware-readiness
 ```
 
 If the laptop worktree or branch already exists, inspect and reuse it rather
@@ -132,11 +152,10 @@ that ignored logs or generated firmware were transferred with Git.
 The 2026-09-07 documentation batch produced the eight-page phase guide and its
 3,395-word Markdown counterpart, this handoff, README navigation, and standing
 `AGENTS.md` instructions. All eight PDF pages were visually reviewed; the final
-overview table was corrected and reviewed again. Relative documentation links,
-repository hygiene, and staged whitespace checks passed. The active checkout
-remained on `agent/rf3-pre-hardware-readiness` at `aa911c3`, with only its existing
-untracked `output/` directory. Firmware tests were not rerun for these
-documentation-only changes; the earlier implementation results are above.
+overview table was corrected and reviewed again. Phase 1 was subsequently
+fast-forwarded into the active checkout and the full software validation matrix
+above was rerun there. The pre-existing untracked `output/` directory was
+preserved and is not part of the Phase 1 commits.
 
 After meaningful work, update this state/next-action summary and the relevant
 phase or subsystem document. Record passed and blocked checks honestly, link

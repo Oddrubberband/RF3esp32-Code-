@@ -1,8 +1,10 @@
 # Phase 1 reliability fixes
 
-This change starts from `aa911c3` on the isolated
-`codex/phase-one-reliability` branch. The active development checkout and both
-hardware pin profiles are unchanged. No device was connected or flashed.
+This change started from `aa911c3` on the isolated
+`codex/phase-one-reliability` branch and was fast-forwarded into active branch
+`agent/rf3-pre-hardware-readiness` on 2026-09-07. Both hardware pin profiles are
+unchanged. No device was connected or flashed. The annotated rollback tag
+`rf3-before-phase-one-integration-20260907` preserves the pre-integration state.
 
 ## Behavior
 
@@ -39,8 +41,9 @@ hardware pin profiles are unchanged. No device was connected or flashed.
 
 ## Verification
 
-Host validation passes 211 native Unity tests, 16 Python tests, and all 264
-qualification cases. The native suite adds fault-injected radio tests,
+Fresh validation on the integrated active checkout passed 211 native Unity
+tests, 16 Python tests, and all 264 qualification cases. The native suite adds
+fault-injected radio tests,
 peer-observed cleanup errors, completed-session replay and eviction tests,
 owned snapshot/concurrent publication checks, and JSON escaping coverage.
 An independent Python JSON decoder also verifies escaped control bytes,
@@ -49,9 +52,11 @@ Six new/strengthened protocol regressions were also run against the original
 header and failed as expected before passing with the updated implementation.
 
 Both canonical firmware builds, both SPIFFS images, and the offline board
-handoff checks pass. The additional custom-PCB Wi-Fi validation build also
-compiles and links with the HTTP server included. Logs and generated reports
-are retained under this worktree's ignored `.pio/` directory.
+handoff checks passed. The additional custom-PCB Wi-Fi validation build also
+compiled and linked with the HTTP server included. Qualification evidence is
+under `.pio/qualification/run-0g43fdix`; the offline handoff reported
+`HOST_ARTIFACT_CHECKS_PASS` under `.pio/board_handoff/run-wh6j6pl5`. Logs and
+generated reports remain ignored under `.pio/`.
 
 Run the normal checks from this worktree:
 
@@ -77,9 +82,10 @@ Physical RF throughput, ESP32 task scheduling, live HTTP responsiveness, and
 hardware fault recovery require board validation. Host tests do not establish
 those results.
 
-## Review and later integration
+## Integration boundary
 
-Review this branch against `aa911c3`. Integrate the resulting commit only after
-reviewing the validation results and any newer changes in the destination
-branch. This work does not implement the later filesystem service, browser
-import/export, or protocol expansion phases.
+Phase 1 is integrated and software-complete. This does not establish live RF
+behavior, power stability, ESP32 scheduling, or HTTP responsiveness on physical
+boards; those begin with Phase 2 hardware validation. This work also does not
+implement the later filesystem service, browser import/export, or protocol
+expansion phases.
