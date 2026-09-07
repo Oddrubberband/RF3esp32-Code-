@@ -820,12 +820,246 @@ void test_protocol_v2_receiver_cleanup_failure_is_reported_and_retryable()
     TEST_ASSERT_TRUE(receiver.cleanupFailed());
     TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::CleanupFailed),
                           static_cast<int>(receiver.error()));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::CleanupFailed),
+                          static_cast<int>(decoded(response).error));
+
+    SenderSession sender(&source, sourceCallbacks());
+    TEST_ASSERT_TRUE(sender.begin(60, metadata, 0));
+    (void)sender.cancel(1);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(SenderEvent::Failed),
+                          static_cast<int>(sender.onFrame(
+                              response.data(), response.size(), 2)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::CleanupFailed),
+                          static_cast<int>(sender.error()));
+
+    // Lost cancellation responses can cause repeated CANCEL frames. The peer
+    // must still see the cleanup failure while deletion continues to fail.
+    (void)receiver.onPacket(cancel, 3, response);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::CleanupFailed),
+                          static_cast<int>(decoded(response).error));
+    TEST_ASSERT_EQUAL_UINT32(2, sink.remove_count);
     TEST_ASSERT_FALSE(receiver.reset());
     TEST_ASSERT_TRUE(receiver.cleanupFailed());
     TEST_ASSERT_TRUE(sink.partial_exists);
     sink.remove_ok = true;
     TEST_ASSERT_TRUE(receiver.reset());
     TEST_ASSERT_FALSE(sink.partial_exists);
+}
+
+void test_protocol_v2_prepare_cleanup_failure_sets_status_and_rejects_start()
+{
+    FakeSource source;
+    source.bytes = {1};
+    FakeSink sink;
+    sink.prepare_result = ReliableTransferV2::SinkPrepareResult::CleanupFailed;
+    sink.partial_exists = true;
+    sink.remove_ok = false;
+    ReceiverSession receiver(&sink, sinkCallbacks());
+    Frame response{};
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ReceiverEvent::Failed),
+                          static_cast<int>(receiver.onPacket(
+                              startPacket(60, inspect(source)), 0, response)));
+    TEST_ASSERT_TRUE(receiver.cleanupFailed());
+    TEST_ASSERT_FALSE(receiver.active());
+    const Packet rejected = decoded(response);
+    TEST_ASSERT_FALSE(rejected.accepted);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::CleanupFailed),
+                          static_cast<int>(rejected.error));
+    TEST_ASSERT_FALSE(receiver.reset());
+    sink.remove_ok = true;
+    TEST_ASSERT_TRUE(receiver.reset());
+    TEST_ASSERT_FALSE(sink.partial_exists);
+}
+
+void test_protocol_v2_duplicate_cancel_retries_failed_cleanup_idempotently()
+{
+    FakeSource source;
+    source.bytes = {1};
+    FakeSink sink;
+    sink.remove_ok = false;
+    ReceiverSession receiver(&sink, sinkCallbacks());
+    Frame response{};
+    (void)receiver.onPacket(startPacket(60, inspect(source)), 0, response);
+    Packet cancel{};
+    cancel.type = PacketType::Cancel;
+    cancel.transfer_id = 60;
+    cancel.error = ErrorCode::Cancelled;
+    (void)receiver.onPacket(cancel, 1, response);
+    TEST_ASSERT_TRUE(receiver.cleanupFailed());
+    sink.remove_ok = true;
+    (void)receiver.onPacket(cancel, 4, response);
+    TEST_ASSERT_FALSE(receiver.cleanupFailed());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::Cancelled),
+                          static_cast<int>(decoded(response).error));
+    TEST_ASSERT_FALSE(sink.partial_exists);
+    const uint32_t removed = sink.remove_count;
+    (void)receiver.onPacket(cancel, 5, response);
+    TEST_ASSERT_EQUAL_UINT32(removed, sink.remove_count);
+    TEST_ASSERT_TRUE(receiver.reset());
+    TEST_ASSERT_FALSE(sink.partial_exists);
+}
+
+void test_protocol_v2_receiver_timeout_and_write_failure_report_cleanup_error()
+{
+    FakeSource source;
+    source.bytes = {1};
+    const Metadata metadata = inspect(source);
+    for (const bool timeout : {false, true}) {
+        FakeSink sink;
+        sink.remove_ok = false;
+        sink.short_write = true;
+        ReceiverSession receiver(&sink, sinkCallbacks(), 100);
+        Frame response{};
+        (void)receiver.onPacket(startPacket(61, metadata), 0, response);
+        const ReceiverEvent event = timeout
+            ? receiver.tick(100, response)
+            : receiver.onPacket(dataPacket(61, 0, source.bytes.data(), 1), 1, response);
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(timeout ? ReceiverEvent::TimedOut
+                                                       : ReceiverEvent::Failed),
+                              static_cast<int>(event));
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::CleanupFailed),
+                              static_cast<int>(receiver.error()));
+        const Packet error = decoded(response);
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(PacketType::Error),
+                              static_cast<int>(error.type));
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::CleanupFailed),
+                              static_cast<int>(error.error));
+        TEST_ASSERT_EQUAL_UINT32(61, error.transfer_id);
+        TEST_ASSERT_TRUE(receiver.cleanupFailed());
+        TEST_ASSERT_TRUE(sink.partial_exists);
+        TEST_ASSERT_FALSE(receiver.active());
+        TEST_ASSERT_FALSE(sink.published);
+        sink.remove_ok = true;
+        TEST_ASSERT_TRUE(receiver.reset());
+    }
+}
+
+void test_protocol_v2_completed_start_replay_preserves_current_and_newer_session()
+{
+    FakeSource source;
+    source.bytes = {0xA5};
+    const Metadata metadata = inspect(source);
+    FakeSink sink;
+    ReceiverSession receiver(&sink, sinkCallbacks());
+    Frame response{};
+    (void)receiver.onPacket(startPacket(62, metadata), 0, response);
+    (void)receiver.onPacket(dataPacket(62, 0, source.bytes.data(), 1), 1, response);
+    (void)receiver.onPacket(endPacket(62, metadata), 2, response);
+    TEST_ASSERT_TRUE(receiver.complete());
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ReceiverEvent::ResponseReady),
+                          static_cast<int>(receiver.onPacket(
+                              startPacket(62, metadata), 3, response)));
+    const Packet completed = decoded(response);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(PacketType::Complete),
+                          static_cast<int>(completed.type));
+    TEST_ASSERT_EQUAL_UINT32(62, completed.transfer_id);
+    TEST_ASSERT_EQUAL_UINT32(metadata.total_size, completed.total_size);
+    TEST_ASSERT_EQUAL_UINT32(metadata.crc32, completed.crc32);
+    TEST_ASSERT_TRUE(receiver.complete());
+    TEST_ASSERT_FALSE(receiver.active());
+    TEST_ASSERT_EQUAL_UINT32(1, receiver.acceptedBytes());
+    TEST_ASSERT_EQUAL_UINT32(1, sink.prepare_count);
+    TEST_ASSERT_EQUAL_UINT32(1, sink.publish_count);
+    TEST_ASSERT_FALSE(sink.partial_exists);
+
+    // A replayed COMPLETE must not falsely complete a fresh sender which has
+    // not sent the file. Only a sender already waiting for completion accepts it.
+    SenderSession fresh_sender(&source, sourceCallbacks());
+    TEST_ASSERT_TRUE(fresh_sender.begin(62, metadata, 3));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(SenderEvent::Ignored),
+                          static_cast<int>(fresh_sender.onFrame(
+                              response.data(), response.size(), 3)));
+    TEST_ASSERT_FALSE(fresh_sender.peerComplete());
+
+    (void)receiver.onPacket(startPacket(63, metadata), 4, response);
+    (void)receiver.onPacket(startPacket(62, metadata), 5, response);
+    TEST_ASSERT_EQUAL_UINT32(62, decoded(response).transfer_id);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(PacketType::Complete),
+                          static_cast<int>(decoded(response).type));
+
+    Metadata changed = metadata;
+    changed.crc32 ^= 1u;
+    (void)receiver.onPacket(startPacket(62, changed), 6, response);
+    TEST_ASSERT_FALSE(decoded(response).accepted);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::InvalidMetadata),
+                          static_cast<int>(decoded(response).error));
+    TEST_ASSERT_TRUE(receiver.active());
+    TEST_ASSERT_EQUAL_UINT32(63, receiver.transferId());
+    TEST_ASSERT_EQUAL_UINT32(0, receiver.acceptedBytes());
+    TEST_ASSERT_EQUAL_UINT64(4, receiver.lastActivityMs());
+    TEST_ASSERT_EQUAL_UINT32(2, sink.prepare_count);
+    TEST_ASSERT_EQUAL_UINT32(1, sink.publish_count);
+    TEST_ASSERT_TRUE(sink.partial_exists);
+
+    (void)receiver.onPacket(dataPacket(63, 0, source.bytes.data(), 1), 7, response);
+    (void)receiver.onPacket(endPacket(63, metadata), 8, response);
+    TEST_ASSERT_TRUE(receiver.complete());
+    TEST_ASSERT_EQUAL_UINT32(2, sink.publish_count);
+}
+
+void test_protocol_v2_completed_start_replay_can_recover_lost_complete()
+{
+    FakeSource source;
+    source.bytes = {1};
+    FakeSink sink;
+    Harness harness(source, sink);
+    FaultRule drop_complete{};
+    drop_complete.destination = Destination::Sender;
+    drop_complete.kind = FaultKind::Drop;
+    drop_complete.type = PacketType::Complete;
+    TEST_ASSERT_TRUE(harness.transport.addRule(drop_complete));
+    TEST_ASSERT_TRUE(harness.begin());
+    for (size_t step = 0; step < 10 && !harness.receiver.complete(); ++step) {
+        harness.step();
+    }
+    TEST_ASSERT_TRUE(harness.receiver.complete());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(SenderState::WaitingForComplete),
+                          static_cast<int>(harness.sender.state()));
+    Frame response{};
+    (void)harness.receiver.onPacket(startPacket(harness.transfer_id, harness.metadata),
+                                    harness.now_ms, response);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(SenderEvent::Completed),
+                          static_cast<int>(harness.sender.onFrame(
+                              response.data(), response.size(), harness.now_ms)));
+    TEST_ASSERT_TRUE(harness.sender.peerComplete());
+    TEST_ASSERT_EQUAL_UINT32(1, sink.prepare_count);
+    TEST_ASSERT_EQUAL_UINT32(1, sink.publish_count);
+}
+
+void test_protocol_v2_completion_replay_window_is_bounded_and_reset_forgets_it()
+{
+    FakeSource source;
+    const Metadata metadata = inspect(source);
+    FakeSink sink;
+    ReceiverSession receiver(&sink, sinkCallbacks());
+    Frame response{};
+    constexpr uint32_t first_id = 1000;
+    // Complete five transfers to overflow the documented four-entry window.
+    constexpr uint32_t completed_count = 5;
+    for (uint32_t index = 0; index < completed_count; ++index) {
+        (void)receiver.onPacket(startPacket(first_id + index, metadata), index * 2u, response);
+        (void)receiver.onPacket(endPacket(first_id + index, metadata), index * 2u + 1u, response);
+        TEST_ASSERT_TRUE(receiver.complete());
+    }
+    (void)receiver.onPacket(startPacket(first_id + 1u, metadata), 20, response);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(PacketType::Complete),
+                          static_cast<int>(decoded(response).type));
+    TEST_ASSERT_EQUAL_UINT32(completed_count, sink.prepare_count);
+
+    // The oldest completion has been evicted and can be accepted again.
+    (void)receiver.onPacket(startPacket(first_id, metadata), 21, response);
+    TEST_ASSERT_TRUE(decoded(response).accepted);
+    TEST_ASSERT_TRUE(receiver.active());
+    TEST_ASSERT_EQUAL_UINT32(completed_count + 1u, sink.prepare_count);
+    TEST_ASSERT_TRUE(receiver.reset());
+    TEST_ASSERT_FALSE(sink.partial_exists);
+
+    // An explicit successful reset is the full reset path, including history.
+    (void)receiver.onPacket(startPacket(first_id + 1u, metadata), 22, response);
+    TEST_ASSERT_TRUE(decoded(response).accepted);
+    TEST_ASSERT_TRUE(receiver.active());
+    TEST_ASSERT_EQUAL_UINT32(completed_count + 2u, sink.prepare_count);
 }
 
 void test_protocol_v2_sender_rejects_invalid_start_and_ready_rejection()
@@ -1382,6 +1616,12 @@ void runProtocolV2Tests()
     RUN_TEST(test_protocol_v2_receiver_zero_byte_file_is_verified_and_published);
     RUN_TEST(test_protocol_v2_receiver_storage_failures_preserve_existing_completed_file);
     RUN_TEST(test_protocol_v2_receiver_cleanup_failure_is_reported_and_retryable);
+    RUN_TEST(test_protocol_v2_prepare_cleanup_failure_sets_status_and_rejects_start);
+    RUN_TEST(test_protocol_v2_duplicate_cancel_retries_failed_cleanup_idempotently);
+    RUN_TEST(test_protocol_v2_receiver_timeout_and_write_failure_report_cleanup_error);
+    RUN_TEST(test_protocol_v2_completed_start_replay_preserves_current_and_newer_session);
+    RUN_TEST(test_protocol_v2_completed_start_replay_can_recover_lost_complete);
+    RUN_TEST(test_protocol_v2_completion_replay_window_is_bounded_and_reset_forgets_it);
     RUN_TEST(test_protocol_v2_sender_rejects_invalid_start_and_ready_rejection);
     RUN_TEST(test_protocol_v2_sender_ignores_wrong_transfer_and_requires_complete);
     RUN_TEST(test_protocol_v2_sender_retry_timeout_and_exhaustion_are_bounded);

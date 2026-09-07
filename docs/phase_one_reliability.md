@@ -1,0 +1,85 @@
+# Phase 1 reliability fixes
+
+This change starts from `aa911c3` on the isolated
+`codex/phase-one-reliability` branch. The active development checkout and both
+hardware pin profiles are unchanged. No device was connected or flashed.
+
+## Behavior
+
+- TX rejects impossible STATUS or FIFO_STATUS values before interpreting
+  success. A floating SPI bus no longer reports a successful local send. The
+  driver lowers CE, skips recovery transmission on an invalid snapshot, and
+  reports radio fault 10. Ordinary success, MAX_RT, timeout, and the supported
+  no-ACK FIFO completion path retain their existing behavior. A valid zero
+  STATUS value is not treated as proof of a disconnected radio.
+- Receiver cancellation, timeout, and failure responses carry the actual
+  post-cleanup error. Repeated CANCEL retries failed cleanup; a successful
+  repeated cancellation remains idempotent. Prepare-time cleanup failure is
+  also visible through the receiver's cleanup flag.
+- The receiver remembers the last four successful transfers in fixed-size
+  RAM. A matching delayed START returns COMPLETE without reopening storage,
+  replacing another active session, or reporting another publication. Reuse
+  of a remembered ID with different metadata is rejected. Explicit successful
+  reset, reboot, and FIFO eviction bound this replay protection. The wire
+  format is unchanged; new transfers still require fresh IDs.
+- Serial and HTTP status read owned cached snapshots through a separate
+  mutex. They do not acquire the radio mutex or perform filesystem/SPI reads.
+  The radio owner publishes state on release and during sender progress.
+  The worker also refreshes idle diagnostics every 250 ms when it can acquire
+  the radio lock, so a disconnected idle radio does not remain hidden forever.
+  Selection changes share the snapshot lock, and captured filenames remain
+  valid after subsequent selections. Lock ordering never requires taking the
+  radio or command mutex while holding the snapshot mutex.
+- HTTP status preserves its existing fields and adds sender/receiver progress,
+  preparation state, publication timestamp, and explicitly named payload
+  bytes-per-second reporting. Text is JSON-escaped. Cached radio values reflect
+  the most recent owner update; reading status does not force a hardware probe.
+- The optimization handoff now references its separately supplied PDF by name,
+  allowing the repository hygiene check to pass without weakening the check.
+
+## Verification
+
+Host validation passes 211 native Unity tests, 16 Python tests, and all 264
+qualification cases. The native suite adds fault-injected radio tests,
+peer-observed cleanup errors, completed-session replay and eviction tests,
+owned snapshot/concurrent publication checks, and JSON escaping coverage.
+An independent Python JSON decoder also verifies escaped control bytes,
+UTF-8 filenames, and numeric fields from the production serializer.
+Six new/strengthened protocol regressions were also run against the original
+header and failed as expected before passing with the updated implementation.
+
+Both canonical firmware builds, both SPIFFS images, and the offline board
+handoff checks pass. The additional custom-PCB Wi-Fi validation build also
+compiles and links with the HTTP server included. Logs and generated reports
+are retained under this worktree's ignored `.pio/` directory.
+
+Run the normal checks from this worktree:
+
+```sh
+platformio test -e native -v
+python -B -m unittest discover -s test -p 'test_*.py'
+python tools/run_firmware_qualification.py
+platformio run -e rf3_custom_pcb -e rf3_esp32_devboard
+platformio run -e rf3_custom_pcb -e rf3_esp32_devboard -t buildfs
+python tools/prepare_board_handoff.py
+python tools/check_repository_hygiene.py
+git diff --check
+```
+
+Wi-Fi stays disabled in the tracked environments. Also compile an isolated
+Wi-Fi-enabled configuration when changing HTTP integration; local validation
+uses an ignored `.pio/phase-one-platformio.ini` that inherits the custom PCB
+environment, enables Wi-Fi, and uses a separate build directory and generated
+sdkconfig path. Dummy validation-only SSID/password values keep the HTTP code
+reachable for the compile/link check; no device is flashed or connected.
+
+Physical RF throughput, ESP32 task scheduling, live HTTP responsiveness, and
+hardware fault recovery require board validation. Host tests do not establish
+those results.
+
+## Review and later integration
+
+Review this branch against `aa911c3`. Integrate the resulting commit only after
+reviewing the validation results and any newer changes in the destination
+branch. This work does not implement the later filesystem service, browser
+import/export, or protocol expansion phases.

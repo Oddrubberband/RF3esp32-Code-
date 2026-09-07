@@ -560,6 +560,10 @@ enum class ReceiverEvent {
 
 class ReceiverSession {
 public:
+    // A small RAM-only replay window survives ordinary new transfers. An
+    // explicit reset (or reboot) forgets it; older entries are evicted FIFO.
+    static constexpr size_t kRecentCompletionCapacity = 4;
+
     ReceiverSession(void* sink_context,
                     SinkCallbacks sink,
                     uint32_t inactivity_timeout_ms = ProtocolV2::kReceiverInactivityTimeoutMs)
@@ -608,8 +612,11 @@ public:
 
         if (packet.type == ProtocolV2::PacketType::Cancel) {
             if (state_ == ReceiverState::Cancelled) {
-                return makeError(packet.transfer_id,
-                                 ProtocolV2::ErrorCode::Cancelled,
+                if (cleanup_failed_) {
+                    (void)abortStorage(ProtocolV2::ErrorCode::Cancelled,
+                                       ReceiverState::Cancelled);
+                }
+                return makeError(packet.transfer_id, error_,
                                  expected_sequence_, response)
                            ? ReceiverEvent::Cancelled : ReceiverEvent::Failed;
             }
@@ -619,8 +626,7 @@ public:
             last_activity_ms_ = now_ms;
             (void)abortStorage(ProtocolV2::ErrorCode::Cancelled,
                                ReceiverState::Cancelled);
-            return makeError(packet.transfer_id,
-                             ProtocolV2::ErrorCode::Cancelled,
+            return makeError(packet.transfer_id, error_,
                              expected_sequence_, response)
                        ? ReceiverEvent::Cancelled : ReceiverEvent::Failed;
         }
@@ -652,7 +658,7 @@ public:
         }
         const uint32_t id = transfer_id_;
         (void)abortStorage(ProtocolV2::ErrorCode::Timeout, ReceiverState::Failed);
-        if (!makeError(id, ProtocolV2::ErrorCode::Timeout,
+        if (!makeError(id, error_,
                        expected_sequence_, response)) {
             return ReceiverEvent::Failed;
         }
@@ -668,6 +674,8 @@ public:
             return false;
         }
         clearSession();
+        recent_completions_ = {};
+        next_completion_ = 0;
         return true;
     }
 
@@ -727,6 +735,21 @@ private:
                        ? ReceiverEvent::ResponseReady : ReceiverEvent::Failed;
         }
 
+        for (const CompletedTransfer& completed : recent_completions_) {
+            if (completed.transfer_id != 0 &&
+                completed.transfer_id == packet.transfer_id) {
+                if (!metadataEqual(incoming, completed.metadata)) {
+                    return makeReady(packet.transfer_id, false, 0,
+                                     ProtocolV2::ErrorCode::InvalidMetadata, response)
+                               ? ReceiverEvent::ResponseReady : ReceiverEvent::Failed;
+                }
+                // Replaying the terminal response must not prepare storage,
+                // replace a newer session, or emit a second publication event.
+                return makeComplete(completed.transfer_id, completed.metadata, response)
+                           ? ReceiverEvent::ResponseReady : ReceiverEvent::Failed;
+            }
+        }
+
         if (active()) {
             if (packet.transfer_id == transfer_id_ && metadataEqual(incoming, metadata_)) {
                 return makeReady(packet.transfer_id, true, expected_sequence_,
@@ -764,6 +787,7 @@ private:
                          : ProtocolV2::ErrorCode::SinkOpen;
             state_ = ReceiverState::Failed;
             storage_present_ = prepared == SinkPrepareResult::CleanupFailed;
+            cleanup_failed_ = storage_present_;
             return makeReady(packet.transfer_id, false, 0, error_, response)
                        ? ReceiverEvent::Failed : ReceiverEvent::Failed;
         }
@@ -888,6 +912,8 @@ private:
         storage_present_ = false;
         state_ = ReceiverState::Completed;
         error_ = ProtocolV2::ErrorCode::None;
+        recent_completions_[next_completion_] = {transfer_id_, metadata_};
+        next_completion_ = (next_completion_ + 1u) % recent_completions_.size();
         return makeComplete(response)
                    ? ReceiverEvent::Completed : ReceiverEvent::Failed;
     }
@@ -898,7 +924,7 @@ private:
     {
         const uint32_t id = transfer_id_;
         (void)abortStorage(error, ReceiverState::Failed);
-        if (!makeError(id, error, relevant_sequence, response)) {
+        if (!makeError(id, error_, relevant_sequence, response)) {
             return ReceiverEvent::Failed;
         }
         return ReceiverEvent::Failed;
@@ -989,11 +1015,18 @@ private:
 
     bool makeComplete(ProtocolV2::Frame& response) const
     {
+        return makeComplete(transfer_id_, metadata_, response);
+    }
+
+    static bool makeComplete(uint32_t transfer_id,
+                             const Metadata& metadata,
+                             ProtocolV2::Frame& response)
+    {
         ProtocolV2::Packet packet{};
         packet.type = ProtocolV2::PacketType::Complete;
-        packet.transfer_id = transfer_id_;
-        packet.total_size = metadata_.total_size;
-        packet.crc32 = metadata_.crc32;
+        packet.transfer_id = transfer_id;
+        packet.total_size = metadata.total_size;
+        packet.crc32 = metadata.crc32;
         packet.error = ProtocolV2::ErrorCode::None;
         return ProtocolV2::encode(packet, response);
     }
@@ -1020,6 +1053,12 @@ private:
     }
 
     void* sink_context_ = nullptr;
+    struct CompletedTransfer {
+        uint32_t transfer_id = 0;
+        Metadata metadata{};
+    };
+    std::array<CompletedTransfer, kRecentCompletionCapacity> recent_completions_{};
+    size_t next_completion_ = 0;
     SinkCallbacks sink_{};
     uint32_t inactivity_timeout_ms_ = ProtocolV2::kReceiverInactivityTimeoutMs;
     ReceiverState state_ = ReceiverState::Idle;

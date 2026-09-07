@@ -23,6 +23,8 @@
 void runReceiverSafetyTests();
 void runProtocolV2Tests();
 void runIntegrationReadinessTests();
+void runRadioFaultTests();
+void runStatusSnapshotTests();
 
 void setUp(void)
 {
@@ -1505,6 +1507,7 @@ void test_transmitOnce_timeout_without_irq_returns_false_and_sets_timeout(void)
     TEST_ASSERT_EQUAL(2, hal.tx_trigger_count);
     TEST_ASSERT_TRUE(radio.lastTxTimedOut());
     TEST_ASSERT_FALSE(radio.lastTxSawIrq());
+    TEST_ASSERT_FALSE(radio.lastTxCommunicationFailed());
     TEST_ASSERT_TRUE(hal.tx_fifo.empty());
 }
 
@@ -1956,6 +1959,8 @@ int main(void)
     runReceiverSafetyTests();
     runProtocolV2Tests();
     runIntegrationReadinessTests();
+    runRadioFaultTests();
+    runStatusSnapshotTests();
     RUN_TEST(test_readReg_reads_value_and_formats_spi_command);
     RUN_TEST(test_readRfPowerLevel_decodes_rf_setup_bits);
     RUN_TEST(test_setRfPowerLevel_updates_packet_setup_and_register);

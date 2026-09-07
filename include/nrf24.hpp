@@ -58,6 +58,7 @@ public:
     uint8_t lastTxObserve() const;
     bool lastTxTimedOut() const;
     bool lastTxSawIrq() const;
+    bool lastTxCommunicationFailed() const;
 
 private:
     enum class CwMode {
@@ -84,6 +85,7 @@ private:
     uint8_t last_tx_observe_ = 0;
     bool last_tx_timed_out_ = false;
     bool last_tx_saw_irq_ = false;
+    bool last_tx_communication_failed_ = false;
     CwMode cw_mode_ = CwMode::None;
     CwRestoreState cw_restore_{};
 };

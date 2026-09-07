@@ -38,9 +38,8 @@ git worktree add ..\rf3-before-optimization rf3-before-transfer-optimization-202
 
 ## Original objective
 
-The source brief was `RF3 File Transfer Optimization.pdf`, originally located
-at `C:\Users\leals\Downloads\RF3 File Transfer Optimization.pdf`. The PDF is
-not committed to this repository.
+The source brief was `RF3 File Transfer Optimization.pdf`, supplied separately
+from this repository. The PDF is not committed to this repository.
 
 The requested work was to audit the entire RF3 file-transfer path for delays,
 drain limits, retry behavior, timeouts, and hot-path logging; improve healthy

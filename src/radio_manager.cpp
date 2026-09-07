@@ -148,8 +148,14 @@ bool RadioManager::sendPayload(const uint8_t* payload, size_t len)
     status_.last_observe_tx = radio_.lastTxObserve();
     status_.irq_connected = radio_.irqConnected();
     status_.irq_asserted = radio_.irqAsserted();
-    refreshPowerLevel();
-    status_.last_fault = 3;  // Transmit (TX) operation failed or timed out.
+    if (radio_.lastTxCommunicationFailed()) {
+        status_.power_level = -1;
+        status_.carrier_detected = false;
+        status_.last_fault = 10;  // Invalid SPI status; radio communication failed.
+    } else {
+        refreshPowerLevel();
+        status_.last_fault = 3;  // Transmit (TX) operation failed or timed out.
+    }
     return false;
 }
 

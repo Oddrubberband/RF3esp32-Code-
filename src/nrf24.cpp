@@ -15,6 +15,20 @@ constexpr std::array<uint8_t, 5> kDemoAddress = {0x52, 0x46, 0x33, 0x24, 0x01};
 // a different rate can still override this at build time with RF3_NRF24_RF_SETUP.
 constexpr uint8_t kDemoRfSetup = RF3_NRF24_RF_SETUP;
 constexpr uint32_t kTxCePulseUs = RF3_NRF24_TX_CE_PULSE_US;
+
+bool validStatus(uint8_t status)
+{
+    // Bit 7 and RX_P_NO=6 are reserved. In particular, a floating SPI bus
+    // returning 0xFF must not be interpreted as a TX_DS interrupt. Zero is
+    // allowed: pipe 0 can be pending with its RX_DR notification cleared.
+    return (status & 0x80u) == 0 && (status & 0x0Eu) != 0x0Cu;
+}
+
+bool validFifoStatus(uint8_t fifo_status)
+{
+    // Bits 7, 3 and 2 are reserved, including in the no-ACK FIFO fallback.
+    return (fifo_status & 0x8Cu) == 0;
+}
 }
 
 Nrf24::Nrf24(Nrf24Hal& hal)
@@ -279,9 +293,22 @@ bool Nrf24::stopRx()
 
 bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
 {
+    last_tx_communication_failed_ = false;
+    last_tx_timed_out_ = false;
+    last_tx_saw_irq_ = false;
     if (!payload || len == 0 || len > 32) {
         return false;
     }
+
+    auto valid_tx_snapshot = [&]() {
+        if (validStatus(last_tx_status_) && validFifoStatus(last_tx_fifo_status_)) {
+            return true;
+        }
+        last_tx_communication_failed_ = true;
+        last_tx_timed_out_ = false;
+        hal_.ce(false);
+        return false;
+    };
 
     auto attempt_transmit = [&](bool rearm_radio, bool hold_ce_until_done) {
         if (rearm_radio) {
@@ -311,6 +338,9 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
         last_tx_observe_ = readReg(0x08);
         last_tx_timed_out_ = false;
         last_tx_saw_irq_ = false;
+        if (!valid_tx_snapshot()) {
+            return false;
+        }
         const bool auto_ack_enabled = (readReg(0x01) & 0x01) != 0;
 
         // Force transmit (TX) mode, queue one payload, then trigger the send
@@ -344,7 +374,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
             hal_.ce(false);
         }
 
-                const bool irq_connected = hal_.irqConnected();
+        const bool irq_connected = hal_.irqConnected();
         const uint64_t start = hal_.nowUs();
         uint64_t last_status_poll = start;
 
@@ -366,6 +396,11 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
 
             const uint8_t status = getStatus();
             const uint8_t fifo_status = readReg(0x17);
+            last_tx_status_ = status;
+            last_tx_fifo_status_ = fifo_status;
+            if (!valid_tx_snapshot()) {
+                return false;
+            }
 
             if (status & (1 << 5)) {
                 last_tx_status_ = status;
@@ -413,6 +448,9 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
         last_tx_status_ = getStatus();
         last_tx_fifo_status_ = readReg(0x17);
         last_tx_observe_ = readReg(0x08);
+        if (!valid_tx_snapshot()) {
+            return false;
+        }
         last_tx_timed_out_ = true;
         hal_.ce(false);
         flushTx();
@@ -423,6 +461,9 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
     // stronger re-prime-and-hold path that some modules prefer.
     if (attempt_transmit(false, false)) {
         return true;
+    }
+    if (last_tx_communication_failed_) {
+        return false;
     }
 
     // Some clone modules and long-wire bench setups need a stronger re-prime
@@ -475,6 +516,11 @@ bool Nrf24::startContinuousCarrier(uint8_t channel, uint8_t rfPowerBits)
         return false;
     }
 
+    if (!validStatus(getStatus())) {
+        hal_.ce(false);
+        return false;
+    }
+
     if (cw_mode_ != CwMode::None) {
         stopContinuousCarrier();
     }
@@ -510,7 +556,12 @@ bool Nrf24::startContinuousCarrier(uint8_t channel, uint8_t rfPowerBits)
     // Genuine nRF24L01+ parts support CONT_WAVE. If the bit does not stick,
     // fall back to the older payload-reuse sequence so CW still produces RF
     // output on older radios and some clone modules.
-    if ((readReg(0x06) & 0x80) != 0) {
+    const uint8_t rf_setup = readReg(0x06);
+    if (!validStatus(getStatus())) {
+        stopContinuousCarrier();
+        return false;
+    }
+    if ((rf_setup & 0x80) != 0) {
         cw_mode_ = CwMode::ContWave;
         hal_.ce(true);
         hal_.delayUs(150);
@@ -551,6 +602,10 @@ bool Nrf24::startContinuousCarrier(uint8_t channel, uint8_t rfPowerBits)
     const uint64_t start = hal_.nowUs();
     while ((hal_.nowUs() - start) < 2000) {
         const uint8_t status = getStatus();
+        if (!validStatus(status)) {
+            stopContinuousCarrier();
+            return false;
+        }
         if (status & (1 << 5)) {
             clearIrq(false, true, true);
 
@@ -646,4 +701,9 @@ bool Nrf24::lastTxTimedOut() const
 bool Nrf24::lastTxSawIrq() const
 {
     return last_tx_saw_irq_;
+}
+
+bool Nrf24::lastTxCommunicationFailed() const
+{
+    return last_tx_communication_failed_;
 }

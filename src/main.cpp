@@ -32,6 +32,7 @@
 #include "nvs_flash.h"
 
 #include "audio_packet.hpp"
+#include "app_status.hpp"
 #include "command_parser.hpp"
 #include "esp32_nrf24_hal.hpp"
 #include "file_transfer_service.hpp"
@@ -155,29 +156,6 @@ struct LoopConfig {
     uint8_t power_level = 3;
 };
 
-struct HttpStatusSnapshot {
-    const char* node_name = WifiControlConfig::kNodeName;
-    const char* hostname = WifiControlConfig::kNodeName;
-    const char* state_name = "Boot";
-    const char* selected_name = "";
-    uint8_t channel = 76;
-    int power_level = -1;
-    bool tx_ok = false;
-    bool tx_timeout = false;
-    bool rx_pending = false;
-    bool rpd = false;
-    uint32_t rx_packets = 0;
-    uint32_t rx_stream = 0;
-    uint32_t rx_raw = 0;
-    uint32_t rx_missing = 0;
-    uint32_t rx_duplicates = 0;
-    uint32_t rx_drain_limit_hits = 0;
-    uint32_t rx_saved = 0;
-    uint32_t rx_saved_bytes = 0;
-    uint32_t selected_bytes = 0;
-    int last_fault = 0;
-};
-
 struct IncomingFileStorage {
     uint32_t transfer_id = 0;
     std::string final_name;
@@ -185,19 +163,12 @@ struct IncomingFileStorage {
     std::FILE* file = nullptr;
 };
 
-struct ProtocolTransferReport {
-    ReliableTransferV2::SenderState state = ReliableTransferV2::SenderState::Idle;
-    ProtocolV2::ErrorCode error = ProtocolV2::ErrorCode::None;
-    uint32_t transfer_id = 0;
-    uint32_t bytes_transferred = 0;
-    uint32_t total_bytes = 0;
-    uint32_t current_sequence = 0;
-    uint32_t total_packets = 0;
-    uint32_t retry_count = 0;
-    uint32_t crc32 = 0;
-    uint64_t elapsed_ms = 0;
-    uint32_t throughput_bps = 0;
-    bool peer_complete = false;
+using ProtocolTransferReport = AppStatus::TransferReport;
+
+struct StatusMutex {
+    SemaphoreHandle_t handle = nullptr;
+    void lock() { (void)xSemaphoreTake(handle, portMAX_DELAY); }
+    void unlock() { xSemaphoreGive(handle); }
 };
 
 const char* loopModeName(LoopMode mode)
@@ -525,10 +496,26 @@ bool sendDataFile(RadioManager& manager,
                   FileTransfer::Service& transfer_service,
                   const char* path,
                   const std::atomic_bool* stop_requested = nullptr,
-                  ProtocolTransferReport* report = nullptr)
+                  ProtocolTransferReport* report = nullptr,
+                  void (*publish_status)(void*) = nullptr,
+                  void* publish_context = nullptr)
 {
+    const auto publish = [&]() {
+        if (publish_status) publish_status(publish_context);
+    };
+    if (report) {
+        *report = ProtocolTransferReport{};
+        report->preparing = true;
+    }
+    publish();
     std::FILE* file = std::fopen(path, "rb");
     if (!file) {
+        if (report) {
+            report->preparing = false;
+            report->state = ReliableTransferV2::SenderState::Failed;
+            report->error = ProtocolV2::ErrorCode::SourceRead;
+        }
+        publish();
         ESP_LOGE(TAG, "Could not open %s for reliable transfer: errno=%d", path, errno);
         return false;
     }
@@ -552,7 +539,29 @@ bool sendDataFile(RadioManager& manager,
     const uint64_t start_ms = monotonicMilliseconds();
     const FileTransfer::StartResult started =
         transfer_service.startTransfer(source, metadata, start_ms);
+    if (report) report->preparing = false;
     if (!started) {
+        if (report) {
+            report->state = ReliableTransferV2::SenderState::Failed;
+            switch (started.code) {
+                case FileTransfer::StartCode::Busy:
+                    report->error = ProtocolV2::ErrorCode::Busy;
+                    break;
+                case FileTransfer::StartCode::UnsupportedSize:
+                    report->error = ProtocolV2::ErrorCode::UnsupportedSize;
+                    break;
+                case FileTransfer::StartCode::LengthMismatch:
+                    report->error = ProtocolV2::ErrorCode::InvalidMetadata;
+                    break;
+                case FileTransfer::StartCode::SessionRejected:
+                    report->error = transfer_service.transportSender().error();
+                    break;
+                default:
+                    report->error = ProtocolV2::ErrorCode::SourceRead;
+                    break;
+            }
+        }
+        publish();
         std::fclose(file);
         ESP_LOGE(TAG,
                  "Protocol v2 source preparation failed for %s result=%u max_bytes=%lu",
@@ -564,6 +573,11 @@ bool sendDataFile(RadioManager& manager,
 
     const uint32_t transfer_id = started.transfer_id;
     ReliableTransferV2::SenderSession& sender = transfer_service.transportSender();
+    const auto refresh_report = [&]() {
+        updateTransferReport(report, transfer_service, monotonicMilliseconds(), start_ms);
+        publish();
+    };
+    refresh_report();
 
     ESP_LOGI(TAG,
              "Protocol v2 TX start id=%08lX bytes=%lu packets=%lu crc32=%08lX",
@@ -582,7 +596,7 @@ bool sendDataFile(RadioManager& manager,
         ProtocolV2::Frame outbound{};
         if (!sender.outboundFrame(outbound)) {
             (void)sender.tick(monotonicMilliseconds());
-            updateTransferReport(report, transfer_service, monotonicMilliseconds(), start_ms);
+            refresh_report();
             delayAtLeastMs(2);
             continue;
         }
@@ -603,7 +617,7 @@ bool sendDataFile(RadioManager& manager,
         const uint64_t send_time_ms = monotonicMilliseconds();
         if (!manager.sendPayload(outbound.data(), outbound.size())) {
             (void)sender.onTransportFailure(send_time_ms);
-            updateTransferReport(report, transfer_service, monotonicMilliseconds(), start_ms);
+            refresh_report();
             delayAtLeastMs(2);
             continue;
         }
@@ -619,7 +633,7 @@ bool sendDataFile(RadioManager& manager,
 
         if (!manager.enterRx()) {
             (void)sender.onTransportFailure(monotonicMilliseconds());
-            updateTransferReport(report, transfer_service, monotonicMilliseconds(), start_ms);
+            refresh_report();
             continue;
         }
 
@@ -658,6 +672,7 @@ bool sendDataFile(RadioManager& manager,
                              event == ReliableTransferV2::SenderEvent::Failed;
             }
             if (!leave_wait) {
+                refresh_report();
                 delayAtLeastMs(2);
             }
         }
@@ -665,11 +680,12 @@ bool sendDataFile(RadioManager& manager,
         if (manager.status().state == RadioState::RxListening && !manager.leaveRx()) {
             (void)sender.onTransportFailure(monotonicMilliseconds());
         }
-        updateTransferReport(report, transfer_service, monotonicMilliseconds(), start_ms);
+        refresh_report();
     }
 
     const uint64_t finish_ms = monotonicMilliseconds();
     updateTransferReport(report, transfer_service, finish_ms, start_ms);
+    publish();
     const uint64_t elapsed_ms = finish_ms >= start_ms ? finish_ms - start_ms : 0;
     const uint32_t throughput_bps = elapsed_ms == 0
                                         ? 0
@@ -743,6 +759,13 @@ public:
             return false;
         }
 
+        status_mutex_.handle = xSemaphoreCreateMutex();
+        if (!status_mutex_.handle) {
+            ESP_LOGE(TAG, "Failed to allocate status mutex");
+            return false;
+        }
+        status_cache_.selectFile(kDefaultFile, 0);
+
         std::setvbuf(stdin, nullptr, _IONBF, 0);
         std::setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -784,9 +807,10 @@ public:
         const std::vector<FileInfo> files = listFiles();
         if (!files.empty()) {
             FileInfo selected{};
-            if (!resolveFile(selected_file_, selected)) {
-                selected_file_ = files.front().name;
+            if (!resolveFile(selectedFileName(), selected)) {
+                selected = files.front();
             }
+            selectFile(selected);
         }
 
         if (xTaskCreate(&DemoConsoleApp::rxTaskEntry, "radio_rx", 4096, this, 4, &rx_task_) != pdPASS) {
@@ -831,7 +855,7 @@ public:
                  kWifiControlEnabled ? "enabled" : "disabled",
                  static_cast<unsigned long>(kTransferRateLimitBytesPerSecond));
         printHelp();
-        printFileTable(files, selected_file_);
+        printFileTable(files, selectedFileName());
         printStatus();
         return true;
     }
@@ -1443,7 +1467,52 @@ private:
 
     void giveRadio()
     {
+        publishStatusLocked();
         xSemaphoreGive(radio_mutex_);
+    }
+
+    // Called only by the radio owner. No SPI, file I/O or command/loop locking
+    // occurs while publishing, so status readers never wait for a transfer.
+    void publishStatusLocked()
+    {
+        AppStatus::RadioSnapshot snapshot{};
+        snapshot.radio = manager_.status();
+        snapshot.tx = last_tx_report_;
+        snapshot.updated_ms = monotonicMilliseconds();
+        snapshot.rx_pending = snapshot.radio.state == RadioState::RxListening &&
+                              (snapshot.radio.last_fifo_status & 0x01u) == 0;
+        snapshot.carrier_events = carrier_event_count_;
+        snapshot.rx_stream = decoded_rx_packet_count_;
+        snapshot.rx_raw = raw_rx_packet_count_;
+        snapshot.rx_missing = missing_rx_packet_count_;
+        snapshot.rx_duplicates = duplicate_rx_packet_count_;
+        snapshot.rx_drain_hits = rx_drain_limit_hit_count_;
+        snapshot.rx_saved = saved_rx_file_count_;
+        snapshot.rx_saved_bytes = saved_rx_byte_count_;
+        snapshot.receiver_state = receiver_.state();
+        snapshot.receiver_error = receiver_.error();
+        snapshot.receiver_id = receiver_.transferId();
+        snapshot.receiver_bytes = receiver_.acceptedBytes();
+        snapshot.receiver_total_bytes = receiver_.totalSize();
+        snapshot.receiver_sequence = receiver_.expectedSequence();
+        snapshot.receiver_packets = receiver_.totalPackets();
+        snapshot.receiver_crc = receiver_.calculatedCrc32();
+        status_cache_.publish(snapshot);
+    }
+
+    static void publishTransferStatusEntry(void* context)
+    {
+        static_cast<DemoConsoleApp*>(context)->publishStatusLocked();
+    }
+
+    std::string selectedFileName() const
+    {
+        return status_cache_.capture().selected_name;
+    }
+
+    void selectFile(const FileInfo& file)
+    {
+        status_cache_.selectFile(file.name, static_cast<uint32_t>(file.bytes));
     }
 
     bool takeCommand(TickType_t timeout = portMAX_DELAY)
@@ -1887,33 +1956,25 @@ private:
 
     void printStatus()
     {
-        // STATUS refreshes the live radio snapshot, then adds a live hasPendingRx()
-        // check when receive (RX) mode is active.
-        if (!takeRadio(pdMS_TO_TICKS(50))) {
-            std::printf("Could not read radio status right now.\n");
-            return;
-        }
-
-        manager_.refreshSnapshot();
-        const bool rx_pending =
-            manager_.status().state == RadioState::RxListening ? manager_.hasPendingRx() : false;
-        const RadioStatus status = manager_.status();
-        const uint32_t carrier_events = carrier_event_count_;
-        const uint32_t decoded_packets = decoded_rx_packet_count_;
-        const uint32_t raw_packets = raw_rx_packet_count_;
-        const uint32_t missing_packets = missing_rx_packet_count_;
-        const uint32_t duplicate_packets = duplicate_rx_packet_count_;
-        const uint32_t drain_limit_hits = rx_drain_limit_hit_count_;
-        const ProtocolTransferReport tx_report = last_tx_report_;
-        const ReliableTransferV2::ReceiverState receiver_state = receiver_.state();
-        const ProtocolV2::ErrorCode receiver_error = receiver_.error();
-        const uint32_t receiver_id = receiver_.transferId();
-        const uint32_t receiver_bytes = receiver_.acceptedBytes();
-        const uint32_t receiver_total_bytes = receiver_.totalSize();
-        const uint32_t receiver_sequence = receiver_.expectedSequence();
-        const uint32_t receiver_packets = receiver_.totalPackets();
-        const uint32_t receiver_crc = receiver_.calculatedCrc32();
-        giveRadio();
+        const AppStatus::Snapshot snapshot = status_cache_.capture();
+        const AppStatus::RadioSnapshot& cached = snapshot.status;
+        const RadioStatus& status = cached.radio;
+        const bool rx_pending = cached.rx_pending;
+        const uint32_t carrier_events = cached.carrier_events;
+        const uint32_t decoded_packets = cached.rx_stream;
+        const uint32_t raw_packets = cached.rx_raw;
+        const uint32_t missing_packets = cached.rx_missing;
+        const uint32_t duplicate_packets = cached.rx_duplicates;
+        const uint32_t drain_limit_hits = cached.rx_drain_hits;
+        const ProtocolTransferReport& tx_report = cached.tx;
+        const ReliableTransferV2::ReceiverState receiver_state = cached.receiver_state;
+        const ProtocolV2::ErrorCode receiver_error = cached.receiver_error;
+        const uint32_t receiver_id = cached.receiver_id;
+        const uint32_t receiver_bytes = cached.receiver_bytes;
+        const uint32_t receiver_total_bytes = cached.receiver_total_bytes;
+        const uint32_t receiver_sequence = cached.receiver_sequence;
+        const uint32_t receiver_packets = cached.receiver_packets;
+        const uint32_t receiver_crc = cached.receiver_crc;
         const LoopConfig loop = loopSnapshot();
         const char* irq_state =
             !status.irq_connected ? "disabled" : (status.irq_asserted ? "low" : "high");
@@ -1931,7 +1992,7 @@ private:
             std::printf("power=unknown ");
         }
         std::printf("selected=%s last_status=0x%02X fifo=0x%02X observe=0x%02X irq=%s tx_irq_seen=%s tx_ok=%s tx_timeout=%s rx_len=%u rx_packets=%u rx_stream=%u rx_raw=%u rx_missing=%u rx_duplicates=%u rx_drain_hits=%u rx_saved=%u rx_saved_bytes=%u carrier_events=%u fault=%d",
-                    selected_file_.c_str(),
+                    snapshot.selected_name.c_str(),
                     static_cast<unsigned>(status.last_status),
                     static_cast<unsigned>(status.last_fifo_status),
                     static_cast<unsigned>(status.last_observe_tx),
@@ -1946,8 +2007,8 @@ private:
                     static_cast<unsigned>(missing_packets),
                     static_cast<unsigned>(duplicate_packets),
                     static_cast<unsigned>(drain_limit_hits),
-                    static_cast<unsigned>(saved_rx_file_count_),
-                    static_cast<unsigned>(saved_rx_byte_count_),
+                    static_cast<unsigned>(cached.rx_saved),
+                    static_cast<unsigned>(cached.rx_saved_bytes),
                     static_cast<unsigned>(carrier_events),
                     status.last_fault);
         std::printf(" protocol=%u tx_id=%08lX tx_state=%s tx_bytes=%lu/%lu tx_seq=%lu/%lu tx_retries=%lu tx_error=%s tx_crc32=%08lX tx_elapsed_ms=%llu tx_bps=%lu peer_complete=%s rx_id=%08lX rx_state=%s rx_bytes=%lu/%lu rx_seq=%lu/%lu rx_error=%s rx_crc32=%08lX",
@@ -2012,83 +2073,11 @@ private:
         std::printf("\n");
     }
 
-    bool captureHttpStatus(HttpStatusSnapshot& out)
-    {
-        if (!takeRadio(pdMS_TO_TICKS(500))) {
-            return false;
-        }
-
-        manager_.refreshSnapshot();
-        const bool rx_pending =
-            manager_.status().state == RadioState::RxListening ? manager_.hasPendingRx() : false;
-        const RadioStatus status = manager_.status();
-        out.node_name = WifiControlConfig::kNodeName;
-        out.hostname = WifiControlConfig::kNodeName;
-        out.state_name = RadioManager::stateName(status.state);
-        out.selected_name = selected_file_.c_str();
-
-        size_t selected_bytes = 0;
-        if (statFileSize(buildFilePath(selected_file_), selected_bytes)) {
-            out.selected_bytes = static_cast<uint32_t>(selected_bytes);
-        }
-
-        out.channel = status.channel;
-        out.power_level = status.power_level;
-        out.tx_ok = status.last_tx_ok;
-        out.tx_timeout = status.last_tx_timed_out;
-        out.rx_packets = status.rx_packets;
-        out.rx_stream = decoded_rx_packet_count_;
-        out.rx_raw = raw_rx_packet_count_;
-        out.rx_missing = missing_rx_packet_count_;
-        out.rx_duplicates = duplicate_rx_packet_count_;
-        out.rx_drain_limit_hits = rx_drain_limit_hit_count_;
-        out.rx_saved = saved_rx_file_count_;
-        out.rx_saved_bytes = saved_rx_byte_count_;
-        out.last_fault = status.last_fault;
-        out.rx_pending = rx_pending;
-        out.rpd = status.carrier_detected;
-        giveRadio();
-        return true;
-    }
-
     std::string buildStatusJson()
     {
-        HttpStatusSnapshot snapshot{};
-        if (!captureHttpStatus(snapshot)) {
-            snapshot.state_name = "Unavailable";
-        }
-
-        std::string json;
-                appendFormat(json,
-                     "{\"node_name\":\"%s\",\"hostname\":\"%s\",\"state\":\"%s\",\"selected\":\"%s\",\"selected_bytes\":%u,"
-                     "\"channel\":%u,\"frequency_mhz\":%u,\"power\":%d,"
-                     "\"tx_ok\":%s,\"tx_timeout\":%s,\"rx_packets\":%u,"
-                     "\"rx_stream\":%u,\"rx_raw\":%u,\"rx_missing\":%u,\"rx_duplicates\":%u,"
-                     "\"rx_drain_hits\":%u,\"rx_saved\":%u,"
-                     "\"rx_saved_bytes\":%u,\"last_fault\":%d,"
-                     "\"rx_pending\":%s,\"rpd\":%s}",
-                     snapshot.node_name,
-                     snapshot.hostname,
-                     snapshot.state_name,
-                     snapshot.selected_name,
-                     static_cast<unsigned>(snapshot.selected_bytes),
-                     static_cast<unsigned>(snapshot.channel),
-                     static_cast<unsigned>(RadioChannel::frequencyMHz(snapshot.channel)),
-                     snapshot.power_level,
-                     snapshot.tx_ok ? "true" : "false",
-                     snapshot.tx_timeout ? "true" : "false",
-                     static_cast<unsigned>(snapshot.rx_packets),
-                     static_cast<unsigned>(snapshot.rx_stream),
-                     static_cast<unsigned>(snapshot.rx_raw),
-                     static_cast<unsigned>(snapshot.rx_missing),
-                     static_cast<unsigned>(snapshot.rx_duplicates),
-                     static_cast<unsigned>(snapshot.rx_drain_limit_hits),
-                     static_cast<unsigned>(snapshot.rx_saved),
-                     static_cast<unsigned>(snapshot.rx_saved_bytes),
-                     snapshot.last_fault,
-                     snapshot.rx_pending ? "true" : "false",
-                     snapshot.rpd ? "true" : "false");
-        return json;
+        return AppStatus::buildJson(status_cache_.capture(),
+                                    WifiControlConfig::kNodeName,
+                                    WifiControlConfig::kNodeName);
     }
 
     bool dispatchHttpCommand(const std::string& line)
@@ -2098,7 +2087,7 @@ private:
 
     bool commandFiles()
     {
-        printFileTable(listFiles(), selected_file_);
+        printFileTable(listFiles(), selectedFileName());
         return true;
     }
 
@@ -2118,9 +2107,9 @@ private:
             return false;
         }
 
-        selected_file_ = file.name;
+        selectFile(file);
         std::printf("Selected %s (%u bytes)\n",
-            selected_file_.c_str(),
+            file.name.c_str(),
             static_cast<unsigned>(file.bytes));
         return true;
     }
@@ -2142,7 +2131,7 @@ private:
 
                 bool infinite = true;
                 uint32_t loop_count = 0;
-                std::string request = selected_file_;
+                std::string request = selectedFileName();
 
                 if (words.size() >= 3) {
                     if (parseLoopCountToken(words[2], infinite, loop_count)) {
@@ -2170,7 +2159,7 @@ private:
                     return false;
                 }
 
-                selected_file_ = file.name;
+                selectFile(file);
                 loop_stop_requested_.store(false);
                 loop_config_ = LoopConfig{};
                 loop_config_.mode = LoopMode::Tx;
@@ -2195,7 +2184,7 @@ private:
 
         // Transmit (TX) either uses the explicitly requested file or the
         // currently selected default file.
-        const std::string request = words.size() >= 2 ? words[1] : selected_file_;
+        const std::string request = words.size() >= 2 ? words[1] : selectedFileName();
         FileInfo file{};
         if (!resolveFile(request, file)) {
             std::printf("File '%s' was not found in SPIFFS.\n", request.c_str());
@@ -2212,7 +2201,7 @@ private:
             return false;
         }
 
-        selected_file_ = file.name;
+        selectFile(file);
         loop_stop_requested_.store(false);
         loop_config_ = LoopConfig{};
         loop_config_.mode = LoopMode::Tx;
@@ -2964,7 +2953,9 @@ private:
                 transfer_service_,
                 path.c_str(),
                 &loop_stop_requested_,
-                &last_tx_report_);
+                &last_tx_report_,
+                &DemoConsoleApp::publishTransferStatusEntry,
+                this);
             status = manager_.status();
         }
         giveRadio();
@@ -3196,6 +3187,7 @@ private:
 
         if (decoded_status == ProtocolV2::DecodeStatus::Ok &&
             incoming.type == ProtocolV2::PacketType::Start &&
+            receiver_.active() &&
             receiver_.transferId() == incoming.transfer_id &&
             active_api_receive_id_ != incoming.transfer_id) {
             active_api_receive_id_ = incoming.transfer_id;
@@ -3312,10 +3304,12 @@ private:
     {
         // This background task is intentionally conservative:
         // - it tries to grab the mutex briefly
-        // - it only touches the radio when receive (RX) mode is active
+        // - it refreshes idle diagnostics at a bounded cadence
         // - it drains any queued packets before releasing the radio again
         // - it saves accepted payload streams into SPIFFS as completed files
         std::array<uint8_t, AudioPacket::kPacketBytes> payload{};
+        constexpr uint64_t kIdleDiagnosticPeriodMs = 250;
+        uint64_t last_diagnostic_ms = 0;
 
         while (true) {
             std::string remote_command;
@@ -3323,6 +3317,7 @@ private:
             if (takeRadio(pdMS_TO_TICKS(10))) {
                 if (manager_.status().state == RadioState::RxListening) {
                     manager_.refreshSnapshot();
+                    last_diagnostic_ms = monotonicMilliseconds();
                     const RadioStatus snapshot = manager_.status();
 
                     if (snapshot.carrier_detected && !last_carrier_detected_) {
@@ -3368,6 +3363,13 @@ private:
                     }
                 } else {
                     last_carrier_detected_ = false;
+                    const uint64_t now_ms = monotonicMilliseconds();
+                    if (now_ms - last_diagnostic_ms >= kIdleDiagnosticPeriodMs) {
+                        // Keep idle disconnect/register diagnostics current without
+                        // making a status request wait on SPI or the radio lock.
+                        manager_.refreshSnapshot();
+                        last_diagnostic_ms = now_ms;
+                    }
                 }
 
                 ProtocolV2::Frame timeout_response{};
@@ -3500,7 +3502,8 @@ private:
     TaskHandle_t loop_task_ = nullptr;         // Background TX/CW loop worker.
     TaskHandle_t wifi_control_task_ = nullptr; // Starts HTTP control off the event-task stack.
     SemaphoreHandle_t command_mutex_ = nullptr;  // Serializes local and remote command dispatch.
-    std::string selected_file_ = kDefaultFile;  // Default file used by transmit (TX).
+    StatusMutex status_mutex_{};              // Guards only cached, owned status values.
+    AppStatus::SnapshotCache<StatusMutex> status_cache_{status_mutex_};
     std::string last_morse_text_;              // Most recent MORSE text for STATUS output.
     bool last_carrier_detected_ = false;      // Edge detector for RPD logging while in RX.
     uint32_t carrier_event_count_ = 0;        // Number of distinct RPD-high events seen while listening.
