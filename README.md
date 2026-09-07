@@ -4,6 +4,14 @@ RF3 is an ESP-IDF firmware project for transferring arbitrary binary files
 over an nRF24L01+ radio. Audio files, including .u8 samples, remain supported
 as ordinary binary payloads.
 
+## Continuing development on another computer
+
+Start with [the project handoff](docs/project_handoff.md). It records the current
+branch, completed work, validation, and next steps. Read the
+[detailed phase guide](docs/firmware_roadmap.md) for the development plan, or its
+[PDF copy](docs/reports/RF3_Detailed_Phase_Guide.pdf). Repository instructions in
+`AGENTS.md` require these records to stay current as work proceeds.
+
 ## Capabilities
 
 - Protocol v2 START/READY, stop-and-wait DATA/ACK, and END/COMPLETE flow
