@@ -2,9 +2,33 @@
 
 This change started from `aa911c3` on the isolated
 `codex/phase-one-reliability` branch and was fast-forwarded into active branch
-`agent/rf3-pre-hardware-readiness` on 2026-09-07. Both hardware pin profiles are
-unchanged. No device was connected or flashed. The annotated rollback tag
+`agent/rf3-pre-hardware-readiness` on 2026-09-07. Both committed hardware pin
+profiles were unchanged in that implementation. No device was connected or
+flashed during that validation. The annotated rollback tag
 `rf3-before-phase-one-integration-20260907` preserves the pre-integration state.
+
+## Custom-PCB pin correction - 2026-09-10
+
+The laptop's previous local firmware used CE=17, CSN=27, IRQ=16. That local
+correction was absent from committed baseline `aa911c3` and the integrated
+Phase 1 source, which used CE=17, CSN=5, IRQ=27. After flashing Phase 1, the
+user reported custom-PCB startup `fault=1` (SPI register probe failure), while
+the devboard booted in Standby with `fault=0`. A successful custom-board probe
+after the correction is still required to establish hardware recovery.
+
+The user authorized restoring the previous local mapping. The firmware build
+flags, compile-time hardware profile, native pin assertions, offline handoff
+profile, and current pin documentation now agree on CE=17, CSN=27, IRQ=16.
+Devboard pins remain CE=27, CSN=5, IRQ=26. Reliability logic, SPI bus pins,
+partitions, and Wi-Fi defaults are unchanged. Do not use older custom-PCB
+packages that encode CSN=5 and IRQ=27. No Phase 2 work is part of this correction.
+
+The corrected source passed 211 native tests, 16 Python tests (including the
+offline handoff configuration checks), repository hygiene, whitespace checks,
+and the custom-PCB firmware build. The custom image is ready for upload; a
+successful on-board probe after reflashing is still unverified. Qualification,
+Wi-Fi validation, and complete offline image packages were not rerun for this
+pin-only correction. The broader results below describe September 7.
 
 ## Behavior
 

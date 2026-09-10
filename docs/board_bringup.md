@@ -59,8 +59,8 @@ If an existing `data/one.bin` differs, preparation stops rather than replacing i
 | Environment | `rf3_custom_pcb` | `rf3_esp32_devboard` |
 | Expected module/flash | ESP32-WROOM-32UE-N16, **16 MB** | ESP32-WROOM-32D, **4 MB** |
 | CE | GPIO17 | GPIO27 |
-| CSN | GPIO5 | GPIO5 |
-| IRQ (active low) | GPIO27 | GPIO26 |
+| CSN | GPIO27 | GPIO5 |
+| IRQ (active low) | GPIO16 | GPIO26 |
 | SCK / MOSI / MISO | GPIO18 / GPIO23 / GPIO19 | GPIO18 / GPIO23 / GPIO19 |
 | Bus | SPI3, mode 0, 1 MHz | Same |
 | Download/reset policy | **Manual**, `no_reset` before upload | Automatic reset when bridge circuitry supports it |
@@ -75,7 +75,8 @@ A successful build or user-specified `--flash_size` does not identify real flash
 
 1. **Power disconnected:** inspect orientation and soldering; continuity-check
    each signal in the table against the actual schematic and module pin legend.
-   Confirm common ground, no rail short, and that GPIO5's strap bias is preserved.
+   Confirm common ground and no rail short. On the devboard, also confirm that
+   GPIO5's strap bias is preserved; the custom PCB uses GPIO27 for CSN.
 2. **Power design:** use a regulated 3.3 V rail at the ESP32/radio circuitry,
    following the exact board and radio-module ratings. Espressif recommends a
    3.3 V source capable of at least 500 mA for the ESP32 supply design; add the
@@ -228,6 +229,11 @@ Until these gates have measured results, the defensible status is **software
 and host images prepared; physical implementation awaiting bench validation**.
 
 ## Recorded host preparation — 2026-08-30
+
+Historical evidence only: the custom-PCB images below use the superseded
+CE=17, CSN=5, IRQ=27 mapping. Regenerate packages from the corrected source
+before use. The current custom-PCB mapping is CE=17, CSN=27, IRQ=16; see
+[project_handoff.md](project_handoff.md) for the September 10 correction.
 
 The latest local package is `.pio/board_handoff/run-082dqd2z`, with
 `HOST_ARTIFACT_CHECKS_PASS` and `hardware_validated: false` in its manifest.

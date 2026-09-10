@@ -2,7 +2,7 @@
 
 This procedure applies to the current `rf3_custom_pcb` image on two custom
 ESP32-WROOM-32UE-N16 boards. Call them node A and node B. Do not flash the
-devboard environment onto the custom PCB: its CE and IRQ pins are different.
+devboard environment onto the custom PCB: its CE, CSN, and IRQ pins are different.
 
 Start with [board_bringup.md](board_bringup.md) for checked image preparation,
 manual BOOT/EN steps, separate sender/receiver filesystem images, and storage
@@ -68,8 +68,8 @@ available.
 **Action**
 
 Inspect both boards under magnification. Confirm module orientation and trace or
-continuity-check CE=GPIO17, CSN=GPIO5, SCK=GPIO18, MOSI=GPIO23, MISO=GPIO19,
-IRQ=GPIO27, 3.3 V, and ground. Check solder bridges, lifted pins, reversed
+continuity-check CE=GPIO17, CSN=GPIO27, SCK=GPIO18, MOSI=GPIO23, MISO=GPIO19,
+IRQ=GPIO16, 3.3 V, and ground. Check solder bridges, lifted pins, reversed
 headers, damaged coax/antenna connectors, and polarity. Measure 3.3 V-to-ground
 resistance after capacitors settle. Attach the correct antenna securely.
 
@@ -103,8 +103,8 @@ and point-to-point continuity, then repair or reconcile the PCB revision.
 
 **Purpose**
 
-Verify the 3.3 V rail and ensure the GPIO5 CSN connection does not prevent ESP32
-boot.
+Verify the 3.3 V rail and normal ESP32 boot with the radio connected. The custom
+PCB uses GPIO27 for CSN, not GPIO5.
 
 **Setup**
 
@@ -115,7 +115,7 @@ at the radio VCC/GND pins, not only at the regulator.
 **Action**
 
 Apply power, observe current and the 3.3 V rail through reset, then press reset
-five times. If available, scope the rail at the radio and GPIO5 during reset.
+five times. If available, scope the rail at the radio and EN during reset.
 Repeat on the second node.
 
 **Expected result**
@@ -139,12 +139,12 @@ brownout/reset loop, or boot behavior changing when the radio is installed.
 **Most likely causes**
 
 1. Supply/regulator/decoupling deficiency or short.
-2. GPIO5 held at an invalid strap level by assembly or module fault.
+2. Reset or boot-strapping signals held incorrectly by an assembly fault.
 3. USB cable or connector voltage drop.
 
 **Next diagnostic step**
 
-Power down, remove the radio, and repeat. If boot recovers, measure GPIO5 and the
+Power down, remove the radio, and repeat. If boot recovers, measure EN and the
 radio supply separately; if it does not, diagnose the ESP32 power/reset circuit.
 
 ## Stage 2 — ESP32 boot sanity
@@ -168,7 +168,7 @@ At the prompt enter `HELP`, `STATUS`, and `FILES`, then reset and repeat once.
 
 **Expected result**
 
-Startup identifies profile `custom-pcb`/node `rf3-pcb` and pins 17/5/27,
+Startup identifies profile `custom-pcb`/node `rf3-pcb` and pins 17/27/16,
 SPIFFS mounts, radio boot reports success or an explicit fault, HELP lists the
 current commands, STATUS returns one coherent line, and FILES lists assets.
 
@@ -204,8 +204,8 @@ attempting a link.
 
 **Setup**
 
-Connect a logic analyzer to GPIO18 SCK, GPIO23 MOSI, GPIO19 MISO, GPIO5 CSN,
-GPIO17 CE, GPIO27 IRQ, and ground on node A. Configure SPI decode as mode 0,
+Connect a logic analyzer to GPIO18 SCK, GPIO23 MOSI, GPIO19 MISO, GPIO27 CSN,
+GPIO17 CE, GPIO16 IRQ, and ground on node A. Configure SPI decode as mode 0,
 MSB-first. Keep leads short. Repeat later on B.
 
 **Action**

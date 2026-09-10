@@ -135,8 +135,8 @@ void test_hardware_profiles_preserve_distinct_supported_pinouts(void)
     constexpr HardwareProfile::Pins dev =
         HardwareProfile::pinsFor(HardwareProfile::Id::Esp32Devboard);
     TEST_ASSERT_EQUAL_INT(17, pcb.ce);
-    TEST_ASSERT_EQUAL_INT(5, pcb.csn);
-    TEST_ASSERT_EQUAL_INT(27, pcb.irq);
+    TEST_ASSERT_EQUAL_INT(27, pcb.csn);
+    TEST_ASSERT_EQUAL_INT(16, pcb.irq);
     TEST_ASSERT_EQUAL_INT(27, dev.ce);
     TEST_ASSERT_EQUAL_INT(5, dev.csn);
     TEST_ASSERT_EQUAL_INT(26, dev.irq);

@@ -20,7 +20,7 @@ from stage_demo_file import parse_partition_size, validate_transfer_size
 
 ROOT = Path(__file__).resolve().parent.parent
 PROFILES = {
-    "rf3_custom_pcb": {"id": 1, "flash_mb": 16, "ce": 17, "csn": 5, "irq": 27},
+    "rf3_custom_pcb": {"id": 1, "flash_mb": 16, "ce": 17, "csn": 27, "irq": 16},
     "rf3_esp32_devboard": {"id": 2, "flash_mb": 4, "ce": 27, "csn": 5, "irq": 26},
 }
 

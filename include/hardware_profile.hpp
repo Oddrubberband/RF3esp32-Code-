@@ -20,7 +20,7 @@ struct Pins {
 
 constexpr Pins pinsFor(Id id)
 {
-    return id == Id::CustomPcb ? Pins{17, 5, 27, 18, 23, 19}
+    return id == Id::CustomPcb ? Pins{17, 27, 16, 18, 23, 19}
                               : Pins{27, 5, 26, 18, 23, 19};
 }
 

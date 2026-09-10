@@ -31,7 +31,7 @@ Sources remain streamed with fixed bounded storage. SPIFFS-backed, generated cal
 
 | Profile | PlatformIO environment | CE | CSN | IRQ | SCK | MOSI | MISO |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Custom ESP32-WROOM-32UE-N16 PCB | `rf3_custom_pcb` | 17 | 5 | 27 | 18 | 23 | 19 |
+| Custom ESP32-WROOM-32UE-N16 PCB | `rf3_custom_pcb` | 17 | 27 | 16 | 18 | 23 | 19 |
 | ESP32 development board | `rf3_esp32_devboard` | 27 | 5 | 26 | 18 | 23 | 19 |
 
 Each environment selects exactly one compile-time profile. Static assertions reject incomplete, unsupported, or mismatched pin definitions. The Espressif PlatformIO platform is pinned to `platformio/espressif32@7.0.1`. The development-board SDK defaults were repaired so `kconfgen` and the complete build succeed.

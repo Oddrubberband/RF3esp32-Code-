@@ -18,7 +18,7 @@ identity, over-the-air interoperability, and real task stack margins are not yet
 proven.
 
 Use `rf3_custom_pcb` on the ESP32-WROOM-32UE-N16 PCB. The
-`rf3_esp32_devboard` profile has a deliberately different CE/IRQ pinout and a
+`rf3_esp32_devboard` profile has a deliberately different CE/CSN/IRQ pinout and a
 4 MB partition table.
 
 ## Reproducible toolchain
@@ -102,7 +102,7 @@ under live ESP-IDF scheduling.
 
 ## Audited firmware configuration
 
-- Custom PCB pins: CE 17, CSN 5, IRQ 27, SCK 18, MOSI 23, MISO 19.
+- Custom PCB pins: CE 17, CSN 27, IRQ 16, SCK 18, MOSI 23, MISO 19.
 - Devboard pins: CE 27, CSN 5, IRQ 26, SCK 18, MOSI 23, MISO 19.
 - SPI3, mode 0, 1 MHz.
 - nRF24 channel 76, five-byte address `52 46 33 24 01`, 250 kbit/s,
@@ -133,7 +133,7 @@ No Critical or High confirmed software defect was found.
 | Low | Confirmed defect | `data/README.md` | The active data documentation still described the retired v1 4-byte/28-byte packet layout and old receive filename width. | Updated to Protocol v2's 12-byte/20-byte DATA layout, maximum size, and eight-hex-digit receive names. |
 | Low | Strongly supported risk | `platformio.ini` and CI | Framework/tool versions below the platform layer were transitive, so a clean host could resolve a different compiler or image tool. | Fixed by pinning the resolved package set and tracking PlatformIO Core. |
 | Medium | Plausible concern requiring validation | ESP-IDF tasks in `src/main.cpp` | Main task is configured for 3,584 bytes and radio RX/loop tasks use 4,096 bytes. Current code fits and builds, but live stack margin is not measured. | Do not change speculatively. Record stack high-water marks during extended bench runs if resets/watchdogs occur. |
-| Medium | Plausible concern requiring validation | PCB power and GPIO5 CSN | PA+LNA modules have burst-current sensitivity; GPIO5 is also an ESP32 strapping pin. A radio module, PCB fault, or poor decoupling could disturb boot or RF operation. | Hardware inspection and rail/boot tests are first in the bench procedure. |
+| Medium | Plausible concern requiring validation | PCB power and devboard GPIO5 CSN | PA+LNA modules have burst-current sensitivity. The devboard uses GPIO5 CSN; the custom PCB uses GPIO27 CSN. A radio module, PCB fault, or poor decoupling could disturb boot or RF operation. | Hardware inspection and rail/boot tests are first in the bench procedure. |
 | Medium | Plausible concern requiring validation | `Nrf24::startContinuousCarrier` and real modules | Genuine and clone radios differ in continuous-carrier support; the driver includes a fallback but only an RF instrument can prove output. | Validate only after the packet link passes. |
 
 ## Confirmed working in software
@@ -168,7 +168,7 @@ what builds, static inspection, and host simulation establish.
 
 - PCB assembly correctness, pin continuity, radio orientation, and common ground.
 - 3.3 V rail droop/noise during PA transmit bursts and adequate local bypassing.
-- GPIO5 boot-strap level with the actual CSN circuit/module attached.
+- Devboard GPIO5 boot-strap level with its CSN circuit/module attached.
 - SPI waveforms and register readback from each physical nRF24.
 - Whether both modules are genuine/compatible at the configured 250 kbit/s.
 - IRQ electrical behavior, antenna/connector health, radiated power, packet

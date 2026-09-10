@@ -1,8 +1,37 @@
 # RF3 project handoff - start here
 
-Last substantive documentation update: 2026-09-07.
+Last substantive documentation update: 2026-09-10.
 
 ## Current state
+
+### Laptop pin correction - 2026-09-10
+
+The current correction is on local branch `codex/phase-one-laptop`, based on
+`5a22f91`. The separate older active checkout and its uncommitted changes are
+preserved. This correction is recorded locally with this handoff update; it has
+not been pushed. Use `git log -1 --oneline` for its final commit.
+
+The user reported uploading Phase 1 to both boards. The devboard boot log shows
+`Radio boot OK`, Standby, and `fault=0`; the custom PCB reports startup `fault=1`
+with SPIFFS mounted. This is startup evidence only, not a successful RF transfer.
+
+The previous local custom-PCB firmware uses CE=17, CSN=27, IRQ=16. The committed
+Phase 1 baseline instead preserved CE=17, CSN=5, IRQ=27. On the user's direction,
+the custom-PCB build flags, checked hardware profile, native expectations,
+offline handoff profile, and current pin documentation now restore **CE=17,
+CSN=27, IRQ=16**. The devboard remains **CE=27, CSN=5, IRQ=26**; both use
+SCK=18, MOSI=23, MISO=19. The prior statement that the preserved committed pins
+were sufficient for this laptop's custom PCB was incorrect.
+
+Fresh validation passed 211 native tests, 16 Python tests (including the offline
+handoff configuration checks), repository hygiene, whitespace checks, and the
+custom-PCB firmware build. The corrected firmware has not been flashed, and
+radio recovery is unverified. Phase 2 and all later work remain paused at the
+user's request. Next: upload custom-PCB firmware only,
+then capture its startup pin line and radio probe result. Existing SPIFFS files
+should be preserved. Earlier custom-PCB images with CSN=5/IRQ=27 are superseded.
+
+### Integrated baseline - 2026-09-07
 
 - Active development branch: `agent/rf3-pre-hardware-readiness`.
 - Phase 1 firmware implementation: `6ba0315276a46c27e15a4b7cde044c1c8764d14c`
@@ -14,8 +43,9 @@ Last substantive documentation update: 2026-09-07.
   validated. It has not been flashed to or exercised on hardware.
 - The annotated rollback tag `rf3-before-phase-one-integration-20260907` points
   to pre-integration revision `aa911c3`.
-- The existing code pinout is correct according to the user. Both pin profiles,
-  tracked Wi-Fi defaults, partitions, and board definitions were preserved.
+- Both committed pin profiles, tracked Wi-Fi defaults, partitions, and board
+  definitions were preserved then. The laptop-specific custom-PCB pin
+  correction above supersedes the prior pinout assumption.
 - Phases 2-7 are plans. The full browser file manager and SoftAP file workflow
   have not been implemented.
 - This handoff refresh records integration and fresh validation; it changes no
@@ -75,15 +105,12 @@ changes using the commands in the Phase 1 document.
 
 ## Next concrete work
 
-Establish the Phase 2 hardware baseline under the user's hardware authorization.
-Record board identity, firmware revision, power/link conditions, byte-comparison
-results, failure behavior, retries, and measured timing. Start small and test
-both directions. Investigate reported power instability with measurements. Do
-not treat host simulation time as physical RF throughput.
-
-Host-side Phase 3 storage design can proceed while a board issue is investigated,
-but the Phase 5 release requires real-board evidence. Do not begin later phases
-just because the current request was to document them.
+Finish the custom-PCB pin correction and its firmware/startup verification.
+Phase 2 and later work are paused. The user's requested future sequence is
+Measurement Foundation, then the physical RF/power baseline; the older phase
+guide's numbering and permission to overlap storage work do not override that
+instruction. Do not begin storage, browser, protocol extensions, resume,
+Bluetooth, or optimization during this correction.
 
 ## Resume on the laptop
 
