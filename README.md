@@ -4,6 +4,16 @@ RF3 is an ESP-IDF firmware project for transferring arbitrary binary files
 over an nRF24L01+ radio. Audio files, including .u8 samples, remain supported
 as ordinary binary payloads.
 
+## Choose the right README
+
+- [Beginner README](README_BEGINNER.md) explains the boards, terminology,
+  setup, flashing, first transfer, storage commands, and troubleshooting from
+  the beginning.
+- [Technical README](README_TECHNICAL.md) documents the architecture, hardware
+  profiles, RF configuration, Protocol v2 flow, concurrency, reliability
+  behavior, validation, and current engineering limits.
+- This README remains the compact project entry point.
+
 ## Continuing development on another computer
 
 Start with [the project handoff](docs/project_handoff.md). It records the current
@@ -136,6 +146,7 @@ the radio and returns `{"preview":true,"channel":76,"frequency_mhz":2476}`.
 `frequency_mhz` alongside the active `channel`. No web page is served by the
 firmware; these are JSON API endpoints. Wi-Fi remains disabled by default.
 
-See docs/build_and_test.md, docs/pre_hardware_readiness.md,
+See README_BEGINNER.md, README_TECHNICAL.md, docs/build_and_test.md,
+docs/pre_hardware_readiness.md,
 docs/hardware_validation.md, docs/file_transfer_api.md, docs/protocol_v2.md,
 and docs/security.md for integration and validation details.

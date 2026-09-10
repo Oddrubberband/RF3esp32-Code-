@@ -1,10 +1,11 @@
 # RF3 physical-board handoff
 
-**Ready for controlled bring-up preparation, not yet hardware-qualified.** The
-software qualification passed, but no physical RF link has been demonstrated.
-There is no PCB schematic/layout or module-specific PA+LNA datasheet in this
-repository, and no identifiable USB ESP32 board was found on this host during
-the 2026-08-30 review. Do not infer a board port from the generic COM1 entry.
+**One physical Phase 1 transfer has passed; broader hardware qualification is
+still incomplete.** The current evidence is recorded in
+[project_handoff.md](project_handoff.md). There is no PCB schematic/layout or
+module-specific PA+LNA datasheet in this repository, and no identifiable USB
+ESP32 board was found on the earlier 2026-08-30 review host. Do not infer a
+board port from an unrelated or generic COM entry.
 
 The first hardware release gates are the actual PCB revision/pinout, exact ESP32
 module/flash size, radio module model, regulator/current budget, and antenna
@@ -190,11 +191,12 @@ ordered test campaign, and record observations in [board_bench_log.csv](board_be
 ## 6. Receiver storage is a test constraint
 
 The devboard SPIFFS partition is **2,555,904 bytes**. Staging both existing audio
-files and receiving another 1,112,701-byte song exceeds even that raw capacity.
+files and receiving another 1,112,701-byte song exceeds the safe capacity.
 Use the lean receiver image for both profiles, and test one large transfer at a
-time on the devboard. Valid received files accumulate; there is no console file
-delete command. Preserve evidence before deliberately refreshing the receiver
-filesystem. Do not run indefinite loops with large files.
+time on the devboard. Valid received files accumulate. Use `FS INFO` to inspect
+safe capacity, `FS LIST ALL` to inspect internal files, and `FS DELETE <file>`
+to remove a visible file deliberately. Preserve evidence before deletion or
+formatting. Do not run indefinite loops with large files.
 
 Espressif notes that SPIFFS reliably uses roughly 75% of its partition, writes
 can pause for garbage collection, and power interruption can corrupt it.
@@ -225,8 +227,8 @@ for each command when needed; do not overwrite earlier captures.
   validated as required by the project. CW is not a prerequisite for the first
   packet test and must stay off until an appropriate controlled test is ready.
 
-Until these gates have measured results, the defensible status is **software
-and host images prepared; physical implementation awaiting bench validation**.
+Until these gates have measured results, the defensible status is **one
+successful physical file transfer recorded; full bench qualification pending**.
 
 ## Recorded host preparation — 2026-08-30
 

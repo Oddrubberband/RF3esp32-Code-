@@ -119,13 +119,15 @@ warning for Phase 1.
 
 ## Read in this order
 
-1. [Detailed phase guide](firmware_roadmap.md) - all seven phases, dependencies,
+1. [Beginner README](../README_BEGINNER.md) or
+   [technical README](../README_TECHNICAL.md), depending on the reader.
+2. [Detailed phase guide](firmware_roadmap.md) - all seven phases, dependencies,
    work packages, deliverables, failure cases, and completion gates.
-2. [PDF phase guide](reports/RF3_Detailed_Phase_Guide.pdf) - portable reading copy.
-3. [Phase 1 implementation and validation](phase_one_reliability.md).
-4. [Board bring-up](board_bringup.md) and
+3. [PDF phase guide](reports/RF3_Detailed_Phase_Guide.pdf) - portable reading copy.
+4. [Phase 1 implementation and validation](phase_one_reliability.md).
+5. [Board bring-up](board_bringup.md) and
    [qualification specification](firmware_qualification.md) for Phase 2.
-5. [Historical optimization handoff](rf3_transfer_optimization_handoff.md) for
+6. [Historical optimization handoff](rf3_transfer_optimization_handoff.md) for
    earlier implementation context. Its branch/revision statements are historical.
 
 ## What Phase 1 changed
