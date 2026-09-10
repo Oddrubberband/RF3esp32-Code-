@@ -48,14 +48,16 @@ STATUS=0x0E, FIFO_STATUS=0x11, and IRQ high. Treat this as an unresolved false
 or transient RX fault classification; it did not invalidate the already
 verified file. Correct it before Phase 2. Reverse-direction and repeated
 hardware transfers remain unrecorded. Phase 2 and all later feature work remain
-paused. The synchronization state is updated after the GitHub push below.
+paused. Branch `codex/phase-one-laptop` is published to `origin` at
+`https://github.com/Oddrubberband/RF3esp32-Code-.git` and is the current
+cross-PC Phase 1 handoff.
 
 ### Laptop pin correction - 2026-09-10
 
-Pin correction `74654ce` is on local branch `codex/phase-one-laptop`, based on
+Pin correction `74654ce` is on branch `codex/phase-one-laptop`, based on
 `5a22f91`. The separate older active checkout and its uncommitted changes are
-preserved. The correction and these notes are committed locally; no push was
-performed in this session. Use `git log -2 --oneline` for the latest revisions.
+preserved. The correction was initially local-only but is now included in the
+published branch. Use `git log -3 --oneline` for the latest revisions.
 
 The user reported uploading Phase 1 to both boards. The devboard boot log shows
 `Radio boot OK`, Standby, and `fault=0`. The custom PCB initially reported
@@ -105,12 +107,15 @@ assuming the implementation commit above is also the current branch tip.
 Confirm remote availability with the steps below; a local commit is not proof
 that another computer has it.
 
-Synchronization at this handoff: work is local; no remote push was performed.
+Historical synchronization state at the September 7 handoff: no remote push
+had been performed.
 Before this handoff commit, the active branch was three commits ahead of its
 local `origin/agent/rf3-pre-hardware-readiness` tracking ref at `5300d40` and
 zero commits behind. The handoff commit adds one more local commit. A local
 tracking ref is not proof that the remote server has the work. Push explicitly
-or create a fresh Git bundle before moving to another computer.
+or create a fresh Git bundle before moving to another computer. The current
+published `codex/phase-one-laptop` state above supersedes this historical
+warning for Phase 1.
 
 ## Read in this order
 
@@ -196,7 +201,7 @@ configuring a GitHub remote. The bundle does not include uncommitted files,
 ignored build artifacts, or credentials. To recreate it on the source computer
 after committing later work, rerun the bundle creation command above.
 
-Alternatively, if the branch has subsequently been pushed, use the remote:
+The current Phase 1 branch is published. Use the remote:
 
 The repository remote is `https://github.com/Oddrubberband/RF3esp32-Code-.git`.
 From an existing clone, inspect its working tree before switching anything:
@@ -204,7 +209,7 @@ From an existing clone, inspect its working tree before switching anything:
 ```sh
 git status --short
 git fetch origin
-git log -3 --oneline origin/agent/rf3-pre-hardware-readiness
+git log -3 --oneline origin/codex/phase-one-laptop
 ```
 
 If that remote branch is absent, the branch has not reached this clone's remote;
@@ -213,7 +218,7 @@ To preserve the laptop's active checkout, create another worktree using an
 unused local branch name:
 
 ```sh
-git worktree add -b codex/phase-one-laptop ../rf3-phase-one-laptop origin/agent/rf3-pre-hardware-readiness
+git worktree add -b codex/phase-one-laptop ../rf3-phase-one-laptop origin/codex/phase-one-laptop
 ```
 
 If the laptop worktree or branch already exists, inspect and reuse it rather
