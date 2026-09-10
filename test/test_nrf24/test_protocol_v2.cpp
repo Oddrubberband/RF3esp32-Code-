@@ -762,6 +762,20 @@ void test_protocol_v2_receiver_storage_failures_preserve_existing_completed_file
     const Metadata metadata = inspect(source);
     Frame response{};
 
+    FakeSink no_space;
+    no_space.prepare_result =
+        ReliableTransferV2::SinkPrepareResult::InsufficientStorage;
+    ReceiverSession capacity_checked(&no_space, sinkCallbacks());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ReceiverEvent::Failed),
+                          static_cast<int>(capacity_checked.onPacket(
+                              startPacket(49, metadata), 0, response)));
+    const Packet rejected = decoded(response);
+    TEST_ASSERT_FALSE(rejected.accepted);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::InsufficientStorage),
+                          static_cast<int>(rejected.error));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::InsufficientStorage),
+                          static_cast<int>(capacity_checked.error()));
+
     FakeSink open_fail;
     open_fail.prepare_result = ReliableTransferV2::SinkPrepareResult::OpenFailed;
     ReceiverSession first(&open_fail, sinkCallbacks());
@@ -1415,6 +1429,23 @@ void test_protocol_v2_corrupted_data_is_detected_by_end_to_end_crc()
     TEST_ASSERT_FALSE(sink.partial_exists);
 }
 
+void test_protocol_v2_default_data_retry_budget_exceeds_control_budget()
+{
+    FakeSource source;
+    source.generated = true;
+    source.generated_size = 1;
+    FakeSink sink;
+    Harness harness(source, sink);
+    const uint32_t dropped_acks =
+        static_cast<uint32_t>(ProtocolV2::kMaximumControlRetries) + 1u;
+    TEST_ASSERT_TRUE(harness.transport.addRule(dropRule(
+        Destination::Sender, PacketType::Ack, 0, false, dropped_acks)));
+    TEST_ASSERT_TRUE(harness.begin());
+    TEST_ASSERT_TRUE(harness.run());
+    assertSuccessfulTransfer(harness);
+    TEST_ASSERT_EQUAL_UINT32(dropped_acks, harness.sender.totalRetries());
+}
+
 void test_protocol_v2_retry_exhaustion_fails_without_publication()
 {
     FakeSource source;
@@ -1424,7 +1455,7 @@ void test_protocol_v2_retry_exhaustion_fails_without_publication()
     Harness harness(source, sink);
     TEST_ASSERT_TRUE(harness.transport.addRule(dropRule(
         Destination::Sender, PacketType::Ack, 0, false,
-        static_cast<uint32_t>(ProtocolV2::kMaximumRetries) + 1u)));
+        static_cast<uint32_t>(ProtocolV2::kMaximumDataRetries) + 1u)));
     TEST_ASSERT_TRUE(harness.begin());
     TEST_ASSERT_FALSE(harness.run());
     TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::RetryExhausted),
@@ -1635,6 +1666,7 @@ void runProtocolV2Tests()
     RUN_TEST(test_protocol_v2_retry_budget_resets_per_packet_not_per_file);
     RUN_TEST(test_protocol_v2_duplicate_start_data_ack_and_end_are_idempotent);
     RUN_TEST(test_protocol_v2_corrupted_data_is_detected_by_end_to_end_crc);
+    RUN_TEST(test_protocol_v2_default_data_retry_budget_exceeds_control_budget);
     RUN_TEST(test_protocol_v2_retry_exhaustion_fails_without_publication);
     RUN_TEST(test_protocol_v2_delay_and_reordering_support_is_deterministic);
     RUN_TEST(test_protocol_v2_nonprogress_traffic_does_not_extend_receiver_timeout);

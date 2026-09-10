@@ -12,6 +12,33 @@ standing instruction and full table are at the top of [AGENTS.md](../AGENTS.md).
 
 ## Current state
 
+### Phase 1 capability restoration - 2026-09-10
+
+Branch `codex/phase-one-laptop` now combines the Phase 1 correctness fixes and
+authoritative pin mapping with every source capability added in the preserved
+pre-Phase-1 working firmware. Restored items are the local serial filesystem
+controls, receive-capacity guard and explicit InsufficientStorage response,
+separate control/DATA retry budgets, TX/RX 10-percent progress reporting,
+detailed short-write diagnostics, and readable multiline STATUS. The serial
+STATUS implementation still reads Phase 1's owned cache and does not reacquire
+the radio lock. Filename and saved-file references from the older implementation
+were adapted to the cache rather than restoring unsafe borrowed state.
+
+A parity check accounted for all 308 nonblank main.cpp additions from the
+pre-Phase-1 working tree: 300 remain verbatim and eight were replaced by the
+safe cached-selection/counter equivalents. The protocol and file-transfer
+helper changes match the earlier implementation, while Phase 1 adds its newer
+fault detection, cleanup propagation, four-entry completion replay, status
+snapshot, and JSON protections.
+
+Fresh checks passed 213 native tests, 16 Python tests, all 264 software
+qualification cases, both firmware builds, both SPIFFS builds, repository
+hygiene, and whitespace validation. The restored firmware has not been flashed;
+the prior custom-PCB Standby/fault=0 screenshot applies to the preceding pin-fix
+build. Phase 2 and all later feature work remain paused. At this point these
+changes are local pending the GitHub push recorded by the next synchronization
+update.
+
 ### Laptop pin correction - 2026-09-10
 
 Pin correction `74654ce` is on local branch `codex/phase-one-laptop`, based on

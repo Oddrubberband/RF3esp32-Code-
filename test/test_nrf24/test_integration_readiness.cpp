@@ -128,6 +128,25 @@ void test_generic_transfer_default_rate_limit_is_disabled(void)
     TEST_ASSERT_EQUAL_UINT32(4, TransferRateLimiter::delayMilliseconds(28, 8000));
 }
 
+void test_fileTransfer_progress_milestones_are_bounded_deciles(void)
+{
+    TEST_ASSERT_EQUAL_UINT8(0, FileTransfer::progressMilestonePercent(0, 0));
+    TEST_ASSERT_EQUAL_UINT8(0, FileTransfer::progressMilestonePercent(1, 0));
+    TEST_ASSERT_EQUAL_UINT8(0, FileTransfer::progressMilestonePercent(0, 1));
+    TEST_ASSERT_EQUAL_UINT8(100, FileTransfer::progressMilestonePercent(1, 1));
+    TEST_ASSERT_EQUAL_UINT8(0, FileTransfer::progressMilestonePercent(9, 100));
+    TEST_ASSERT_EQUAL_UINT8(10, FileTransfer::progressMilestonePercent(10, 100));
+    TEST_ASSERT_EQUAL_UINT8(50, FileTransfer::progressMilestonePercent(59, 100));
+    TEST_ASSERT_EQUAL_UINT8(90, FileTransfer::progressMilestonePercent(99, 100));
+    TEST_ASSERT_EQUAL_UINT8(100, FileTransfer::progressMilestonePercent(100, 100));
+    TEST_ASSERT_EQUAL_UINT8(100, FileTransfer::progressMilestonePercent(101, 100));
+    TEST_ASSERT_EQUAL_UINT8(
+        100, FileTransfer::progressMilestonePercent(UINT32_MAX, UINT32_MAX));
+    TEST_ASSERT_EQUAL_UINT64(250, FileTransfer::safeReceiveCapacity(1000, 500));
+    TEST_ASSERT_EQUAL_UINT64(0, FileTransfer::safeReceiveCapacity(1000, 750));
+    TEST_ASSERT_EQUAL_UINT64(0, FileTransfer::safeReceiveCapacity(1000, 900));
+}
+
 void test_hardware_profiles_preserve_distinct_supported_pinouts(void)
 {
     constexpr HardwareProfile::Pins pcb =
@@ -156,5 +175,6 @@ void runIntegrationReadinessTests()
     RUN_TEST(test_fileTransfer_cancel_targets_active_transfer_id);
     RUN_TEST(test_fileTransfer_receive_handler_runs_after_verified_publication);
     RUN_TEST(test_generic_transfer_default_rate_limit_is_disabled);
+    RUN_TEST(test_fileTransfer_progress_milestones_are_bounded_deciles);
     RUN_TEST(test_hardware_profiles_preserve_distinct_supported_pinouts);
 }

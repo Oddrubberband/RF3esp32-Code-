@@ -21,12 +21,19 @@ constexpr uint32_t kMaxFileSize = kMaxPacketCount * kDataPayloadCapacity;
 
 constexpr uint32_t kControlResponseTimeoutMs = 500;
 constexpr uint32_t kDataAckTimeoutMs = 250;
-constexpr uint8_t kMaximumRetries = 5;
+constexpr uint8_t kMaximumControlRetries = 5;
+constexpr uint8_t kMaximumDataRetries = 20;
+// Compatibility alias for callers that used the original single retry budget.
+constexpr uint8_t kMaximumRetries = kMaximumControlRetries;
 constexpr uint32_t kReceiverInactivityTimeoutMs = 10000;
 constexpr uint32_t kSenderInactivityTimeoutMs = 10000;
 
 static_assert(kFrameSize == 32, "Protocol v2 must use fixed 32-byte frames");
 static_assert(kDataPayloadCapacity == 20, "Protocol v2 DATA capacity changed");
+static_assert((static_cast<uint32_t>(kMaximumDataRetries) + 1u) *
+                      kDataAckTimeoutMs <
+                  kSenderInactivityTimeoutMs,
+              "DATA retry window must remain below sender inactivity timeout");
 static_assert(kMaxFileSize == 1310720u, "Protocol v2 file-size limit changed");
 
 using Frame = std::array<uint8_t, kFrameSize>;
@@ -67,12 +74,13 @@ enum class ErrorCode : uint8_t {
     ByteCountMismatch = 20,
     TransportFailure = 21,
     StateViolation = 22,
+    InsufficientStorage = 23,
 };
 
 inline bool isKnownErrorCode(ErrorCode error)
 {
     return static_cast<uint8_t>(error) <=
-           static_cast<uint8_t>(ErrorCode::StateViolation);
+           static_cast<uint8_t>(ErrorCode::InsufficientStorage);
 }
 
 enum class DecodeStatus {
@@ -521,6 +529,7 @@ inline const char* errorName(ErrorCode error)
         case ErrorCode::ByteCountMismatch: return "byte-count-mismatch";
         case ErrorCode::TransportFailure: return "transport-failure";
         case ErrorCode::StateViolation: return "state-violation";
+        case ErrorCode::InsufficientStorage: return "insufficient-storage";
         default: return "unknown";
     }
 }

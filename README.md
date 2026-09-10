@@ -88,6 +88,13 @@ validates replacement and capacity behavior, and checks the SPIFFS image fit.
 
 The serial console supports HELP, STATUS, STOP, FILES, SELECT, TX, TX LOOP,
 MORSE, RX, STANDBY, SLEEP, WAKE, POWERDOWN, CHANNEL, CW START, and CW LOOP.
+The retained local filesystem controls are FS INFO, FS LIST ALL, FS DELETE
+<file>, FS CLEAN PARTIALS, and the deliberately explicit FS FORMAT CONFIRM.
+Filesystem mutation is not accepted through the RF remote-command path.
+
+STATUS is a readable multiline snapshot and remains nonblocking with respect
+to long-held radio ownership. TX and RX print accepted-byte progress at each
+10-percent milestone with packet counts, retries where applicable, and rate.
 If SPIFFS or the radio is unavailable, the console remains available and
 reports the failed subsystem.
 

@@ -306,21 +306,20 @@ bool resolveFile(std::string request, FileInfo& out)
     return false;
 }
 
-std::vector<FileInfo> listFiles()
+std::vector<FileInfo> listAllFiles(bool* scan_ok = nullptr)
 {
     std::vector<FileInfo> files;
+    if (scan_ok) {
+        *scan_ok = false;
+    }
     DIR* dir = opendir(kSpiffsRoot);
     if (!dir) {
         return files;
     }
 
     while (dirent* entry = readdir(dir)) {
-        if (entry->d_name[0] == '.') {
-            continue;
-        }
-
         const std::string name(entry->d_name);
-        if (ReliableTransferV2::isInternalTransferName(name)) {
+        if (name == "." || name == "..") {
             continue;
         }
 
@@ -333,9 +332,24 @@ std::vector<FileInfo> listFiles()
     }
 
     closedir(dir);
+    if (scan_ok) {
+        *scan_ok = true;
+    }
     std::sort(files.begin(), files.end(), [](const FileInfo& lhs, const FileInfo& rhs) {
         return lhs.name < rhs.name;
     });
+    return files;
+}
+
+std::vector<FileInfo> listFiles()
+{
+    std::vector<FileInfo> files;
+    for (const FileInfo& file : listAllFiles()) {
+        if (!file.name.empty() && file.name.front() != '.' &&
+            !ReliableTransferV2::isInternalTransferName(file.name)) {
+            files.push_back(file);
+        }
+    }
     return files;
 }
 
@@ -587,6 +601,7 @@ bool sendDataFile(RadioManager& manager,
              static_cast<unsigned long>(sender.crc32()));
 
     bool cancellation_started = false;
+    uint8_t last_tx_progress_percent = 0;
     while (!sender.terminal()) {
         if (stop_requested && stop_requested->load() && !cancellation_started) {
             cancellation_started = true;
@@ -681,6 +696,30 @@ bool sendDataFile(RadioManager& manager,
             (void)sender.onTransportFailure(monotonicMilliseconds());
         }
         refresh_report();
+
+        const uint8_t progress_percent = FileTransfer::progressMilestonePercent(
+            sender.acknowledgedBytes(), sender.totalSize());
+        if (progress_percent > last_tx_progress_percent) {
+            last_tx_progress_percent = progress_percent;
+            const uint64_t progress_now_ms = monotonicMilliseconds();
+            const uint64_t progress_elapsed_ms =
+                progress_now_ms >= start_ms ? progress_now_ms - start_ms : 0;
+            const uint32_t progress_rate_bps = progress_elapsed_ms == 0
+                ? 0
+                : static_cast<uint32_t>(
+                      (static_cast<uint64_t>(sender.acknowledgedBytes()) * 1000u) /
+                      progress_elapsed_ms);
+            ESP_LOGI(TAG,
+                     "TX progress id=%08lX %u%% | bytes=%lu/%lu | packets=%lu/%lu | retries=%lu | rate=%lu B/s",
+                     static_cast<unsigned long>(transfer_id),
+                     static_cast<unsigned>(progress_percent),
+                     static_cast<unsigned long>(sender.acknowledgedBytes()),
+                     static_cast<unsigned long>(sender.totalSize()),
+                     static_cast<unsigned long>(sender.acknowledgedPackets()),
+                     static_cast<unsigned long>(sender.totalPackets()),
+                     static_cast<unsigned long>(sender.totalRetries()),
+                     static_cast<unsigned long>(progress_rate_bps));
+        }
     }
 
     const uint64_t finish_ms = monotonicMilliseconds();
@@ -842,12 +881,13 @@ public:
         }
 
         ESP_LOGI(TAG,
-                 "Reliable file protocol v%u: frame=%u data=%u max_file=%lu retries=%u",
+                 "Reliable file protocol v%u: frame=%u data=%u max_file=%lu retries=control:%u,data:%u",
                  static_cast<unsigned>(ProtocolV2::kVersion),
                  static_cast<unsigned>(ProtocolV2::kFrameSize),
                  static_cast<unsigned>(ProtocolV2::kDataPayloadCapacity),
                  static_cast<unsigned long>(ProtocolV2::kMaxFileSize),
-                 static_cast<unsigned>(ProtocolV2::kMaximumRetries));
+                 static_cast<unsigned>(ProtocolV2::kMaximumControlRetries),
+                 static_cast<unsigned>(ProtocolV2::kMaximumDataRetries));
         ESP_LOGI(TAG,
                  "Build profile=%s filesystem=%s HTTP-control=%s transfer-rate-limit=%lu B/s",
                  HardwareProfile::kSelectedName,
@@ -1437,6 +1477,11 @@ private:
             "  STATUS               Show radio state and selected file\n"
             "  STOP                 Stop any active TX/CW/Morse/RX and return to standby\n"
             "  FILES                List staged files in SPIFFS\n"
+            "  FS INFO              Reconcile SPIFFS usage with every file\n"
+            "  FS LIST ALL          List visible, hidden, and internal files\n"
+            "  FS DELETE <file>     Delete one visible file from SPIFFS\n"
+            "  FS CLEAN PARTIALS    Delete stale internal receive fragments\n"
+            "  FS FORMAT CONFIRM    Erase every file in SPIFFS\n"
             "  SELECT <file>        Choose which staged file TX will send\n"
             "  TX [file]            Start sending the selected or named file\n"
             "  TX LOOP [n|INF] [f]  Repeatedly send the selected or named file\n"
@@ -1654,6 +1699,30 @@ private:
             return ReliableTransferV2::SinkPrepareResult::CleanupFailed;
         }
 
+        size_t filesystem_total = 0;
+        size_t filesystem_used = 0;
+        const esp_err_t info_result =
+            esp_spiffs_info(nullptr, &filesystem_total, &filesystem_used);
+        if (info_result != ESP_OK) {
+            ESP_LOGE(TAG,
+                     "Could not inspect RX storage for transfer %08lX: %s",
+                     static_cast<unsigned long>(transfer_id),
+                     esp_err_to_name(info_result));
+            return ReliableTransferV2::SinkPrepareResult::OpenFailed;
+        }
+        const uint64_t safe_available = FileTransfer::safeReceiveCapacity(
+            filesystem_total, filesystem_used);
+        if (static_cast<uint64_t>(total_size) > safe_available) {
+            ESP_LOGE(TAG,
+                     "RX storage rejected id=%08lX: need=%lu safe_available=%llu used=%u total=%u reserve=25%%",
+                     static_cast<unsigned long>(transfer_id),
+                     static_cast<unsigned long>(total_size),
+                     static_cast<unsigned long long>(safe_available),
+                     static_cast<unsigned>(filesystem_used),
+                     static_cast<unsigned>(filesystem_total));
+            return ReliableTransferV2::SinkPrepareResult::InsufficientStorage;
+        }
+
         incoming_file_.file = std::fopen(partial_path.c_str(), "wb");
         if (!incoming_file_.file) {
             ESP_LOGE(TAG,
@@ -1672,7 +1741,19 @@ private:
         if (!incoming_file_.file || !data || length == 0) {
             return 0;
         }
-        return std::fwrite(data, 1, length, incoming_file_.file);
+        errno = 0;
+        const size_t written = std::fwrite(data, 1, length, incoming_file_.file);
+        if (written != length) {
+            ESP_LOGE(TAG,
+                     "RX storage write failed id=%08lX file=%s requested=%u written=%u accepted=%lu errno=%d",
+                     static_cast<unsigned long>(incoming_file_.transfer_id),
+                     incoming_file_.partial_name.c_str(),
+                     static_cast<unsigned>(length),
+                     static_cast<unsigned>(written),
+                     static_cast<unsigned long>(receiver_.acceptedBytes()),
+                     errno);
+        }
+        return written;
     }
 
     bool closeIncomingStorage()
@@ -1911,10 +1992,9 @@ private:
         }
 
         const std::string command = uppercaseCopy(words.front());
-        // Allow the full operator command set over the radio link, but keep
-        // REMOTE itself local-only so one board cannot recursively relay to
-        // another board (or back to itself).
-        return command != "REMOTE";
+        // REMOTE cannot recursively relay. Filesystem mutation stays local so
+        // an RF peer cannot erase or format another board's storage.
+        return command != "REMOTE" && command != "FS";
     }
 
     void tryResumeWirelessRx(const char* reason)
@@ -1979,98 +2059,110 @@ private:
         const char* irq_state =
             !status.irq_connected ? "disabled" : (status.irq_asserted ? "low" : "high");
 
-        std::printf("profile=%s filesystem=%s http_control=%s State=%s channel=%u frequency_mhz=%u ",
+        std::printf("\n=== RF3 STATUS =====================================================\n");
+        std::printf("Cache  : updated=%llu ms  tx_preparing=%s\n",
+                    static_cast<unsigned long long>(cached.updated_ms),
+                    tx_report.preparing ? "yes" : "no");
+        std::printf("System : profile=%s  filesystem=%s  http=%s  protocol=v%u\n",
                     HardwareProfile::kSelectedName,
                     filesystem_ready_ ? "ready" : "unavailable",
                     kWifiControlEnabled ? "enabled" : "disabled",
+                    static_cast<unsigned>(ProtocolV2::kVersion));
+        std::printf("Radio  : state=%s  channel=%u (%u MHz)  power=",
                     RadioManager::stateName(status.state),
                     static_cast<unsigned>(status.channel),
                     static_cast<unsigned>(RadioChannel::frequencyMHz(status.channel)));
         if (status.power_level >= 0) {
-            std::printf("power=%d ", status.power_level);
+            std::printf("%d", status.power_level);
         } else {
-            std::printf("power=unknown ");
+            std::printf("unknown");
         }
-        std::printf("selected=%s last_status=0x%02X fifo=0x%02X observe=0x%02X irq=%s tx_irq_seen=%s tx_ok=%s tx_timeout=%s rx_len=%u rx_packets=%u rx_stream=%u rx_raw=%u rx_missing=%u rx_duplicates=%u rx_drain_hits=%u rx_saved=%u rx_saved_bytes=%u carrier_events=%u fault=%d",
-                    snapshot.selected_name.c_str(),
+        std::printf("  fault=%d\n", status.last_fault);
+        std::printf("Regs   : STATUS=0x%02X  FIFO=0x%02X  OBSERVE_TX=0x%02X  IRQ=%s\n",
                     static_cast<unsigned>(status.last_status),
                     static_cast<unsigned>(status.last_fifo_status),
                     static_cast<unsigned>(status.last_observe_tx),
-                    irq_state,
-                    status.last_tx_saw_irq ? "true" : "false",
-                    status.last_tx_ok ? "true" : "false",
-                    status.last_tx_timed_out ? "true" : "false",
+                    irq_state);
+        std::printf("Live   : pending=%s  rpd=%s  last_rx_len=%u  radio_rx_packets=%u\n",
+                    status.state == RadioState::RxListening
+                        ? (rx_pending ? "yes" : "no") : "n/a",
+                    status.state == RadioState::RxListening
+                        ? (status.carrier_detected ? "high" : "low") : "n/a",
                     static_cast<unsigned>(status.last_rx_len),
-                    static_cast<unsigned>(status.rx_packets),
-                    static_cast<unsigned>(decoded_packets),
-                    static_cast<unsigned>(raw_packets),
-                    static_cast<unsigned>(missing_packets),
-                    static_cast<unsigned>(duplicate_packets),
-                    static_cast<unsigned>(drain_limit_hits),
+                    static_cast<unsigned>(status.rx_packets));
+        std::printf("File   : selected=%s  saved=%u file(s) / %u bytes\n",
+                    snapshot.selected_name.c_str(),
                     static_cast<unsigned>(cached.rx_saved),
-                    static_cast<unsigned>(cached.rx_saved_bytes),
-                    static_cast<unsigned>(carrier_events),
-                    status.last_fault);
-        std::printf(" protocol=%u tx_id=%08lX tx_state=%s tx_bytes=%lu/%lu tx_seq=%lu/%lu tx_retries=%lu tx_error=%s tx_crc32=%08lX tx_elapsed_ms=%llu tx_bps=%lu peer_complete=%s rx_id=%08lX rx_state=%s rx_bytes=%lu/%lu rx_seq=%lu/%lu rx_error=%s rx_crc32=%08lX",
-                    static_cast<unsigned>(ProtocolV2::kVersion),
-                    static_cast<unsigned long>(tx_report.transfer_id),
+                    static_cast<unsigned>(cached.rx_saved_bytes));
+        std::printf("TX     : state=%s  id=%08lX  error=%s  peer_complete=%s\n",
                     ReliableTransferV2::senderStateName(tx_report.state),
+                    static_cast<unsigned long>(tx_report.transfer_id),
+                    ProtocolV2::errorName(tx_report.error),
+                    tx_report.peer_complete ? "yes" : "no");
+        std::printf("         progress=%lu/%lu bytes  packets=%lu/%lu  retries=%lu\n",
                     static_cast<unsigned long>(tx_report.bytes_transferred),
                     static_cast<unsigned long>(tx_report.total_bytes),
                     static_cast<unsigned long>(tx_report.current_sequence),
                     static_cast<unsigned long>(tx_report.total_packets),
-                    static_cast<unsigned long>(tx_report.retry_count),
-                    ProtocolV2::errorName(tx_report.error),
+                    static_cast<unsigned long>(tx_report.retry_count));
+        std::printf("         crc32=%08lX  elapsed=%llu ms  rate=%lu B/s\n",
                     static_cast<unsigned long>(tx_report.crc32),
                     static_cast<unsigned long long>(tx_report.elapsed_ms),
-                    static_cast<unsigned long>(tx_report.throughput_bps),
-                    tx_report.peer_complete ? "true" : "false",
-                    static_cast<unsigned long>(receiver_id),
+                    static_cast<unsigned long>(tx_report.throughput_bps));
+        std::printf("         last_radio: irq_seen=%s  ok=%s  timeout=%s\n",
+                    status.last_tx_saw_irq ? "true" : "false",
+                    status.last_tx_ok ? "true" : "false",
+                    status.last_tx_timed_out ? "true" : "false");
+        std::printf("RX     : state=%s  id=%08lX  error=%s\n",
                     ReliableTransferV2::receiverStateName(receiver_state),
+                    static_cast<unsigned long>(receiver_id),
+                    ProtocolV2::errorName(receiver_error));
+        std::printf("         progress=%lu/%lu bytes  packets=%lu/%lu  crc32=%08lX\n",
                     static_cast<unsigned long>(receiver_bytes),
                     static_cast<unsigned long>(receiver_total_bytes),
                     static_cast<unsigned long>(receiver_sequence),
                     static_cast<unsigned long>(receiver_packets),
-                    ProtocolV2::errorName(receiver_error),
                     static_cast<unsigned long>(receiver_crc));
-        if (kWirelessControlEnabled) {
-            std::printf(" remote=enabled");
-            if (kWirelessControlAutoRx) {
-                std::printf(" remote_auto_rx=true");
-            }
-        }
-        if (status.state == RadioState::RxListening) {
-            std::printf(" rx_pending=%s rpd=%s",
-                        rx_pending ? "true" : "false",
-                        status.carrier_detected ? "true" : "false");
-        }
+        std::printf("         decoded=%u  raw=%u  missing=%u  duplicates=%u\n",
+                    static_cast<unsigned>(decoded_packets),
+                    static_cast<unsigned>(raw_packets),
+                    static_cast<unsigned>(missing_packets),
+                    static_cast<unsigned>(duplicate_packets));
+        std::printf("         drain_hits=%u  carrier_events=%u\n",
+                    static_cast<unsigned>(drain_limit_hits),
+                    static_cast<unsigned>(carrier_events));
+        std::printf("Remote : control=%s  auto_rx=%s\n",
+                    kWirelessControlEnabled ? "enabled" : "disabled",
+                    kWirelessControlAutoRx ? "enabled" : "disabled");
         if (!last_morse_text_.empty()) {
-            std::printf(" last_morse=\"%s\"", last_morse_text_.c_str());
+            std::printf("Morse  : last=\"%s\"\n", last_morse_text_.c_str());
         }
         if (loop.active) {
-            std::printf(" loop=%s", loopModeName(loop.mode));
+            std::printf("Loop   : mode=%s", loopModeName(loop.mode));
             if (loop.mode == LoopMode::Tx) {
-                std::printf(" loop_file=%s", loop.file_name.c_str());
+                std::printf("  file=%s", loop.file_name.c_str());
                 if (loop.infinite) {
-                    std::printf(" loop_remaining=inf");
+                    std::printf("  remaining=inf");
                 } else {
-                    std::printf(" loop_remaining=%u", static_cast<unsigned>(loop.remaining_iterations));
+                    std::printf("  remaining=%u", static_cast<unsigned>(loop.remaining_iterations));
                 }
             } else if (loop.mode == LoopMode::Cw) {
-                std::printf(" loop_on_ms=%u loop_off_ms=%u loop_power=%u",
+                std::printf("  on_ms=%u  off_ms=%u  power=%u",
                             static_cast<unsigned>(loop.cw_on_ms),
                             static_cast<unsigned>(loop.cw_off_ms),
                             static_cast<unsigned>(loop.power_level));
                 if (loop.cw_report_every > 0) {
-                    std::printf(" loop_report_every=%u",
+                    std::printf("  report_every=%u",
                                 static_cast<unsigned>(loop.cw_report_every));
                 }
             } else if (loop.mode == LoopMode::Morse) {
-                std::printf(" loop_text=%s", loop.morse_text.c_str());
+                std::printf("  text=%s", loop.morse_text.c_str());
             }
-            std::printf(" loop_done=%u", static_cast<unsigned>(loop.completed_iterations));
+            std::printf("  completed=%u\n", static_cast<unsigned>(loop.completed_iterations));
+        } else {
+            std::printf("Loop   : inactive\n");
         }
-        std::printf("\n");
+        std::printf("====================================================================\n");
     }
 
     std::string buildStatusJson()
@@ -2089,6 +2181,254 @@ private:
     {
         printFileTable(listFiles(), selectedFileName());
         return true;
+    }
+
+    bool captureFilesystemSnapshot(std::vector<FileInfo>& entries,
+                                   size_t& total,
+                                   size_t& used)
+    {
+        if (!filesystem_ready_) {
+            std::printf("SPIFFS is not mounted.\n");
+            return false;
+        }
+        if (!takeRadio(pdMS_TO_TICKS(500))) {
+            std::printf("Filesystem is busy. Run STOP and try again.\n");
+            return false;
+        }
+        bool scan_ok = false;
+        entries = listAllFiles(&scan_ok);
+        const esp_err_t result = esp_spiffs_info(nullptr, &total, &used);
+        giveRadio();
+        if (!scan_ok) {
+            std::printf("Could not enumerate every SPIFFS directory entry.\n");
+            return false;
+        }
+        if (result != ESP_OK) {
+            std::printf("Could not read SPIFFS usage: %s\n", esp_err_to_name(result));
+            return false;
+        }
+        return true;
+    }
+
+    bool printFilesystemInfo()
+    {
+        std::vector<FileInfo> entries;
+        size_t total = 0;
+        size_t used = 0;
+        if (!captureFilesystemSnapshot(entries, total, used)) {
+            return false;
+        }
+
+        const size_t free_bytes = used < total ? total - used : 0;
+        const uint64_t safe_receive = FileTransfer::safeReceiveCapacity(total, used);
+        size_t visible_count = 0;
+        size_t hidden_count = 0;
+        size_t internal_count = 0;
+        uint64_t visible_bytes = 0;
+        uint64_t hidden_bytes = 0;
+        uint64_t internal_bytes = 0;
+        for (const FileInfo& entry : entries) {
+            if (ReliableTransferV2::isInternalTransferName(entry.name)) {
+                ++internal_count;
+                internal_bytes += entry.bytes;
+            } else if (!entry.name.empty() && entry.name.front() == '.') {
+                ++hidden_count;
+                hidden_bytes += entry.bytes;
+            } else {
+                ++visible_count;
+                visible_bytes += entry.bytes;
+            }
+        }
+        const uint64_t listed_bytes = visible_bytes + hidden_bytes + internal_bytes;
+        const uint64_t overhead_bytes = used > listed_bytes ? used - listed_bytes : 0;
+        std::printf("SPIFFS\n");
+        std::printf("  used                 : %u bytes\n", static_cast<unsigned>(used));
+        std::printf("  free                 : %u bytes\n", static_cast<unsigned>(free_bytes));
+        std::printf("  total                : %u bytes\n", static_cast<unsigned>(total));
+        std::printf("  safe receive capacity: %llu bytes (25%% GC reserve)\n",
+                    static_cast<unsigned long long>(safe_receive));
+        std::printf("  visible files        : %u / %llu bytes\n",
+                    static_cast<unsigned>(visible_count),
+                    static_cast<unsigned long long>(visible_bytes));
+        std::printf("  hidden dot-files     : %u / %llu bytes\n",
+                    static_cast<unsigned>(hidden_count),
+                    static_cast<unsigned long long>(hidden_bytes));
+        std::printf("  internal .part files : %u / %llu bytes\n",
+                    static_cast<unsigned>(internal_count),
+                    static_cast<unsigned long long>(internal_bytes));
+        std::printf("  allocation overhead  : %llu bytes\n",
+                    static_cast<unsigned long long>(overhead_bytes));
+        return true;
+    }
+
+    bool printAllFilesystemFiles()
+    {
+        std::vector<FileInfo> entries;
+        size_t total = 0;
+        size_t used = 0;
+        if (!captureFilesystemSnapshot(entries, total, used)) {
+            return false;
+        }
+        if (entries.empty()) {
+            std::printf("SPIFFS contains no files.\n");
+            return true;
+        }
+
+        std::printf("All SPIFFS files:\n");
+        uint64_t listed_bytes = 0;
+        for (const FileInfo& entry : entries) {
+            const char* classification =
+                ReliableTransferV2::isInternalTransferName(entry.name)
+                    ? "internal-partial"
+                    : !entry.name.empty() && entry.name.front() == '.'
+                          ? "hidden"
+                          : "visible";
+            std::printf("  [%-16s] %s (%u bytes)\n",
+                        classification,
+                        entry.name.c_str(),
+                        static_cast<unsigned>(entry.bytes));
+            listed_bytes += entry.bytes;
+        }
+        std::printf("Listed %u file(s), %llu logical bytes; SPIFFS reports %u allocated bytes.\n",
+                    static_cast<unsigned>(entries.size()),
+                    static_cast<unsigned long long>(listed_bytes),
+                    static_cast<unsigned>(used));
+        return true;
+    }
+
+    bool beginFilesystemMutation()
+    {
+        if (!filesystem_ready_) {
+            std::printf("SPIFFS is not mounted.\n");
+            return false;
+        }
+        if (!takeLoop(pdMS_TO_TICKS(50))) {
+            std::printf("Could not inspect the TX loop state. Try again.\n");
+            return false;
+        }
+        const bool loop_active = loop_config_.active;
+        giveLoop();
+        if (loop_active) {
+            std::printf("Filesystem is busy with an active loop. Run STOP first.\n");
+            return false;
+        }
+        if (!takeRadio(pdMS_TO_TICKS(500))) {
+            std::printf("Filesystem is busy with radio activity. Run STOP and try again.\n");
+            return false;
+        }
+        if (receiver_.active() || incoming_file_.file) {
+            giveRadio();
+            std::printf("Filesystem is receiving a file. Run STOP before changing files.\n");
+            return false;
+        }
+        return true;
+    }
+
+    bool commandFilesystem(const std::vector<std::string>& words)
+    {
+        if (words.size() < 2) {
+            std::printf("Usage: FS INFO | FS LIST ALL | FS DELETE <file> | FS CLEAN PARTIALS | FS FORMAT CONFIRM\n");
+            return false;
+        }
+
+        const std::string action = uppercaseCopy(words[1]);
+        if (action == "INFO") {
+            if (words.size() != 2) {
+                std::printf("Usage: FS INFO\n");
+                return false;
+            }
+            return printFilesystemInfo();
+        }
+
+        if (action == "LIST") {
+            if (words.size() != 3 || uppercaseCopy(words[2]) != "ALL") {
+                std::printf("Usage: FS LIST ALL\n");
+                return false;
+            }
+            return printAllFilesystemFiles();
+        }
+
+        if (action == "DELETE") {
+            if (words.size() != 3) {
+                std::printf("Usage: FS DELETE <file>\n");
+                return false;
+            }
+            if (!beginFilesystemMutation()) {
+                return false;
+            }
+
+            FileInfo file{};
+            if (!resolveFile(words[2], file)) {
+                giveRadio();
+                std::printf("File '%s' was not found or is an internal .part file.\n",
+                            words[2].c_str());
+                return false;
+            }
+
+            errno = 0;
+            const bool removed = std::remove(buildFilePath(file.name).c_str()) == 0;
+            const int remove_errno = errno;
+            if (removed && selectedFileName() == file.name) {
+                const std::vector<FileInfo> remaining = listFiles();
+                if (remaining.empty()) {
+                    selectFile(FileInfo{kDefaultFile, 0});
+                } else {
+                    selectFile(remaining.front());
+                }
+            }
+            giveRadio();
+
+            if (!removed) {
+                std::printf("Could not delete %s: errno=%d\n",
+                            file.name.c_str(), remove_errno);
+                return false;
+            }
+            std::printf("Deleted %s (%u bytes).\n",
+                        file.name.c_str(), static_cast<unsigned>(file.bytes));
+            return printFilesystemInfo();
+        }
+
+        if (action == "CLEAN") {
+            if (words.size() != 3 || uppercaseCopy(words[2]) != "PARTIALS") {
+                std::printf("Usage: FS CLEAN PARTIALS\n");
+                return false;
+            }
+            if (!beginFilesystemMutation()) {
+                return false;
+            }
+            cleanupStaleIncomingFiles();
+            giveRadio();
+            std::printf("Stale .part cleanup complete. Use FS LIST ALL to verify.\n");
+            return printFilesystemInfo();
+        }
+
+        if (action == "FORMAT") {
+            if (words.size() != 3 || uppercaseCopy(words[2]) != "CONFIRM") {
+                std::printf("Formatting erases every SPIFFS file. Use: FS FORMAT CONFIRM\n");
+                return false;
+            }
+            if (!beginFilesystemMutation()) {
+                return false;
+            }
+
+            const esp_err_t result = esp_spiffs_format(nullptr);
+            if (result == ESP_OK) {
+                incoming_file_ = IncomingFileStorage{};
+                resetRxSession();
+                selectFile(FileInfo{kDefaultFile, 0});
+            }
+            giveRadio();
+
+            if (result != ESP_OK) {
+                std::printf("SPIFFS format failed: %s\n", esp_err_to_name(result));
+                return false;
+            }
+            std::printf("SPIFFS formatted. All files were erased.\n");
+            return printFilesystemInfo();
+        }
+
+        std::printf("Usage: FS INFO | FS LIST ALL | FS DELETE <file> | FS CLEAN PARTIALS | FS FORMAT CONFIRM\n");
+        return false;
     }
 
     bool commandSelect(const std::vector<std::string>& words)
@@ -2238,7 +2578,7 @@ private:
 
         const std::vector<std::string> request_words = splitWords(request);
         if (!isRemoteCommandAllowed(request_words)) {
-            std::printf("Remote commands support the full command set except REMOTE.\n");
+            std::printf("Remote commands support the full command set except REMOTE and FS.\n");
             return false;
         }
 
@@ -3191,6 +3531,8 @@ private:
             receiver_.transferId() == incoming.transfer_id &&
             active_api_receive_id_ != incoming.transfer_id) {
             active_api_receive_id_ = incoming.transfer_id;
+            last_rx_progress_percent_ = 0;
+            rx_transfer_started_ms_ = now_ms;
             transfer_service_.reportReceiveStarted(
                 receiver_.transferId(),
                 receiver_.totalSize(),
@@ -3224,6 +3566,27 @@ private:
                 receiver_.acceptedBytes(),
                 incoming.sequence,
                 now_ms);
+            const uint8_t progress_percent = FileTransfer::progressMilestonePercent(
+                receiver_.acceptedBytes(), receiver_.totalSize());
+            if (progress_percent > last_rx_progress_percent_) {
+                last_rx_progress_percent_ = progress_percent;
+                const uint64_t elapsed_ms = now_ms >= rx_transfer_started_ms_
+                                                ? now_ms - rx_transfer_started_ms_ : 0;
+                const uint32_t rate_bps = elapsed_ms == 0
+                    ? 0
+                    : static_cast<uint32_t>(
+                          (static_cast<uint64_t>(receiver_.acceptedBytes()) * 1000u) /
+                          elapsed_ms);
+                ESP_LOGI(TAG,
+                         "RX progress id=%08lX %u%% | bytes=%lu/%lu | packets=%lu/%lu | rate=%lu B/s",
+                         static_cast<unsigned long>(receiver_.transferId()),
+                         static_cast<unsigned>(progress_percent),
+                         static_cast<unsigned long>(receiver_.acceptedBytes()),
+                         static_cast<unsigned long>(receiver_.totalSize()),
+                         static_cast<unsigned long>(receiver_.acceptedPackets()),
+                         static_cast<unsigned long>(receiver_.totalPackets()),
+                         static_cast<unsigned long>(rate_bps));
+            }
 #if RF3_VERBOSE_RX_LOG
             if (incoming.sequence == 0 ||
                 (receiver_.acceptedPackets() % 64u) == 0) {
@@ -3428,6 +3791,9 @@ private:
         if (command == "FILES" || command == "LS") {
             return commandFiles();
         }
+        if (command == "FS") {
+            return commandFilesystem(words);
+        }
         if (command == "SELECT") {
             return commandSelect(words);
         }
@@ -3510,6 +3876,8 @@ private:
     IncomingFileStorage incoming_file_{};     // SPIFFS adapter state for the current RX partial file.
     ReliableTransferV2::ReceiverSession receiver_;  // Verified Protocol v2 RX session.
     uint32_t active_api_receive_id_ = 0;       // Receiver transfer mirrored into the subsystem API.
+    uint8_t last_rx_progress_percent_ = 0;     // Last reported accepted-byte milestone.
+    uint64_t rx_transfer_started_ms_ = 0;      // Monotonic start used for RX progress rate.
     ProtocolTransferReport last_tx_report_{}; // Last reliable sender state for STATUS.
     uint32_t decoded_rx_packet_count_ = 0;    // Payloads accepted as in-order stream data.
     uint32_t raw_rx_packet_count_ = 0;        // Payloads that were received but not accepted as stream data.

@@ -33,6 +33,30 @@ confirmed by the user-supplied status screenshot described above. Qualification,
 Wi-Fi validation, and complete offline image packages were not rerun for this
 pin-only correction. The broader results below describe September 7.
 
+## Pre-Phase-1 capability restoration - 2026-09-10
+
+Phase 1 now retains every nonblank source addition from the preserved
+pre-Phase-1 working firmware. A line-level parity audit found 308 added
+main.cpp lines; 300 are retained verbatim and the remaining eight filename and
+saved-counter references were deliberately converted to Phase 1's owned,
+mutex-protected status snapshots. The Phase 1 radio fault, cleanup propagation,
+completion replay, cached status, owned filename, and JSON safety changes remain
+in place.
+
+Restored behavior includes readable multiline serial STATUS, TX/RX 10-percent
+accepted-byte progress logs, local FS INFO / LIST ALL / DELETE / CLEAN PARTIALS /
+FORMAT CONFIRM commands, detailed short-write diagnostics, and a 25-percent
+SPIFFS garbage-collection reserve checked before accepting a receive. A new
+InsufficientStorage wire error reports that rejection. Control exchanges keep
+five retries while DATA exchanges allow twenty; the DATA retry window remains
+shorter than receiver inactivity timeout. This preserves the pre-Phase-1
+signal/data-flow tuning while retaining Phase 1 correctness.
+
+Fresh validation passed 213 native tests, 16 Python tests, all 264 software
+qualification cases, both canonical firmware builds, both SPIFFS builds,
+repository hygiene, and whitespace checks. This restored build has not yet been
+flashed or exercised in a physical RF transfer. Phase 2 remains paused.
+
 ## Behavior
 
 - TX rejects impossible STATUS or FIFO_STATUS values before interpreting
@@ -113,6 +137,7 @@ those results.
 
 Phase 1 is integrated and software-complete. This does not establish live RF
 behavior, power stability, ESP32 scheduling, or HTTP responsiveness on physical
-boards; those begin with Phase 2 hardware validation. This work also does not
-implement the later filesystem service, browser import/export, or protocol
-expansion phases.
+boards; those begin with the later authorized hardware-validation work. Phase 1
+includes the retained local serial SPIFFS controls described above, but it does
+not implement the later shared storage layer, browser import/export, filename
+protocol extension, resume, Bluetooth, or other deferred phases.

@@ -257,18 +257,22 @@ Named defaults are:
 | --- | ---: |
 | Control response timeout | 500 ms |
 | DATA ACK timeout | 250 ms |
-| Maximum retransmissions per frame | 5 |
+| Maximum control retransmissions per frame | 5 |
+| Maximum DATA retransmissions per frame | 20 |
 | Receiver inactivity timeout | 10,000 ms |
 | Sender overall inactivity timeout | 10,000 ms |
 
 All times use monotonic milliseconds supplied to the state machines. Timeout
 and retry constants are centralized in `protocol_v2.hpp`.
 
-The five-retry budget is per outstanding START, DATA, END, or CANCEL exchange;
-it resets after READY or the matching DATA ACK. `totalRetries()` is diagnostic
-only, so transient errors accumulated across a large file do not exhaust a
-whole-transfer error budget. The firmware services RX every 2 ms, drains at
-most 32 packets per pass, and counts passes that reach that cap.
+The retry budget is per outstanding exchange and resets after READY or the
+matching DATA ACK. START, END, and CANCEL use five retries; DATA uses twenty to
+tolerate a longer burst of packet loss without weakening the control path.
+The maximum DATA retry window is statically constrained below the receiver's
+10-second inactivity timeout. `totalRetries()` is diagnostic only, so transient
+errors accumulated across a large file do not exhaust a whole-transfer error
+budget. The firmware services RX every 2 ms, drains at most 32 packets per pass,
+and counts passes that reach that cap.
 
 Receiver inactivity is measured from the last accepted START or in-order DATA
 packet. Duplicate START/DATA, out-of-order DATA, and unexpected packets are
@@ -318,6 +322,13 @@ Production receives into an internal `.part` file. Internal partials are hidden
 from normal file listings and stale partials are removed at startup. Open,
 write, flush/close, rename, and cleanup outcomes are checked.
 
+Before opening a new partial, the receiver checks mounted SPIFFS usage and
+reserves 25 percent of total capacity for filesystem garbage collection. A
+transfer larger than the remaining safe capacity is rejected immediately with
+`InsufficientStorage`; an existing completed file is never removed to make room.
+The local serial console can reconcile usage and inspect visible, hidden, and
+internal files with `FS INFO` and `FS LIST ALL`.
+
 A failed, cancelled, timed-out, truncated, or CRC-mismatched transfer cannot
 appear as completed. Existing completed files are never deleted to make room.
 Publication selects a collision-free completed name and atomically renames the
@@ -329,7 +340,7 @@ The stable error enumeration includes busy, unsupported version/size, invalid
 metadata/frame, wrong transfer, unexpected packet/sequence, retry exhaustion,
 timeout, cancellation, source read, sink open/write/close, CRC mismatch,
 publication failure, cleanup failure, byte/packet-count mismatch, transport
-failure, and state violation. Numeric values are defined by
+failure, state violation, and insufficient storage. Numeric values are defined by
 `ProtocolV2::ErrorCode` and must not be renumbered without a protocol version
 change.
 

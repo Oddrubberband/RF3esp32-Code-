@@ -23,6 +23,30 @@ constexpr size_t kMediaTypeCapacity = 48;
 constexpr size_t kPublishedPathCapacity = 96;
 constexpr size_t kMemorySourceMaximumBytes = 4096;
 
+// Returns the highest completed 10-percent milestone. A zero-length transfer
+// has no byte-progress milestone and is represented by its terminal state.
+constexpr uint8_t progressMilestonePercent(uint32_t completed_bytes,
+                                           uint32_t total_bytes)
+{
+    if (total_bytes == 0 || completed_bytes == 0) {
+        return 0;
+    }
+    const uint32_t bounded_bytes =
+        completed_bytes < total_bytes ? completed_bytes : total_bytes;
+    const uint32_t percent = static_cast<uint32_t>(
+        (static_cast<uint64_t>(bounded_bytes) * 100u) / total_bytes);
+    return static_cast<uint8_t>((percent / 10u) * 10u);
+}
+
+// SPIFFS garbage collection needs working room. Keep the upper quarter of the
+// mounted capacity uncommitted when deciding whether a new receive can start.
+constexpr uint64_t safeReceiveCapacity(uint64_t total_bytes,
+                                       uint64_t used_bytes)
+{
+    const uint64_t safe_usage_limit = (total_bytes * 3u) / 4u;
+    return safe_usage_limit > used_bytes ? safe_usage_limit - used_bytes : 0;
+}
+
 enum class CollisionPolicy : uint8_t {
     CreateUnique,
     RejectIfExists,

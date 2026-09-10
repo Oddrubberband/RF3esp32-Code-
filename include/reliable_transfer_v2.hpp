@@ -128,13 +128,15 @@ public:
                   SourceCallbacks source,
                   uint32_t control_timeout_ms = ProtocolV2::kControlResponseTimeoutMs,
                   uint32_t data_timeout_ms = ProtocolV2::kDataAckTimeoutMs,
-                  uint8_t maximum_retries = ProtocolV2::kMaximumRetries,
-                  uint32_t inactivity_timeout_ms = ProtocolV2::kSenderInactivityTimeoutMs)
+                  uint8_t maximum_control_retries = ProtocolV2::kMaximumControlRetries,
+                  uint32_t inactivity_timeout_ms = ProtocolV2::kSenderInactivityTimeoutMs,
+                  uint8_t maximum_data_retries = ProtocolV2::kMaximumDataRetries)
         : source_context_(source_context),
           source_(source),
           control_timeout_ms_(control_timeout_ms),
           data_timeout_ms_(data_timeout_ms),
-          maximum_retries_(maximum_retries),
+          maximum_control_retries_(maximum_control_retries),
+          maximum_data_retries_(maximum_data_retries),
           inactivity_timeout_ms_(inactivity_timeout_ms)
     {
     }
@@ -452,7 +454,10 @@ private:
 
     SenderEvent scheduleRetry()
     {
-        if (retry_count_ >= maximum_retries_) {
+        const uint8_t maximum_retries =
+            state_ == SenderState::WaitingForDataAck
+                ? maximum_data_retries_ : maximum_control_retries_;
+        if (retry_count_ >= maximum_retries) {
             if (state_ == SenderState::Cancelling) {
                 state_ = SenderState::Cancelled;
                 error_ = ProtocolV2::ErrorCode::Cancelled;
@@ -500,7 +505,8 @@ private:
     SourceCallbacks source_{};
     uint32_t control_timeout_ms_ = ProtocolV2::kControlResponseTimeoutMs;
     uint32_t data_timeout_ms_ = ProtocolV2::kDataAckTimeoutMs;
-    uint8_t maximum_retries_ = ProtocolV2::kMaximumRetries;
+    uint8_t maximum_control_retries_ = ProtocolV2::kMaximumControlRetries;
+    uint8_t maximum_data_retries_ = ProtocolV2::kMaximumDataRetries;
     uint32_t inactivity_timeout_ms_ = ProtocolV2::kSenderInactivityTimeoutMs;
     SenderState state_ = SenderState::Idle;
     ProtocolV2::ErrorCode error_ = ProtocolV2::ErrorCode::None;
@@ -524,6 +530,7 @@ enum class SinkPrepareResult {
     Ready,
     CleanupFailed,
     OpenFailed,
+    InsufficientStorage,
 };
 
 struct SinkCallbacks {
@@ -784,7 +791,9 @@ private:
         if (prepared != SinkPrepareResult::Ready) {
             error_ = prepared == SinkPrepareResult::CleanupFailed
                          ? ProtocolV2::ErrorCode::CleanupFailed
-                         : ProtocolV2::ErrorCode::SinkOpen;
+                         : prepared == SinkPrepareResult::InsufficientStorage
+                               ? ProtocolV2::ErrorCode::InsufficientStorage
+                               : ProtocolV2::ErrorCode::SinkOpen;
             state_ = ReceiverState::Failed;
             storage_present_ = prepared == SinkPrepareResult::CleanupFailed;
             cleanup_failed_ = storage_present_;
