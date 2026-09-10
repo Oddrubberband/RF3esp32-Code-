@@ -54,8 +54,21 @@ signal/data-flow tuning while retaining Phase 1 correctness.
 
 Fresh validation passed 213 native tests, 16 Python tests, all 264 software
 qualification cases, both canonical firmware builds, both SPIFFS builds,
-repository hygiene, and whitespace checks. This restored build has not yet been
-flashed or exercised in a physical RF transfer. Phase 2 remains paused.
+repository hygiene, and whitespace checks.
+
+The restored build was then exercised in one physical custom-PCB-to-devboard
+transfer on channel 0. The 1,112,701-byte song.u8 completed in 55,636 DATA
+packets with source and receiver CRC32 5138505B. TX reported 1,908 B/s, RX
+reported 1,919 B/s, and the sender used one retry. The receiver verified and
+published rx_90757F3C.bin before the sender accepted peer completion.
+
+About 116 seconds after publication, the listening receiver reported fault 4
+from an RX read failure. STANDBY followed by RX restored RxListening with
+fault=0, STATUS=0x0E, FIFO_STATUS=0x11, and IRQ high. This did not corrupt the
+completed transfer, but the transient empty-FIFO/read condition is still being
+classified as a permanent radio fault. Correct and regression-test that behavior
+before Phase 2. Reverse-direction and repeated-transfer hardware tests have not
+yet been recorded. Phase 2 remains paused.
 
 ## Behavior
 

@@ -33,11 +33,22 @@ snapshot, and JSON protections.
 
 Fresh checks passed 213 native tests, 16 Python tests, all 264 software
 qualification cases, both firmware builds, both SPIFFS builds, repository
-hygiene, and whitespace validation. The restored firmware has not been flashed;
-the prior custom-PCB Standby/fault=0 screenshot applies to the preceding pin-fix
-build. Phase 2 and all later feature work remain paused. At this point these
-changes are local pending the GitHub push recorded by the next synchronization
-update.
+hygiene, and whitespace validation.
+
+The restored build completed one physical transfer from the custom PCB to the
+ESP32 devboard on channel 0. song.u8 transferred 1,112,701 bytes in 55,636 DATA
+packets; both endpoints reported CRC32 5138505B. TX measured 1,908 B/s with one
+retry and accepted peer completion. RX measured 1,919 B/s and published
+rx_90757F3C.bin. This is the first recorded successful physical Protocol v2 file
+transfer for the restored Phase 1 build.
+
+About 116 seconds later the receiver logged an RX read failure and entered
+fault 4. STANDBY then RX recovered it immediately to RxListening, fault=0,
+STATUS=0x0E, FIFO_STATUS=0x11, and IRQ high. Treat this as an unresolved false
+or transient RX fault classification; it did not invalidate the already
+verified file. Correct it before Phase 2. Reverse-direction and repeated
+hardware transfers remain unrecorded. Phase 2 and all later feature work remain
+paused. The synchronization state is updated after the GitHub push below.
 
 ### Laptop pin correction - 2026-09-10
 
@@ -136,20 +147,23 @@ remains disabled. Independent Python JSON decoding is included in the Python
 suite. Repository hygiene and whitespace checks passed before integration and
 are rerun for the final handoff commit.
 
-These are recorded results from the Phase 1 session, not a fresh test run each
-time this file is read. Live RF, power stability, ESP32 scheduling, and HTTP
-responsiveness on the boards remain unverified. Reproduce checks after relevant
-changes using the commands in the Phase 1 document.
+These are recorded results from the September 7 Phase 1 session, not a fresh
+test run each time this file is read. The current-state section above records
+the later successful physical transfer. Power stability, broader RF conditions,
+ESP32 scheduling, and HTTP responsiveness remain unverified. Reproduce checks
+after relevant changes using the commands in the Phase 1 document.
 
 ## Next concrete work
 
-The custom-PCB pin correction and radio startup verification are complete.
-Retain the authoritative pin mapping above and await the user's next task.
-Phase 2 and later work are paused. The user's requested future sequence is
-Measurement Foundation, then the physical RF/power baseline; the older phase
-guide's numbering and permission to overlap storage work do not override that
-instruction. Do not begin storage, browser, protocol extensions, resume,
-Bluetooth, or optimization during this correction.
+The pin correction, capability restoration, and first successful physical file
+transfer are complete. Before Phase 2, correct the transient post-transfer RX
+fault-4 classification and repeat transfer checks in both directions. Retain
+the authoritative pin mapping above. Phase 2 and later work are paused. The
+user's requested future sequence is Measurement Foundation, then the physical
+RF/power baseline; the older phase guide's numbering and permission to overlap
+storage work do not override that instruction. Do not begin the shared storage
+layer, browser, protocol extensions, resume, Bluetooth, or further performance
+optimization before those gates.
 
 ## Resume on the laptop
 
