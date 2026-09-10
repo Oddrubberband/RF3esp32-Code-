@@ -1,5 +1,30 @@
 # RF3 continuity instructions
 
+## Authoritative board pin mapping - do not revert
+
+The user-confirmed mapping below is the required configuration for these boards.
+Following correction `74654ce`, the September 10 custom-PCB status screenshot
+shows Standby and fault=0. The devboard also passed its startup check.
+
+| Board | CE | CSN | IRQ | SCK | MOSI | MISO |
+|---|---:|---:|---:|---:|---:|---:|
+| Custom PCB (`rf3_custom_pcb`) | 17 | 27 | 16 | 18 | 23 | 19 |
+| Devboard (`rf3_esp32_devboard`) | 27 | 5 | 26 | 18 | 23 | 19 |
+
+**CUSTOM PCB: CSN=GPIO27 and IRQ=GPIO16. The old CSN=GPIO5 / IRQ=GPIO27
+custom-PCB mapping is superseded and must not be restored.** It survived in
+the committed pre-Phase-1 baseline even though the working laptop firmware had
+already corrected it; flashing that baseline produced a radio probe fault.
+The devboard's CSN=GPIO5 remains correct. Do not swap the two board profiles.
+
+Keep `platformio.ini`, `include/hardware_profile.hpp`, native pin assertions,
+`tools/prepare_board_handoff.py`, and current pin documentation synchronized.
+Older commits, schematics, PDFs, and historical handoffs do not override this
+mapping. Any future pin change requires explicit user confirmation for the
+actual board. Successful startup is not evidence of completed RF transfers.
+
+## Continuity workflow
+
 The user wants to resume this project in Codex on another computer without
 reconstructing context from chat history. Documentation is part of the work.
 

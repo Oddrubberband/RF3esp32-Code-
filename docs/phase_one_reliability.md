@@ -13,8 +13,11 @@ The laptop's previous local firmware used CE=17, CSN=27, IRQ=16. That local
 correction was absent from committed baseline `aa911c3` and the integrated
 Phase 1 source, which used CE=17, CSN=5, IRQ=27. After flashing Phase 1, the
 user reported custom-PCB startup `fault=1` (SPI register probe failure), while
-the devboard booted in Standby with `fault=0`. A successful custom-board probe
-after the correction is still required to establish hardware recovery.
+the devboard booted in Standby with `fault=0`. After reflashing correction
+`74654ce`, the user's September 10 custom-PCB status screenshot shows Standby,
+`fault=0`, `power=3`, `last_status=0x0E`, `fifo=0x11`, and `irq=high`.
+SPIFFS remains mounted with the previously staged files. This confirms radio
+initialization recovery, not RF transfer success, throughput, or IRQ timing.
 
 The user authorized restoring the previous local mapping. The firmware build
 flags, compile-time hardware profile, native pin assertions, offline handoff
@@ -25,8 +28,8 @@ packages that encode CSN=5 and IRQ=27. No Phase 2 work is part of this correctio
 
 The corrected source passed 211 native tests, 16 Python tests (including the
 offline handoff configuration checks), repository hygiene, whitespace checks,
-and the custom-PCB firmware build. The custom image is ready for upload; a
-successful on-board probe after reflashing is still unverified. Qualification,
+and both canonical firmware builds. Custom-board startup after reflashing is
+confirmed by the user-supplied status screenshot described above. Qualification,
 Wi-Fi validation, and complete offline image packages were not rerun for this
 pin-only correction. The broader results below describe September 7.
 

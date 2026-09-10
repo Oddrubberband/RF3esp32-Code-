@@ -2,18 +2,31 @@
 
 Last substantive documentation update: 2026-09-10.
 
+## Authoritative pin mapping - do not revert
+
+**Custom PCB: CE=17, CSN=27, IRQ=16. Devboard: CE=27, CSN=5, IRQ=26.
+Both: SCK=18, MOSI=23, MISO=19.** The custom-PCB CSN=5 / IRQ=27 mapping in
+older commits and handoffs is superseded; the devboard's CSN=5 is correct.
+Future changes require explicit user confirmation for the actual board. The
+standing instruction and full table are at the top of [AGENTS.md](../AGENTS.md).
+
 ## Current state
 
 ### Laptop pin correction - 2026-09-10
 
-The current correction is on local branch `codex/phase-one-laptop`, based on
+Pin correction `74654ce` is on local branch `codex/phase-one-laptop`, based on
 `5a22f91`. The separate older active checkout and its uncommitted changes are
-preserved. This correction is recorded locally with this handoff update; it has
-not been pushed. Use `git log -1 --oneline` for its final commit.
+preserved. The correction and these notes are committed locally; no push was
+performed in this session. Use `git log -2 --oneline` for the latest revisions.
 
 The user reported uploading Phase 1 to both boards. The devboard boot log shows
-`Radio boot OK`, Standby, and `fault=0`; the custom PCB reports startup `fault=1`
-with SPIFFS mounted. This is startup evidence only, not a successful RF transfer.
+`Radio boot OK`, Standby, and `fault=0`. The custom PCB initially reported
+startup `fault=1` with SPIFFS mounted. After the corrected firmware was uploaded,
+the user's September 10 screenshot shows `profile=custom-pcb`, `State=Standby`,
+`fault=0`, `power=3`, `last_status=0x0E`, `fifo=0x11`, and `irq=high`.
+SPIFFS remains ready and lists README.md, song.u8, and speech_test.u8.
+This confirms recovery of radio initialization; it is not a successful RF
+transfer or a physical throughput result.
 
 The previous local custom-PCB firmware uses CE=17, CSN=27, IRQ=16. The committed
 Phase 1 baseline instead preserved CE=17, CSN=5, IRQ=27. On the user's direction,
@@ -24,12 +37,10 @@ SCK=18, MOSI=23, MISO=19. The prior statement that the preserved committed pins
 were sufficient for this laptop's custom PCB was incorrect.
 
 Fresh validation passed 211 native tests, 16 Python tests (including the offline
-handoff configuration checks), repository hygiene, whitespace checks, and the
-custom-PCB firmware build. The corrected firmware has not been flashed, and
-radio recovery is unverified. Phase 2 and all later work remain paused at the
-user's request. Next: upload custom-PCB firmware only,
-then capture its startup pin line and radio probe result. Existing SPIFFS files
-should be preserved. Earlier custom-PCB images with CSN=5/IRQ=27 are superseded.
+handoff configuration checks), repository hygiene, whitespace checks, and both
+canonical firmware builds. The corrected custom-PCB startup is now confirmed
+by the user's status screenshot. Phase 2 and all later work remain paused at
+the user's request. Earlier custom-PCB images with CSN=5/IRQ=27 are superseded.
 
 ### Integrated baseline - 2026-09-07
 
@@ -105,7 +116,8 @@ changes using the commands in the Phase 1 document.
 
 ## Next concrete work
 
-Finish the custom-PCB pin correction and its firmware/startup verification.
+The custom-PCB pin correction and radio startup verification are complete.
+Retain the authoritative pin mapping above and await the user's next task.
 Phase 2 and later work are paused. The user's requested future sequence is
 Measurement Foundation, then the physical RF/power baseline; the older phase
 guide's numbering and permission to overlap storage work do not override that

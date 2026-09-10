@@ -25,6 +25,10 @@ branch, completed work, validation, and next steps. Read the
 The rf3_custom_pcb environment selects the custom ESP32-WROOM-32UE-N16 PCB:
 
 - CE 17, CSN 27, IRQ 16
+
+**Custom-PCB pinout warning:** CSN=GPIO27 and IRQ=GPIO16 are authoritative.
+The older custom-PCB CSN=GPIO5 / IRQ=GPIO27 mapping is superseded. See
+[AGENTS.md](AGENTS.md) for the complete mapping and confirmation requirement.
 - SCK 18, MOSI 23, MISO 19
 
 The rf3_esp32_devboard environment selects the ESP32 development-board setup:
