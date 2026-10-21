@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 #include "audio_packet.hpp"
@@ -12,6 +14,7 @@ constexpr uint8_t kControlStart = 0x81;
 constexpr uint8_t kControlStop = 0x82;
 constexpr uint8_t kControlRemoteCommand = 0x83;
 constexpr uint8_t kControlRemoteResponse = 0x84;
+constexpr uint8_t kControlTextMessage = 0x85;
 
 constexpr uint8_t kMagic0 = 'R';
 constexpr uint8_t kMagic1 = 'F';
@@ -19,6 +22,11 @@ constexpr uint8_t kMagic2 = '3';
 constexpr uint8_t kVersion = 1;
 constexpr size_t kRemoteCommandHeaderBytes = 6;
 constexpr size_t kRemoteCommandMaxBytes = AudioPacket::kPacketBytes - kRemoteCommandHeaderBytes;
+constexpr size_t kTextMessageHeaderBytes = 10;
+constexpr size_t kTextChunkMaxBytes = AudioPacket::kPacketBytes - kTextMessageHeaderBytes;
+constexpr size_t kTextMessageMaxBytes = 154;
+constexpr size_t kTextMessageMaxChunks =
+    (kTextMessageMaxBytes + kTextChunkMaxBytes - 1) / kTextChunkMaxBytes;
 
 constexpr uint8_t kRecommendedStartRepeats = 5;
 constexpr uint32_t kRecommendedStartGapMs = 15;
@@ -275,6 +283,189 @@ inline bool decodeRemoteResponse(const uint8_t* packet,
         text_len);
     return true;
 }
+
+struct TextChunk {
+    uint16_t message_id = 0;
+    uint8_t chunk_index = 0;
+    uint8_t chunk_count = 0;
+    std::string_view text{};
+};
+
+inline bool isTextMessagePacket(const uint8_t* packet, size_t packet_len)
+{
+    return packet &&
+           packet_len == AudioPacket::kPacketBytes &&
+           packet[0] == kMagic0 &&
+           packet[1] == kMagic1 &&
+           packet[2] == kMagic2 &&
+           packet[3] == kControlTextMessage &&
+           packet[4] == kVersion;
+}
+
+inline bool encodeTextChunk(uint16_t message_id,
+                            uint8_t chunk_index,
+                            uint8_t chunk_count,
+                            const char* text,
+                            size_t text_len,
+                            uint8_t* out_packet,
+                            size_t& out_packet_len)
+{
+    out_packet_len = 0;
+
+    if (!text || !out_packet || message_id == 0 ||
+        chunk_count == 0 || chunk_count > kTextMessageMaxChunks ||
+        chunk_index >= chunk_count || text_len == 0 || text_len > kTextChunkMaxBytes ||
+        (chunk_index + 1u < chunk_count && text_len != kTextChunkMaxBytes)) {
+        return false;
+    }
+
+    clearPacket(out_packet);
+    out_packet[0] = kMagic0;
+    out_packet[1] = kMagic1;
+    out_packet[2] = kMagic2;
+    out_packet[3] = kControlTextMessage;
+    out_packet[4] = kVersion;
+    out_packet[5] = static_cast<uint8_t>((message_id >> 8) & 0xFF);
+    out_packet[6] = static_cast<uint8_t>(message_id & 0xFF);
+    out_packet[7] = chunk_index;
+    out_packet[8] = chunk_count;
+    out_packet[9] = static_cast<uint8_t>(text_len);
+
+    for (size_t i = 0; i < text_len; ++i) {
+        const uint8_t ch = static_cast<uint8_t>(text[i]);
+        if (ch < 0x20 || ch > 0x7E) {
+            out_packet_len = 0;
+            return false;
+        }
+        out_packet[kTextMessageHeaderBytes + i] = ch;
+    }
+
+    out_packet_len = AudioPacket::kPacketBytes;
+    return true;
+}
+
+inline bool decodeTextChunk(const uint8_t* packet,
+                            size_t packet_len,
+                            TextChunk& out_chunk)
+{
+    out_chunk = {};
+    if (!isTextMessagePacket(packet, packet_len)) {
+        return false;
+    }
+
+    const uint16_t message_id =
+        static_cast<uint16_t>(packet[5] << 8) |
+        static_cast<uint16_t>(packet[6]);
+    const uint8_t chunk_index = packet[7];
+    const uint8_t chunk_count = packet[8];
+    const size_t text_len = packet[9];
+    if (message_id == 0 || chunk_count == 0 || chunk_count > kTextMessageMaxChunks ||
+        chunk_index >= chunk_count || text_len == 0 || text_len > kTextChunkMaxBytes ||
+        (chunk_index + 1u < chunk_count && text_len != kTextChunkMaxBytes)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < text_len; ++i) {
+        const uint8_t ch = packet[kTextMessageHeaderBytes + i];
+        if (ch < 0x20 || ch > 0x7E) {
+            return false;
+        }
+    }
+    for (size_t i = kTextMessageHeaderBytes + text_len;
+         i < AudioPacket::kPacketBytes;
+         ++i) {
+        if (packet[i] != 0) {
+            return false;
+        }
+    }
+
+    out_chunk.message_id = message_id;
+    out_chunk.chunk_index = chunk_index;
+    out_chunk.chunk_count = chunk_count;
+    out_chunk.text = std::string_view(
+        reinterpret_cast<const char*>(packet + kTextMessageHeaderBytes),
+        text_len);
+    return true;
+}
+
+class TextMessageAssembler {
+public:
+    enum class Action {
+        NotText,
+        Invalid,
+        Ignored,
+        InProgress,
+        Complete
+    };
+
+    void reset()
+    {
+        active_ = false;
+        message_id_ = 0;
+        chunk_count_ = 0;
+        next_chunk_ = 0;
+        text_size_ = 0;
+    }
+
+    Action accept(const uint8_t* packet,
+                  size_t packet_len,
+                  std::string_view& out_message)
+    {
+        out_message = {};
+        if (!isTextMessagePacket(packet, packet_len)) {
+            return Action::NotText;
+        }
+
+        TextChunk chunk{};
+        if (!decodeTextChunk(packet, packet_len, chunk)) {
+            reset();
+            return Action::Invalid;
+        }
+
+        if (chunk.chunk_index == 0) {
+            reset();
+            active_ = true;
+            message_id_ = chunk.message_id;
+            chunk_count_ = chunk.chunk_count;
+        } else if (!active_) {
+            return Action::Ignored;
+        }
+
+        if (chunk.message_id != message_id_ || chunk.chunk_count != chunk_count_) {
+            reset();
+            return Action::Invalid;
+        }
+        if (chunk.chunk_index < next_chunk_) {
+            return Action::Ignored;
+        }
+        if (chunk.chunk_index != next_chunk_ ||
+            text_size_ + chunk.text.size() > text_buffer_.size()) {
+            reset();
+            return Action::Invalid;
+        }
+
+        for (char ch : chunk.text) {
+            text_buffer_[text_size_++] = ch;
+        }
+        ++next_chunk_;
+
+        if (next_chunk_ < chunk_count_) {
+            return Action::InProgress;
+        }
+
+        out_message = std::string_view(text_buffer_.data(), text_size_);
+        active_ = false;
+        return Action::Complete;
+    }
+
+private:
+    std::array<char, kTextMessageMaxBytes> text_buffer_{};
+    bool active_ = false;
+    uint16_t message_id_ = 0;
+    uint8_t chunk_count_ = 0;
+    uint8_t next_chunk_ = 0;
+    size_t text_size_ = 0;
+};
 
 class ReceiverGate {
 public:

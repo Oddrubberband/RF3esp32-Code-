@@ -2,8 +2,12 @@
 .pio-core/
 .pio-home/
 .venv/
+.venv-host/
 build/
 build-idf/
+dist/
+*.spec
+!RF3Desktop.spec
 sdkconfig
 sdkconfig.old
 sdkconfig.*
@@ -11,6 +15,7 @@ sdkconfig.*
 !sdkconfig.*.defaults
 native-test-results.txt
 __pycache__/
+.test-tmp/
 *.pyc
 include/wifi_control_config.local.hpp
 

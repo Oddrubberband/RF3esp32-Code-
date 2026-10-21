@@ -8,6 +8,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MACHINE_PATH_EXCLUSIONS = {
+    # The project registry requires absolute paths in its runbooks/entry point.
+    # VS Code's saved ESP-IDF setup is workstation metadata, not source code.
+    # Secret checks below still apply to every one of these files.
+    "AGENTS.md",
+    "README.md",
+    "host_gui/README.md",
+    "docs/build_and_test.md",
+    ".vscode/settings.json",
     "docs/codex_repository_audit.md",
     "docs/integration_readiness_report.md",
 }

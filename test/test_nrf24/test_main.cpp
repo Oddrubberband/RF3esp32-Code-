@@ -1544,6 +1544,78 @@ void test_streamSync_remote_response_round_trip(void)
     TEST_ASSERT_EQUAL_MEMORY(kText, text.data(), sizeof(kText) - 1);
 }
 
+void test_streamSync_text_message_reassembles_multiple_chunks(void)
+{
+    const std::string message =
+        "This live message spans several nRF24 packets cleanly.";
+    const size_t chunk_count =
+        (message.size() + StreamSync::kTextChunkMaxBytes - 1) /
+        StreamSync::kTextChunkMaxBytes;
+    StreamSync::TextMessageAssembler assembler;
+    std::string_view completed;
+
+    for (size_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+        const size_t offset = chunk_index * StreamSync::kTextChunkMaxBytes;
+        const size_t remaining = message.size() - offset;
+        const size_t chunk_len =
+            remaining < StreamSync::kTextChunkMaxBytes
+                ? remaining
+                : StreamSync::kTextChunkMaxBytes;
+        uint8_t packet[AudioPacket::kPacketBytes] = {};
+        size_t packet_len = 0;
+        TEST_ASSERT_TRUE(StreamSync::encodeTextChunk(
+            0x1234,
+            static_cast<uint8_t>(chunk_index),
+            static_cast<uint8_t>(chunk_count),
+            message.data() + offset,
+            chunk_len,
+            packet,
+            packet_len));
+
+        const StreamSync::TextMessageAssembler::Action action =
+            assembler.accept(packet, packet_len, completed);
+        if (chunk_index + 1 < chunk_count) {
+            TEST_ASSERT_EQUAL(
+                static_cast<int>(StreamSync::TextMessageAssembler::Action::InProgress),
+                static_cast<int>(action));
+        } else {
+            TEST_ASSERT_EQUAL(
+                static_cast<int>(StreamSync::TextMessageAssembler::Action::Complete),
+                static_cast<int>(action));
+        }
+    }
+
+    TEST_ASSERT_EQUAL_UINT32(message.size(), static_cast<uint32_t>(completed.size()));
+    TEST_ASSERT_EQUAL_MEMORY(message.data(), completed.data(), message.size());
+}
+
+void test_streamSync_text_message_rejects_out_of_order_chunk(void)
+{
+    std::array<char, StreamSync::kTextChunkMaxBytes> first{};
+    first.fill('A');
+    uint8_t first_packet[AudioPacket::kPacketBytes] = {};
+    uint8_t second_packet[AudioPacket::kPacketBytes] = {};
+    size_t first_len = 0;
+    size_t second_len = 0;
+
+    TEST_ASSERT_TRUE(StreamSync::encodeTextChunk(
+        0x2222, 0, 2, first.data(), first.size(), first_packet, first_len));
+    TEST_ASSERT_TRUE(StreamSync::encodeTextChunk(
+        0x2222, 1, 2, "B", 1, second_packet, second_len));
+
+    StreamSync::TextMessageAssembler assembler;
+    std::string_view completed;
+    TEST_ASSERT_EQUAL(
+        static_cast<int>(StreamSync::TextMessageAssembler::Action::Ignored),
+        static_cast<int>(assembler.accept(second_packet, second_len, completed)));
+    TEST_ASSERT_EQUAL(
+        static_cast<int>(StreamSync::TextMessageAssembler::Action::InProgress),
+        static_cast<int>(assembler.accept(first_packet, first_len, completed)));
+    TEST_ASSERT_EQUAL(
+        static_cast<int>(StreamSync::TextMessageAssembler::Action::Complete),
+        static_cast<int>(assembler.accept(second_packet, second_len, completed)));
+}
+
 void test_streamSync_gate_ignores_nonzero_audio_before_sync(void)
 {
     uint8_t packet[AudioPacket::kPacketBytes] = {};
@@ -1858,6 +1930,9 @@ int main(void)
     RUN_TEST(test_streamSync_stop_round_trip);
     RUN_TEST(test_streamSync_remote_command_round_trip);
     RUN_TEST(test_streamSync_remote_command_rejects_oversized_text);
+    RUN_TEST(test_streamSync_remote_response_round_trip);
+    RUN_TEST(test_streamSync_text_message_reassembles_multiple_chunks);
+    RUN_TEST(test_streamSync_text_message_rejects_out_of_order_chunk);
     RUN_TEST(test_streamSync_gate_ignores_nonzero_audio_before_sync);
     RUN_TEST(test_streamSync_gate_accepts_legacy_seq0_without_start);
     RUN_TEST(test_streamSync_gate_accepts_start_then_seq0);

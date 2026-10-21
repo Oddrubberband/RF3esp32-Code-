@@ -2,7 +2,21 @@
 
 RF3 uses PlatformIO Core 6.1.19 and pins the Espressif32 platform to 7.0.1.
 Run commands from the repository root. Build output and generated sdkconfig
-files remain under the ignored .pio directory.
+files remain under the ignored .pio directory. The only active repository root
+on this machine is the direct path below; no directory junction is required:
+
+```powershell
+Set-Location 'C:\Users\Pare\Desktop\SCHOOL\fall_2026\404\CodE_project\RF3esp32-Code-clean'
+```
+
+Documentation-only edits do not trigger any of these builds or packaging.
+When code validation or delivery requires a build, reuse the existing output
+directories. GUI packaging uses only `RF3Desktop.spec`, updates
+`dist/RF3DesktopFixed/` in place, and reuses `build/RF3Desktop/`:
+
+```powershell
+.\.venv-host\Scripts\python.exe -m PyInstaller --noconfirm --distpath dist --workpath build RF3Desktop.spec
+```
 
 ## Native validation
 

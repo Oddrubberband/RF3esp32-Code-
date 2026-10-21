@@ -26,6 +26,7 @@ idf_component_register(
         # Serial Peripheral Interface Flash File System (SPIFFS) is only used
         # internally by main.cpp, so it remains private.
         spiffs
+        bt
         esp_event
         esp_http_server
         esp_netif
