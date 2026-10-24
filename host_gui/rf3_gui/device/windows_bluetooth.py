@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 SPP_SERVICE_UUID = "00001101-0000-1000-8000-00805f9b34fb"
 ERROR_NO_MORE_ITEMS = 259
 ERROR_CANCELLED = 1223
+ERROR_INVALID_PARAMETER = 87
 E_INVALIDARG = 0x80070057
 
 
@@ -283,19 +284,39 @@ class WindowsBluetooth:
                 if not device.authenticated:
                     raise BluetoothError("Windows did not confirm pairing; no serial connection was opened")
             self._check_cancel(cancel)
+            # A paired device may already have an outgoing SPP driver/COM
+            # mapping. Re-enabling that service is unnecessary and can fail
+            # before we ever try the working port. Never use another peer's
+            # port or an incoming listener as a fallback.
+            matches = matching_spp_ports(address, self._port_provider(), self._registry_lookup(address))
+            self._check_cancel(cancel)
+            if len(matches) > 1:
+                raise BluetoothError("Multiple outgoing SPP ports match this device; choose its COM port using Refresh Ports")
+            if len(matches) == 1:
+                progress(f"Using selected device's existing outgoing Bluetooth port {matches[0]}")
+                return matches[0]
             progress("Enabling the selected device's Serial Port Profile service")
             error = api.enable_spp(radio, device)
-            if error not in (0, E_INVALIDARG):
-                raise BluetoothError(f"Serial Port Profile unavailable (Windows error {error}). Use Classic SPP firmware; BLE-only ESP chips need a BLE transport")
+            self._check_cancel(cancel)
+            if error == ERROR_INVALID_PARAMETER:
+                # Error 87 is an activation-parameter failure, not proof of a
+                # BLE-only peer. Accept only an address-verified COM mapping
+                # appearing within the normal bounded readiness wait below.
+                progress("Windows SPP activation returned error 87 (invalid parameter); checking for the selected device's outgoing port")
+            elif error not in (0, E_INVALIDARG):
+                raise BluetoothError(f"Windows could not enable this device's Serial Port Profile (error {error}). Check its Classic SPP service and Windows driver setup; this error alone does not identify the ESP chip type")
             deadline = time.monotonic() + self._port_timeout
             progress("Waiting for the selected device's outgoing Bluetooth COM port")
             while True:
                 self._check_cancel(cancel)
                 matches = matching_spp_ports(address, self._port_provider(), self._registry_lookup(address))
+                self._check_cancel(cancel)
                 if len(matches) == 1:
                     return matches[0]
                 if len(matches) > 1:
                     raise BluetoothError("Multiple outgoing SPP ports match this device; choose its COM port using Refresh Ports")
                 if time.monotonic() >= deadline:
+                    if error == ERROR_INVALID_PARAMETER:
+                        raise BluetoothError("Windows SPP activation returned error 87 (invalid parameter), and no outgoing SPP COM port matched the selected device. Check its Serial Port service in Windows Bluetooth settings, then use Refresh Ports or retry; no other device's port was selected")
                     raise BluetoothError("Paired, but no outgoing SPP COM port appeared for this device. Check SPP firmware/service and retry; no other device's port was selected")
                 cancel.wait(0.25)

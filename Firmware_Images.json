@@ -1,0 +1,14 @@
+{
+  "Current": {
+    "rf3_custom_pcb": {
+      "bootloader.bin": "2a7dfef9dc5941486b9663db30994768c80466d4d1b143ea6955f1f519f6ad69",
+      "partitions.bin": "ec22054c31cb913300f7fbbec81bfd932fb9d20893e3c160aadbde6ddf7e71cb",
+      "firmware.bin": "e966e9630fb07f22e5d594ab176f97f8b71f2401854398f4185e55a8156b274e"
+    },
+    "rf3_esp32_devboard": {
+      "bootloader.bin": "88044d8ce09822d179daef004c707b7f766bf368c2b45f660b14a49d30d22338",
+      "partitions.bin": "bf796b75a6aeb7161a0db466e7c622a6e12047e4fdcfe75e59db113720d62d9d",
+      "firmware.bin": "72122db8d256766116778a85c4762063fcfcc4fc573a956e3e4b2401e3e0090a"
+    }
+  }
+}

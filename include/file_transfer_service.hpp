@@ -55,6 +55,7 @@ enum class StartCode : uint8_t {
     UnsupportedSize,
     LengthMismatch,
     SessionRejected,
+    InvalidExtension,
 };
 
 template <size_t Capacity>
@@ -228,6 +229,13 @@ public:
         sender_status_.started_ms = now_ms;
         sender_status_.updated_ms = now_ms;
 
+        FileTypeMetadata::Extension extension{};
+        if (!FileTypeMetadata::derive(metadata.logical_filename.c_str(), extension)) {
+            active_source_ = nullptr;
+            sender_status_.state = State::Failed;
+            sender_status_.error = ProtocolV2::ErrorCode::InvalidMetadata;
+            return {StartCode::InvalidExtension, 0};
+        }
         ReliableTransferV2::Metadata wire_metadata{};
         const ReliableTransferV2::InspectResult inspected =
             ReliableTransferV2::inspectSource(this, sourceCallbacks(), wire_metadata);
@@ -239,6 +247,7 @@ public:
             sender_status_.elapsed_ms = 0;
             return {inspectStartCode(inspected), 0};
         }
+        wire_metadata.extension = extension;
         if (metadata.has_expected_length &&
             metadata.expected_length != wire_metadata.total_size) {
             active_source_ = nullptr;

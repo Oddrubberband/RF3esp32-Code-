@@ -1,14 +1,16 @@
 import os
+import json
 import queue
 import threading
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from rf3_gui.app.state_model import ConnectionState, DeviceInfo, RadioState
+from rf3_gui.app.state_model import ConnectionState, DeviceInfo, RadioState, RadioCapabilities, Telemetry
 from rf3_gui.device.serial_device import (
     SERIAL_MAX_RESPONSE_BYTES,
     SerialDeviceBackend,
@@ -38,7 +40,8 @@ class TestConnectionSafety(unittest.TestCase):
         responses = iter([b'{"state":"Stand', b'', b'by","channel":76}\r\n'])
 
         class FragmentedSerial:
-            def readline(self, size=-1):
+            in_waiting = 0
+            def read(self, size=1):
                 try:
                     return next(responses)
                 except StopIteration:
@@ -97,6 +100,7 @@ class TestConnectionSafety(unittest.TestCase):
         def write(payload):
             written.append(payload)
             stop.set()
+            return len(payload)
 
         old_port = SimpleNamespace(write=write, flush=lambda: None)
         self.backend._serial = SimpleNamespace(write=lambda _: self.fail("Used new port"), close=lambda: None)
@@ -145,3 +149,110 @@ class TestConnectionSafety(unittest.TestCase):
         self.assertTrue(window.disconnect_button.isEnabled())
         self.assertFalse(window.connect_button.isEnabled())
         window.close()
+
+    def test_hello_connects_without_radio_and_unavailable_status_keeps_host_alive(self):
+        backend = self.backend
+        backend._handle_line(json.dumps({"rf3_protocol": 1, "node_name": "rf3-pcb",
+                                        "profile": "custom-pcb", "protocol": 2}))
+        self.assertTrue(backend._identity_ok)
+        self.assertTrue(backend._handshake_ok)
+        self.assertEqual(backend._snapshot.connection_state, ConnectionState.CONNECTED)
+        self.assertEqual(backend._snapshot.confirmed_radio_state, RadioState.UNKNOWN)
+        backend.request_status()
+        backend._handle_line('{"state":"Unavailable"}')
+        self.assertFalse(backend._status_response_timer.isActive())
+        self.assertNotIn("STATUS", backend._pending_commands)
+        self.assertTrue(backend._status_poll_timer.isActive())
+        self.assertEqual(backend._snapshot.connection_state, ConnectionState.CONNECTED)
+        backend._handle_line('{"state":"Fault","last_fault":1}')
+        self.assertEqual(backend._snapshot.confirmed_radio_state, RadioState.FAULT)
+
+    def test_incomplete_or_unsupported_identity_cannot_connect(self):
+        identity = {"rf3_protocol": 1, "node_name": "rf3-pcb", "profile": "custom-pcb", "protocol": 2}
+        for fields in ({"rf3_protocol": True}, {"rf3_protocol": 999}, {"profile": []},
+                       {"profile": "unrelated"}, {"node_name": ""}, {"protocol": True}):
+            self.backend._handle_line(json.dumps(identity | fields))
+            self.assertFalse(self.backend._handshake_ok)
+        self.backend._handle_line('{"rf3_protocol":1}')
+        self.assertFalse(self.backend._handshake_ok)
+
+    def test_radio_controls_wait_for_telemetry_after_hello(self):
+        from rf3_gui.app.controller import AppController
+        from rf3_gui.ui.main_window import MainWindow
+        window = MainWindow(AppController(self.backend))
+        self.backend._handle_line('{"rf3_protocol":1,"node_name":"rf3-pcb","profile":"custom-pcb","protocol":2}')
+        window._apply_snapshot(self.backend._snapshot)
+        self.assertFalse(window.rx_button.isEnabled())
+        self.assertFalse(window.apply_channel_button.isEnabled())
+        self.assertFalse(window.test_mode_checkbox.isEnabled())
+        self.assertIn("waiting for radio status", window.connection_detail_label.text())
+        window.close()
+
+    def test_port_setup_does_not_consume_status_handshake_deadline(self):
+        backend = self.backend
+        backend._serial = None
+        backend._snapshot = backend._replace_snapshot(connection_state=ConnectionState.DISCONNECTED)
+        with patch("rf3_gui.device.serial_device.threading.Thread"):
+            backend.connect_to(DeviceInfo("RF3", "12:34:56:78:9A:BC", "bluetooth"))
+        self.assertTrue(backend._setup_timer.isActive())
+        self.assertFalse(backend._handshake_timer.isActive())
+        backend._on_worker_event(backend._connection_generation, "resolved",
+                                 DeviceInfo("RF3 Bluetooth", "COM9", "serial"))
+        self.assertTrue(backend._setup_timer.isActive())
+        self.assertFalse(backend._handshake_timer.isActive())
+        backend._on_serial_opened("COM9")
+        self.assertFalse(backend._setup_timer.isActive())
+        self.assertGreater(backend._handshake_timer.remainingTime(), 24000)
+
+    def test_probe_queue_is_bounded_while_status_write_is_pending(self):
+        backend = self.backend
+        for _ in range(20):
+            backend._send_handshake_status()
+        self.assertEqual(list(backend._write_queue.queue), ["HELLO", "STATUS"])
+        backend._on_worker_event(backend._connection_generation, "written", "STATUS")
+        backend._send_handshake_status()
+        self.assertEqual(list(backend._write_queue.queue), ["HELLO", "STATUS", "STATUS"])
+
+    def test_writer_never_calls_unbounded_driver_flush(self):
+        stop = threading.Event()
+        commands = queue.Queue()
+        commands.put("STATUS")
+        def write(payload):
+            stop.set()
+            return len(payload)
+        port = SimpleNamespace(write=write, flush=lambda: self.fail("Unbounded flush called"))
+        self.backend._write_loop(port, stop, commands, self.backend._connection_generation)
+
+    def test_partial_write_reports_failure(self):
+        events = []
+        self.backend._worker_event.connect(lambda generation, kind, payload: events.append((kind, payload)))
+        commands = queue.Queue()
+        commands.put("CHANNEL 1")
+        commands.put(None)
+        self.backend._write_loop(SimpleNamespace(write=lambda payload: 2), threading.Event(),
+                                 commands, self.backend._connection_generation)
+        self.assertTrue(any(kind == "write_error" and "Incomplete serial write" in payload[1]
+                            for kind, payload in events))
+
+    def test_cancel_stops_both_connection_deadlines(self):
+        self.backend._setup_timer.start(120000)
+        self.backend._handshake_timer.start(25000)
+        self.backend.disconnect_from_device()
+        self.assertFalse(self.backend._setup_timer.isActive())
+        self.assertFalse(self.backend._handshake_timer.isActive())
+
+    def test_new_peer_cannot_inherit_previous_boards_capabilities(self):
+        backend = self.backend
+        backend._serial = None
+        backend._snapshot = backend._replace_snapshot(
+            connection_state=ConnectionState.DISCONNECTED, test_mode=True, selected_file="old.bin",
+            power_level=3, telemetry=Telemetry(rx_saved=7),
+            capabilities=RadioCapabilities(supports_host_echo=True, supports_host_file_upload=True))
+        with patch("rf3_gui.device.serial_device.threading.Thread"):
+            backend.connect_to(DeviceInfo("RF3 PCB", "COM9", "serial"))
+        self.assertFalse(backend._snapshot.test_mode)
+        self.assertFalse(backend._snapshot.capabilities.supports_host_echo)
+        self.assertFalse(backend._snapshot.capabilities.supports_host_file_upload)
+        self.assertEqual(backend._snapshot.selected_file, "")
+        self.assertEqual(backend._snapshot.telemetry.rx_saved, 0)
+        self.assertIsNone(backend._snapshot.power_level)

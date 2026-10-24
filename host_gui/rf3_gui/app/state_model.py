@@ -63,6 +63,10 @@ class DeviceInfo:
 
 @dataclass(frozen=True)
 class RadioCapabilities:
+    supports_test_mode: bool = False
+    supports_stored_file_tx: bool = False
+    host_chunk_max: int = 64
+    supports_host_storage: bool = False
     min_channel: int = MIN_CHANNEL
     max_channel: int = MAX_CHANNEL
     power_levels: tuple[int, ...] = (0, 1, 2, 3)
@@ -99,7 +103,15 @@ class Telemetry:
 
 @dataclass(frozen=True)
 class DeviceSnapshot:
+    rx_transfer_state: str = ""
+    rx_transfer_id: str = ""
+    rx_received_bytes: int = 0
+    rx_total_bytes: int = 0
+    rx_error: str = ""
+    profile: str = ""
+    active_tx_file: str = ""
     connection_state: ConnectionState = ConnectionState.DISCONNECTED
+    connection_detail: str = ""
     test_mode: bool = False
     test_tx_count: int = 0
     test_tx_bytes: int = 0
@@ -110,6 +122,20 @@ class DeviceSnapshot:
     selected_file: str = ""
     telemetry: Telemetry = field(default_factory=Telemetry)
     capabilities: RadioCapabilities = field(default_factory=RadioCapabilities)
+
+
+@dataclass(frozen=True)
+class StoredFile:
+    name: str
+    size: int
+
+
+@dataclass(frozen=True)
+class StorageListing:
+    files: tuple[StoredFile, ...] = ()
+    used: int = 0
+    capacity: int = 0
+    available: bool = False
 
 
 @dataclass(frozen=True)

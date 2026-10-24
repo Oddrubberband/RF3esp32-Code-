@@ -15,6 +15,7 @@ class DeviceBackend(QObject):
     command_finished = Signal(str, bool, str)
     log_event = Signal(str, str)
     text_message_received = Signal(str, str)
+    storage_changed = Signal(object)
 
     def discover(self) -> None:
         raise NotImplementedError
@@ -32,6 +33,24 @@ class DeviceBackend(QObject):
         raise NotImplementedError
 
     def request_status(self) -> None:
+        raise NotImplementedError
+
+    def refresh_storage(self) -> None:
+        raise NotImplementedError
+
+    def import_file(self, source_path: Path) -> None:
+        raise NotImplementedError
+
+    def export_file(self, remote_name: str, destination_path: Path) -> None:
+        raise NotImplementedError
+
+    def delete_file(self, remote_name: str) -> None:
+        raise NotImplementedError
+
+    def select_stored_file(self, remote_name: str) -> None:
+        raise NotImplementedError
+
+    def start_stored_tx(self, remote_name: str) -> None:
         raise NotImplementedError
 
     def set_test_mode(self, enabled: bool) -> None:

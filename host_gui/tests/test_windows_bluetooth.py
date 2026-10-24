@@ -23,6 +23,7 @@ from rf3_gui.app.state_model import ConnectionState, DeviceInfo, DeviceSnapshot
 from rf3_gui.device.serial_device import SerialDeviceBackend, _write_timeout_for
 from rf3_gui.device.windows_bluetooth import (
     BluetoothCancelled, BluetoothError, BluetoothPeer, E_INVALIDARG,
+    ERROR_INVALID_PARAMETER,
     WindowsBluetooth, _DeviceInfo, _SystemTime, compact_address, matching_spp_ports,
     _NativeApi, _SearchParams, SPP_SERVICE_UUID,
 )
@@ -87,7 +88,7 @@ class FakeApi:
 class TestWindowsBluetooth(unittest.TestCase):
     def adapter(self, api, ports=None, **kwargs):
         return WindowsBluetooth(api_factory=lambda: api,
-                                port_provider=lambda: [port()] if ports is None else ports,
+                                port_provider=lambda: ([port()] if "service" in api.calls else []) if ports is None else ports,
                                 registry_lookup=lambda address: [], port_timeout=0, **kwargs)
 
     def test_fresh_scan_does_not_pair_or_enable_service(self):
@@ -113,7 +114,7 @@ class TestWindowsBluetooth(unittest.TestCase):
             ADDRESS, threading.Event(), parent_window=42, progress=messages.append)
         self.assertEqual(chosen, "COM9")
         self.assertIn(("pair", 42), api.calls)
-        self.assertIn("service", api.calls)
+        self.assertNotIn("service", api.calls)  # Already mapped after pairing.
         self.assertTrue(any("Pairing" in message for message in messages))
 
     def test_already_paired_does_not_request_pairing_again(self):
@@ -166,11 +167,12 @@ class TestWindowsBluetooth(unittest.TestCase):
         with self.assertRaisesRegex(BluetoothError, "Multiple outgoing"):
             self.adapter(FakeApi(paired=True), [port("COM7"), port("COM9")]).prepare_serial(ADDRESS, threading.Event())
 
-    def test_unsupported_spp_reports_ble_limitation(self):
+    def test_service_failure_does_not_misdiagnose_ble_only_chip(self):
         api = FakeApi(paired=True)
         api.service_error = 1060
-        with self.assertRaisesRegex(BluetoothError, "BLE-only"):
+        with self.assertRaisesRegex(BluetoothError, "error 1060") as caught:
             self.adapter(api).prepare_serial(ADDRESS, threading.Event())
+        self.assertNotIn("BLE-only", str(caught.exception))
 
     def test_already_enabled_service_still_requires_matching_port(self):
         api = FakeApi(paired=True)
@@ -197,6 +199,37 @@ class TestWindowsBluetooth(unittest.TestCase):
         adapter = WindowsBluetooth(api_factory=lambda: api, port_provider=lambda: next(batches),
                                    registry_lookup=lambda address: [], port_timeout=1)
         self.assertEqual(adapter.prepare_serial(ADDRESS, threading.Event()), "COM9")
+
+    def test_existing_selected_port_bypasses_failing_service_activation(self):
+        api = FakeApi(paired=True)
+        api.service_error = ERROR_INVALID_PARAMETER
+        messages = []
+        chosen = self.adapter(api, [port()]).prepare_serial(ADDRESS, threading.Event(), progress=messages.append)
+        self.assertEqual(chosen, "COM9")
+        self.assertNotIn("service", api.calls)
+        self.assertTrue(any("existing outgoing" in message for message in messages))
+
+    def test_error_87_requires_matching_outgoing_port_after_activation(self):
+        api = FakeApi(paired=True)
+        api.service_error = ERROR_INVALID_PARAMETER
+        messages = []
+        self.assertEqual(self.adapter(api).prepare_serial(ADDRESS, threading.Event(), progress=messages.append), "COM9")
+        self.assertIn("service", api.calls)
+        self.assertTrue(any("error 87" in message for message in messages))
+
+    def test_error_87_never_uses_other_peer_or_incoming_port(self):
+        for ports in ([], [port("COM7", "AABBCCDDEEFF")], [port(incoming=True)]):
+            api = FakeApi(paired=True)
+            api.service_error = ERROR_INVALID_PARAMETER
+            with self.assertRaisesRegex(BluetoothError, "error 87") as caught:
+                self.adapter(api, ports).prepare_serial(ADDRESS, threading.Event())
+            self.assertNotIn("BLE-only", str(caught.exception))
+
+    def test_ambiguous_existing_ports_do_not_toggle_service(self):
+        api = FakeApi(paired=True)
+        with self.assertRaisesRegex(BluetoothError, "Multiple outgoing"):
+            self.adapter(api, [port("COM7"), port("COM9")]).prepare_serial(ADDRESS, threading.Event())
+        self.assertNotIn("service", api.calls)
 
     def test_native_bindings_use_expected_structures_and_spp_guid_without_hardware(self):
         class Function:
@@ -257,6 +290,13 @@ class TestBluetoothGuiIntegration(unittest.TestCase):
         metadata = []
 
         class FakeSerial:
+            def __init__(self):
+                self.pending = bytearray()
+
+            @property
+            def in_waiting(self):
+                return len(self.pending)
+
             def open(self):
                 pass
 
@@ -295,11 +335,15 @@ class TestBluetoothGuiIntegration(unittest.TestCase):
             def flush(self):
                 pass
 
-            def readline(self, size=-1):
-                try:
-                    return responses.get(timeout=0.01)
-                except queue.Empty:
-                    return b""
+            def read(self, size=1):
+                if not self.pending:
+                    try:
+                        self.pending.extend(responses.get(timeout=0.01))
+                    except queue.Empty:
+                        return b""
+                data = bytes(self.pending[:size])
+                del self.pending[:size]
+                return data
 
         def wait_for(predicate):
             deadline = time.monotonic() + 4
@@ -323,7 +367,7 @@ class TestBluetoothGuiIntegration(unittest.TestCase):
             self.assertFalse(serial_port.rts)
             self.assertEqual(serial_constructor.call_args.kwargs["write_timeout"], 8.0)
             self.assertTrue(any(isinstance(call, tuple) and call[0] == "pair" for call in api.calls))
-            self.assertIn("service", api.calls)
+            self.assertNotIn("service", api.calls)  # Existing selected SPP port is reused.
             self.assertEqual(controller.snapshot.connection_state, ConnectionState.CONNECTING)
 
             responses.put(b"RF3 Bluetooth SPP connected\r\nOK STATUS\r\n")
@@ -334,7 +378,7 @@ class TestBluetoothGuiIntegration(unittest.TestCase):
 
             # A missing nRF24 is independent of a working PC-to-ESP host link.
             responses.put(b'{"node_name":"rf3-devboard","state":"Fault","fault":1,')
-            responses.put(b'"host_upload":"enabled","host_download":"enabled"}\r\n')
+            responses.put(b'"profile":"esp32-devboard","test_mode_supported":true,"host_upload":"enabled","host_download":"enabled"}\r\n')
             wait_for(lambda: controller.snapshot.connection_state == ConnectionState.CONNECTED)
             self.assertTrue(controller.snapshot.capabilities.supports_host_file_upload)
             self.assertTrue(controller.snapshot.capabilities.supports_host_file_download)
@@ -346,7 +390,7 @@ class TestBluetoothGuiIntegration(unittest.TestCase):
                 controller.set_selected_file(source)
                 window.test_mode_checkbox.click()
                 wait_for(lambda: b"TESTMODE ON\r\n" in written)
-                responses.put(b'{"state":"Fault","fault":1,"test_mode":true,'
+                responses.put(b'{"state":"Fault","fault":1,"test_mode":true,"test_mode_supported":true,'
                               b'"host_upload":"enabled","host_download":"enabled","host_echo":"enabled"}\r\n')
                 wait_for(lambda: window.transmit_button.text() == "Upload && Verify")
                 self.assertFalse(window.rx_button.isEnabled())

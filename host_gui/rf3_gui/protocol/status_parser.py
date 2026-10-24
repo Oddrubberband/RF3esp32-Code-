@@ -16,7 +16,13 @@ def parse_status_line(line: str) -> dict[str, Any]:
         if "=" not in token:
             continue
         key, raw_value = token.split("=", 1)
-        values[key] = _coerce_value(raw_value)
+        # Identity/file fields are text even when the filename is 'false', '0'
+        # or another token accepted by the numeric/boolean grammar.
+        values[key] = raw_value if key in {
+            "profile", "node_name", "selected", "rx_last", "rx_last_path", "tx_file",
+            "state", "State", "tx_state", "rx_state", "tx_error", "rx_error",
+            "tx_id", "rx_id", "tx_crc32", "rx_crc32",
+        } else _coerce_value(raw_value)
     return values
 
 

@@ -30,7 +30,7 @@ def _parse_args(argv: list[str]) -> tuple[str, str | None, list[str]]:
 
 def main() -> int:
     backend_name, port, qt_argv = _parse_args(sys.argv)
-    configure_logging()
+    log_path = configure_logging()
     app = QApplication(qt_argv)
     app.setApplicationName("RF3 Desktop")
 
@@ -41,6 +41,7 @@ def main() -> int:
     )
     controller = AppController(backend)
     window = MainWindow(controller)
+    window.log_location_label.setText(f"Diagnostic log: {log_path or 'unavailable'}")
     window.resize(1080, 720)
     window.show()
 

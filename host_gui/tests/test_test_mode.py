@@ -161,7 +161,8 @@ class TestDevboardMode(unittest.TestCase):
 
         backend._handle_line("profile=esp32-devboard test_mode=off State=Fault fault=1")
         self.assertFalse(window.test_mode_checkbox.isChecked())
-        self.assertTrue(window.rx_button.isEnabled())
+        self.assertFalse(window.rx_button.isEnabled())
+        self.assertTrue(window.apply_channel_button.isEnabled())  # Explicit reinitialization remains available.
         window.close()
 
     def test_window_appends_live_peer_text(self):
@@ -310,11 +311,13 @@ class TestDevboardMode(unittest.TestCase):
 
             def write(self, payload):
                 self.writes.append(payload)
+                return len(payload)
 
             def flush(self):
                 pass
 
-            def readline(self, size=-1):
+            in_waiting = 0
+            def read(self, size=1):
                 time.sleep(0.005)
                 return b""
 

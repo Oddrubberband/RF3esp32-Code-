@@ -7,19 +7,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-MACHINE_PATH_EXCLUSIONS = {
-    # The project registry requires absolute paths in its runbooks/entry point.
-    # VS Code's saved ESP-IDF setup is workstation metadata, not source code.
-    # Secret checks below still apply to every one of these files.
-    "AGENTS.md",
-    "README.md",
-    "host_gui/README.md",
-    "docs/build_and_test.md",
-    ".vscode/settings.json",
-    "docs/codex_repository_audit.md",
-    "docs/integration_readiness_report.md",
-}
-ALLOWED_SDKCONFIG = {"sdkconfig.defaults", "sdkconfig.devboard.defaults"}
+MACHINE_PATH_EXCLUSIONS = set()
+ALLOWED_SDKCONFIG = {"sdkconfig.defaults", "sdkconfig.devboard.defaults", "sdkconfig.bluetooth.defaults"}
 SECRET_PATTERNS = {
     "GitHub token": re.compile(r"\bgh[opsu]_[A-Za-z0-9]{30,}\b"),
     "AWS access key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),

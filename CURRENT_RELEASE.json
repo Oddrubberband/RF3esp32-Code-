@@ -1,0 +1,18 @@
+{
+  "implementation": "RF3 R2 current",
+  "release_tag": "v2026.10.24-r2",
+  "implementation_verified_date": "2026-10-23",
+  "promotion_date": "2026-10-24",
+  "release_notes": "CHANGELOG.md",
+  "firmware_source_main_sha256": "3c7de48fed6c84ba79991a3d1945a99440c87e36f36720639366aee2e63f9c11",
+  "baseline_gui_tests": 208,
+  "baseline_native_tests": 177,
+  "hardware_observation": {
+    "scope": "One user-operated file round trip, directly compared original and exported bytes",
+    "size_bytes": 411014,
+    "direction_board_identity_and_flashed_image_identity": "not independently checked",
+    "sha256_match": true,
+    "byte_identical": true
+  },
+  "requires_both_boards_updated_for_extension_metadata": true
+}

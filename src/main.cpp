@@ -13,6 +13,7 @@
 #include <string_view>
 #include <sys/stat.h>
 #include <utility>
+#include <type_traits>
 #include <vector>
 
 #include "esp_err.h"
@@ -43,6 +44,11 @@
 #include "bluetooth_tx_flow.hpp"
 #include "host_upload_publish.hpp"
 #include "host_transfer_guard.hpp"
+#include "host_connection_protocol.hpp"
+#include "host_storage_protocol.hpp"
+#include "host_transfer_protocol.hpp"
+#include "host_status_protocol.hpp"
+#include "host_rx_command_guard.hpp"
 #include "esp32_nrf24_hal.hpp"
 #include "file_transfer_service.hpp"
 #include "hardware_profile.hpp"
@@ -99,9 +105,6 @@ namespace {
 constexpr const char* TAG = "APP";
 constexpr const char* kSpiffsRoot = "/spiffs";
 constexpr const char* kDefaultFile = "payload.bin";
-constexpr const char* kReceivedFilePrefix = "rx_";
-constexpr const char* kReceivedFileExtension = ".bin";
-constexpr const char* kReceivedPartialExtension = ".part";
 constexpr uint16_t kMaxReceivedFileCollisionIndex = 999;
 constexpr uint32_t kDefaultMorseDotMs = 120;
 constexpr uint8_t kDefaultMorsePowerLevel = 3;
@@ -113,8 +116,8 @@ constexpr TickType_t kWifiControlPollPeriod = pdMS_TO_TICKS(100);
 // the packet cadence will overrun the queue during live data transfer.
 constexpr TickType_t kRxPollPeriod = pdMS_TO_TICKS(2) > 0 ? pdMS_TO_TICKS(2) : 1;
 constexpr TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(15000);
-constexpr size_t kConsoleLineBytes = 160;
-constexpr size_t kHostTransferChunkBytes = 64;
+constexpr size_t kConsoleLineBytes = HostTransferProtocol::kConsoleLineBytes;
+constexpr size_t kHostTransferChunkBytes = HostTransferProtocol::kMaxChunkBytes;
 // SPIFFS reserves one byte for its leading slash and one for the terminator
 // within CONFIG_SPIFFS_OBJ_NAME_LEN=32.
 constexpr size_t kHostFilenameMaxBytes = 30;
@@ -192,31 +195,7 @@ struct LoopConfig {
     uint8_t power_level = 3;
 };
 
-struct HttpStatusSnapshot {
-    const char* node_name = WifiControlConfig::kNodeName;
-    const char* hostname = WifiControlConfig::kNodeName;
-    const char* state_name = "Boot";
-    const char* selected_name = "";
-    uint8_t channel = 76;
-    int power_level = -1;
-    bool tx_ok = false;
-    bool test_mode = false;
-    uint32_t test_tx_count = 0;
-    uint32_t test_tx_bytes = 0;
-    bool tx_timeout = false;
-    bool rx_pending = false;
-    bool rpd = false;
-    uint32_t rx_packets = 0;
-    uint32_t rx_stream = 0;
-    uint32_t rx_raw = 0;
-    uint32_t rx_missing = 0;
-    uint32_t rx_saved = 0;
-    uint32_t rx_saved_bytes = 0;
-    std::string rx_last_name;
-    std::string rx_last_path;
-    uint32_t selected_bytes = 0;
-    int last_fault = 0;
-};
+using HttpStatusSnapshot = HostStatusProtocol::Snapshot;
 
 struct IncomingFileStorage {
     uint32_t transfer_id = 0;
@@ -227,6 +206,7 @@ struct IncomingFileStorage {
 
 struct HostUploadStorage {
     bool active = false;
+    size_t chunk_bytes = HostTransferProtocol::kLegacyChunkBytes;
     std::string final_name;
     std::FILE* file = nullptr;
     uint32_t expected_size = 0;
@@ -243,6 +223,8 @@ struct HostUploadStorage {
 
 struct HostDownloadStorage {
     bool active = false;
+    bool encoded_name = false;
+    size_t chunk_bytes = HostTransferProtocol::kLegacyChunkBytes;
     std::string name;
     std::FILE* file = nullptr;
     uint32_t total_size = 0;
@@ -267,7 +249,41 @@ struct ProtocolTransferReport {
     uint32_t retry_count = 0;
     uint32_t crc32 = 0;
     bool peer_complete = false;
+    char file_name[HostStorageProtocol::kFilenameMaxBytes + 1]{};
+    RadioStatus radio{};
+    bool radio_valid = false;
 };
+
+// The sender owns the radio mutex for the whole RF transfer. Publish only a
+// small trivially copied record here so STATUS can observe progress without
+// borrowing the hardware lock or racing the sender. No allocation in this lock.
+static_assert(std::is_trivially_copyable_v<ProtocolTransferReport>, "Published progress must not allocate in a critical section");
+portMUX_TYPE transfer_report_mux = portMUX_INITIALIZER_UNLOCKED;
+ProtocolTransferReport copyTransferReport(const ProtocolTransferReport& source)
+{
+    portENTER_CRITICAL(&transfer_report_mux);
+    const ProtocolTransferReport copy = source;
+    portEXIT_CRITICAL(&transfer_report_mux);
+    return copy;
+}
+void publishTransferReport(ProtocolTransferReport& destination, const ProtocolTransferReport& source)
+{
+    portENTER_CRITICAL(&transfer_report_mux);
+    destination = source;
+    portEXIT_CRITICAL(&transfer_report_mux);
+}
+void prepareTransferReport(ProtocolTransferReport& destination, const FileInfo& file,
+                           const RadioStatus& radio, uint32_t id)
+{
+    ProtocolTransferReport next;
+    next.transfer_id = id;
+    next.state = ReliableTransferV2::SenderState::Preparing;
+    next.total_bytes = static_cast<uint32_t>(file.bytes);
+    std::snprintf(next.file_name, sizeof(next.file_name), "%s", file.name.c_str());
+    next.radio = radio;
+    next.radio_valid = true;
+    publishTransferReport(destination, next);
+}
 
 const char* loopModeName(LoopMode mode)
 {
@@ -555,26 +571,10 @@ std::string buildFilePath(std::string_view name)
 
 std::string buildReceivedFileName(uint32_t transfer_id,
                                   bool partial,
-                                  uint16_t collision_index = 0)
+                                  uint16_t collision_index = 0,
+                                  std::string_view extension = {})
 {
-    char buffer[40] = {};
-    if (partial || collision_index == 0) {
-        std::snprintf(buffer,
-                      sizeof(buffer),
-                      "%s%08lX%s",
-                      kReceivedFilePrefix,
-                      static_cast<unsigned long>(transfer_id),
-                      partial ? kReceivedPartialExtension : kReceivedFileExtension);
-    } else {
-        std::snprintf(buffer,
-                      sizeof(buffer),
-                      "%s%08lX_%03u%s",
-                      kReceivedFilePrefix,
-                      static_cast<unsigned long>(transfer_id),
-                      static_cast<unsigned>(collision_index),
-                      kReceivedFileExtension);
-    }
-    return std::string(buffer);
+    return FileTypeMetadata::receivedName(transfer_id, partial, collision_index, extension);
 }
 
 bool resolveFile(std::string request, FileInfo& out)
@@ -799,12 +799,8 @@ uint32_t nextTransferId()
     return candidate;
 }
 
-uint32_t nextTransferIdEntry(void*)
-{
-    return nextTransferId();
-}
-
 void updateTransferReport(ProtocolTransferReport* report,
+                          const RadioManager& manager,
                           FileTransfer::Service& service,
                           uint64_t now_ms)
 {
@@ -813,16 +809,20 @@ void updateTransferReport(ProtocolTransferReport* report,
         return;
     }
     const ReliableTransferV2::SenderSession& sender = service.transportSender();
-    report->state = sender.state();
-    report->error = sender.error();
-    report->transfer_id = sender.transferId();
-    report->bytes_transferred = sender.acknowledgedBytes();
-    report->total_bytes = sender.totalSize();
-    report->current_sequence = sender.currentSequence();
-    report->total_packets = sender.totalPackets();
-    report->retry_count = sender.totalRetries();
-    report->crc32 = sender.crc32();
-    report->peer_complete = sender.peerComplete();
+    ProtocolTransferReport next = copyTransferReport(*report);
+    next.state = sender.state();
+    next.error = sender.error();
+    next.transfer_id = sender.transferId();
+    next.bytes_transferred = sender.acknowledgedBytes();
+    next.total_bytes = sender.totalSize();
+    next.current_sequence = sender.currentSequence();
+    next.total_packets = sender.totalPackets();
+    next.retry_count = sender.totalRetries();
+    next.crc32 = sender.crc32();
+    next.peer_complete = sender.peerComplete();
+    next.radio = manager.status();
+    next.radio_valid = true;
+    publishTransferReport(*report, next);
 }
 
 bool sendDataFile(RadioManager& manager,
@@ -834,6 +834,13 @@ bool sendDataFile(RadioManager& manager,
     std::FILE* file = std::fopen(path, "rb");
     if (!file) {
         ESP_LOGE(TAG, "Could not open %s for reliable transfer: errno=%d", path, errno);
+        if (report) {
+            ProtocolTransferReport failed = copyTransferReport(*report);
+            failed.state = ReliableTransferV2::SenderState::Failed;
+            failed.error = ProtocolV2::ErrorCode::SourceRead;
+            failed.radio = manager.status();
+            publishTransferReport(*report, failed);
+        }
         return false;
     }
 
@@ -857,6 +864,18 @@ bool sendDataFile(RadioManager& manager,
     const FileTransfer::StartResult started =
         transfer_service.startTransfer(source, metadata, start_ms);
     if (!started) {
+        if (report) {
+            ProtocolTransferReport failed = copyTransferReport(*report);
+            failed.state = ReliableTransferV2::SenderState::Failed;
+            failed.error = started.code == FileTransfer::StartCode::UnsupportedSize
+                ? ProtocolV2::ErrorCode::UnsupportedSize
+                : started.code == FileTransfer::StartCode::ReadFailed || started.code == FileTransfer::StartCode::InvalidSource
+                ? ProtocolV2::ErrorCode::SourceRead
+                : started.code == FileTransfer::StartCode::Busy
+                ? ProtocolV2::ErrorCode::Busy : ProtocolV2::ErrorCode::InvalidMetadata;
+            failed.radio = manager.status();
+            publishTransferReport(*report, failed);
+        }
         std::fclose(file);
         ESP_LOGE(TAG,
                  "Protocol v2 source preparation failed for %s result=%u max_bytes=%lu",
@@ -866,6 +885,7 @@ bool sendDataFile(RadioManager& manager,
         return false;
     }
 
+    updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
     const uint32_t transfer_id = started.transfer_id;
     ReliableTransferV2::SenderSession& sender = transfer_service.transportSender();
 
@@ -886,7 +906,7 @@ bool sendDataFile(RadioManager& manager,
         ProtocolV2::Frame outbound{};
         if (!sender.outboundFrame(outbound)) {
             (void)sender.tick(monotonicMilliseconds());
-            updateTransferReport(report, transfer_service, monotonicMilliseconds());
+            updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
             delayAtLeastMs(2);
             continue;
         }
@@ -907,7 +927,7 @@ bool sendDataFile(RadioManager& manager,
         const uint64_t send_time_ms = monotonicMilliseconds();
         if (!manager.sendPayload(outbound.data(), outbound.size())) {
             (void)sender.onTransportFailure(send_time_ms);
-            updateTransferReport(report, transfer_service, monotonicMilliseconds());
+            updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
             delayAtLeastMs(2);
             continue;
         }
@@ -923,7 +943,7 @@ bool sendDataFile(RadioManager& manager,
 
         if (!manager.enterRx()) {
             (void)sender.onTransportFailure(monotonicMilliseconds());
-            updateTransferReport(report, transfer_service, monotonicMilliseconds());
+            updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
             continue;
         }
 
@@ -969,10 +989,10 @@ bool sendDataFile(RadioManager& manager,
         if (manager.status().state == RadioState::RxListening && !manager.leaveRx()) {
             (void)sender.onTransportFailure(monotonicMilliseconds());
         }
-        updateTransferReport(report, transfer_service, monotonicMilliseconds());
+        updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
     }
 
-    updateTransferReport(report, transfer_service, monotonicMilliseconds());
+    updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
     std::fclose(file);
     if (sender.state() == ReliableTransferV2::SenderState::Completed &&
         sender.peerComplete()) {
@@ -1002,7 +1022,7 @@ class DemoConsoleApp {
 public:
     explicit DemoConsoleApp(RadioManager& manager)
         : manager_(manager),
-          transfer_service_(&nextTransferIdEntry),
+          transfer_service_(&DemoConsoleApp::queuedTransferIdEntry, this),
           receiver_(this, incomingStorageCallbacks())
     {
         transfer_service_.registerReceiveHandler(
@@ -1030,6 +1050,12 @@ public:
             return false;
         }
 
+        status_mutex_ = xSemaphoreCreateMutex();
+        if (!status_mutex_) {
+            ESP_LOGE(TAG, "Failed to allocate status mutex");
+            return false;
+        }
+        setSelectedFile(selected_file_);
         command_mutex_ = xSemaphoreCreateMutex();
         if (!command_mutex_) {
             ESP_LOGE(TAG, "Failed to allocate command mutex");
@@ -1093,7 +1119,7 @@ public:
         if (!files.empty()) {
             FileInfo selected{};
             if (!resolveFile(selected_file_, selected)) {
-                selected_file_ = files.front().name;
+                setSelectedFile(files.front().name);
             }
         }
 
@@ -1388,7 +1414,7 @@ private:
         if (!bluetooth_command_task_) {
             if (xTaskCreate(&DemoConsoleApp::bluetoothCommandTaskEntry,
                             "bt_cmd",
-                            4096,
+                            6144,
                             this,
                             4,
                             &bluetooth_command_task_) != pdPASS) {
@@ -1615,10 +1641,15 @@ private:
         const auto response_words = splitWords(command);
         const bool host_echo_command = !response_words.empty() &&
             uppercaseCopy(response_words.front()) == "ECHO";
-        if (host_file_command || host_echo_command) {
-            // UPLOAD and DOWNLOAD handlers emit one structured response line
-            // themselves. Avoid a second ACK and a large STATUS document for
-            // every file chunk.
+        const bool host_hello_command = response_words.size() == 1 &&
+            uppercaseCopy(response_words.front()) == "HELLO";
+        const bool host_storage_command = !response_words.empty() &&
+            (uppercaseCopy(response_words.front()) == "STORAGE" ||
+             uppercaseCopy(response_words.front()) == "SELECTHEX" ||
+             uppercaseCopy(response_words.front()) == "TXHEX");
+        if (host_file_command || host_echo_command || host_hello_command || host_storage_command) {
+            // These handlers emit their own structured response. HELLO must
+            // not acquire a radio snapshot through the generic STATUS reply.
             return;
         }
 
@@ -1627,9 +1658,10 @@ private:
                      "%s %s\r\n",
                      accepted ? "OK" : "ERR",
                      command.c_str());
-        response += buildStatusJson();
-        response += "\r\n";
-        sendBluetoothText(response, epoch);
+        // ACK and complete JSON have independent framing/size budgets. Combining
+        // an arbitrary console command echo with JSON could overflow one queue item.
+        if (sendBluetoothText(response, epoch))
+            sendBluetoothText(buildStatusJson() + "\r\n", epoch);
     }
 
     bool sendBluetoothText(const std::string& text, uint32_t expected_epoch = 0)
@@ -2155,10 +2187,15 @@ private:
         std::printf(
             "\nCommands:\n"
             "  HELP                 Show this command list\n"
+            "  HELLO                Identify the host link without accessing the radio\n"
+            "  STORAGE LIST <offset>  List visible SPIFFS files (host JSON pages)\n"
+            "  STORAGE DELETE <hex>   Delete one idle visible file (host only)\n"
             "  STATUS               Show radio state and selected file\n"
             "  STOP                 Stop any active TX/CW/Morse/RX and return to standby\n"
             "  FILES                List staged files in SPIFFS\n"
             "  SELECT <file>        Choose which staged file TX will send\n"
+            "  SELECTHEX <UTF8hex>  Select exact SPIFFS filename (host only)\n"
+            "  TXHEX <UTF8hex>      Transmit exact SPIFFS filename (host only)\n"
             "  TX [file]            Start sending the selected or named file\n"
             "  UPLOAD ...           Stage a host file using BEGIN/DATA/END/CANCEL\n"
             "  DOWNLOAD ...         Export a SPIFFS file using BEGIN/DATA/END/CANCEL\n"
@@ -2231,6 +2268,7 @@ private:
     void clearLoopLocked()
     {
         loop_config_ = LoopConfig{};
+        loop_owns_radio_.store(false);
     }
 
     static ReliableTransferV2::SinkPrepareResult prepareIncomingStorageEntry(
@@ -2280,7 +2318,8 @@ private:
         for (uint16_t collision = 0;
              collision <= kMaxReceivedFileCollisionIndex;
              ++collision) {
-            const std::string candidate = buildReceivedFileName(transfer_id, false, collision);
+            const std::string candidate = buildReceivedFileName(transfer_id, false, collision, receiver_.fileExtension());
+            if (candidate.empty()) return false;
             const std::string path = buildFilePath(candidate);
             struct stat info {};
             errno = 0;
@@ -2446,9 +2485,9 @@ private:
             (void)receiver_.abort(failure);
             transfer_service_.reportReceiveFailed(
                 receiver_.transferId(), receiver_.error(), monotonicMilliseconds());
-        } else {
-            (void)receiver_.reset();
         }
+        // Keep Completed/Cancelled/Failed metadata for truthful terminal status.
+        // A new RX session explicitly resets it; merely leaving RX does not.
         active_api_receive_id_ = 0;
         if (receiver_.cleanupFailed()) {
             ESP_LOGE(TAG,
@@ -2640,7 +2679,7 @@ private:
         // STATUS refreshes the live radio snapshot, then adds a live hasPendingRx()
         // check when receive (RX) mode is active.
         if (!takeRadio(pdMS_TO_TICKS(50))) {
-            std::printf("Could not read radio status right now.\n");
+            std::printf("Status: radio snapshot busy; transfer snapshot follows.\n");
             return;
         }
 
@@ -2652,7 +2691,7 @@ private:
         const uint32_t decoded_packets = decoded_rx_packet_count_;
         const uint32_t raw_packets = raw_rx_packet_count_;
         const uint32_t missing_packets = missing_rx_packet_count_;
-        const ProtocolTransferReport tx_report = last_tx_report_;
+        const ProtocolTransferReport tx_report = copyTransferReport(last_tx_report_);
         const ReliableTransferV2::ReceiverState receiver_state = receiver_.state();
         const ProtocolV2::ErrorCode receiver_error = receiver_.error();
         const uint32_t receiver_id = receiver_.transferId();
@@ -2662,9 +2701,18 @@ private:
         const uint32_t receiver_packets = receiver_.totalPackets();
         const uint32_t receiver_crc = receiver_.calculatedCrc32();
         giveRadio();
-        const LoopConfig loop = loopSnapshot();
+        LoopConfig loop;
+        const bool loop_snapshot_available = takeLoop(pdMS_TO_TICKS(50));
+        if (loop_snapshot_available) {
+            loop = loop_config_;
+            giveLoop();
+        }
         const char* irq_state =
             !status.irq_connected ? "disabled" : (status.irq_asserted ? "low" : "high");
+        std::string selected_token;
+        HostConnectionProtocol::appendJsonString(selected_token, selected_file_);
+        std::string tx_file_token;
+        HostConnectionProtocol::appendJsonString(tx_file_token, tx_report.file_name);
 
         std::printf("profile=%s filesystem=%s http_control=%s bt_control=%s test_mode=%s State=%s channel=%u ",
                     HardwareProfile::kSelectedName,
@@ -2680,7 +2728,7 @@ private:
             std::printf("power=unknown ");
         }
         std::printf("selected=%s last_status=0x%02X fifo=0x%02X observe=0x%02X irq=%s tx_irq_seen=%s tx_ok=%s tx_timeout=%s rx_len=%u rx_packets=%u rx_stream=%u rx_raw=%u rx_missing=%u rx_saved=%u rx_saved_bytes=%u carrier_events=%u fault=%d",
-                    selected_file_.c_str(),
+                    selected_token.c_str(),
                     static_cast<unsigned>(status.last_status),
                     static_cast<unsigned>(status.last_fifo_status),
                     static_cast<unsigned>(status.last_observe_tx),
@@ -2718,10 +2766,16 @@ private:
                     ProtocolV2::errorName(receiver_error),
                     static_cast<unsigned long>(receiver_crc));
         if (!last_saved_rx_file_.empty()) {
-            std::printf(" rx_last=%s rx_last_path=%s",
-                        last_saved_rx_file_.c_str(),
-                        buildFilePath(last_saved_rx_file_).c_str());
+            std::string rx_name_token;
+            std::string rx_path_token;
+            HostConnectionProtocol::appendJsonString(rx_name_token, last_saved_rx_file_);
+            HostConnectionProtocol::appendJsonString(rx_path_token, buildFilePath(last_saved_rx_file_));
+            std::printf(" rx_last=%s rx_last_path=%s", rx_name_token.c_str(), rx_path_token.c_str());
         }
+        std::printf(" tx_file=%s test_mode_supported=%s host_stored_tx=%s",
+                    tx_file_token.c_str(),
+                    HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard ? "true" : "false",
+                    filesystem_ready_ ? "true" : "false");
         std::printf(" test_tx_count=%lu test_tx_bytes=%lu test_tx_state=%s",
                     static_cast<unsigned long>(test_tx_count_),
                     static_cast<unsigned long>(test_tx_bytes_),
@@ -2729,8 +2783,12 @@ private:
         std::printf(" text=enabled text_tx_count=%lu text_rx_count=%lu",
                     static_cast<unsigned long>(text_tx_count_),
                     static_cast<unsigned long>(text_rx_count_));
-        std::printf(" host_upload=enabled host_download=enabled host_retry=enabled host_echo=%s",
-                    HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard ? "enabled" : "disabled");
+        std::printf(" host_upload=%s host_download=%s host_retry=enabled host_storage=%s host_echo=%s host_chunk_max=%u",
+                    filesystem_ready_ ? "enabled" : "disabled",
+                    filesystem_ready_ ? "enabled" : "disabled",
+                    filesystem_ready_ ? "enabled" : "disabled",
+                    HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard ? "enabled" : "disabled",
+                    static_cast<unsigned>(HostTransferProtocol::kMaxChunkBytes));
         if (kWirelessControlEnabled) {
             std::printf(" remote=enabled");
             if (kWirelessControlAutoRx) {
@@ -2745,7 +2803,9 @@ private:
         if (!last_morse_text_.empty()) {
             std::printf(" last_morse=\"%s\"", last_morse_text_.c_str());
         }
-        if (loop.active) {
+        if (!loop_snapshot_available) {
+            std::printf(" loop=Busy");
+        } else if (loop.active) {
             std::printf(" loop=%s", loopModeName(loop.mode));
             if (loop.mode == LoopMode::Tx) {
                 std::printf(" loop_file=%s", loop.file_name.c_str());
@@ -2767,98 +2827,142 @@ private:
                 std::printf(" loop_text=%s", loop.morse_text.c_str());
             }
             std::printf(" loop_done=%u", static_cast<unsigned>(loop.completed_iterations));
+        } else {
+            std::printf(" loop=None");
         }
         std::printf("\n");
     }
 
+    static uint32_t queuedTransferIdEntry(void* context)
+    {
+        const auto* app = static_cast<DemoConsoleApp*>(context);
+        const ProtocolTransferReport report = copyTransferReport(app->last_tx_report_);
+        return report.state == ReliableTransferV2::SenderState::Preparing && report.transfer_id
+            ? report.transfer_id : nextTransferId();
+    }
+
+    void setSelectedFile(const std::string& name)
+    {
+        selected_file_ = name;
+        char published[sizeof(selected_status_name_)]{};
+        std::snprintf(published, sizeof(published), "%s", name.c_str());
+        portENTER_CRITICAL(&transfer_report_mux);
+        std::memcpy(selected_status_name_, published, sizeof(published));
+        portEXIT_CRITICAL(&transfer_report_mux);
+    }
+
     bool captureHttpStatus(HttpStatusSnapshot& out)
     {
-        if (!takeRadio(pdMS_TO_TICKS(500))) {
+        // Serialize string/cache ownership with an ordinary task mutex. The RF
+        // sender never takes it, so STATUS remains bounded while RF is active.
+        if (!status_mutex_ || xSemaphoreTake(status_mutex_, pdMS_TO_TICKS(50)) != pdTRUE)
             return false;
-        }
-
-        manager_.refreshSnapshot();
-        const bool rx_pending =
-            manager_.status().state == RadioState::RxListening ? manager_.hasPendingRx() : false;
-        const RadioStatus status = manager_.status();
+        out = cached_host_status_;
         out.node_name = WifiControlConfig::kNodeName;
         out.hostname = WifiControlConfig::kNodeName;
-        out.state_name = RadioManager::stateName(status.state);
-        out.selected_name = selected_file_.c_str();
-
+        out.profile = HardwareProfile::kSelectedName;
+        out.filesystem_ready = filesystem_ready_;
+        out.test_mode_supported = HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard;
+        out.host_chunk_max = HostTransferProtocol::kMaxChunkBytes;
+        out.supports_remote = kWirelessControlEnabled;
+        out.remote_auto_rx = kWirelessControlAutoRx;
+        // Never hold radio while acquiring the loop lock: encoded commands use
+        // loop -> radio order. An unavailable loop snapshot fails closed as Busy.
+        out.loop_name = "Busy";
+        if (takeLoop(pdMS_TO_TICKS(50))) {
+            out.loop_name = loop_config_.active ? loopModeName(loop_config_.mode) : "None";
+            giveLoop();
+        }
+        out.test_mode = test_mode_.load();
+        out.test_tx_count = test_tx_count_.load();
+        out.test_tx_bytes = test_tx_bytes_.load();
+        char selected[sizeof(selected_status_name_)]{};
+        portENTER_CRITICAL(&transfer_report_mux);
+        std::memcpy(selected, selected_status_name_, sizeof(selected));
+        portEXIT_CRITICAL(&transfer_report_mux);
+        out.selected_name = selected;
+        ProtocolTransferReport tx_report{};
+        const bool acquired = takeRadio(pdMS_TO_TICKS(50));
+        if (acquired) {
+            manager_.refreshSnapshot();
+            out.rx_pending = manager_.status().state == RadioState::RxListening
+                ? manager_.hasPendingRx() : false;
+            const RadioStatus status = manager_.status();
+            out.state_name = RadioManager::stateName(status.state);
+            out.channel = status.channel;
+            out.power_level = status.power_level;
+            out.tx_ok = status.last_tx_ok;
+            out.tx_timeout = status.last_tx_timed_out;
+            out.rx_packets = status.rx_packets;
+            out.rx_stream = decoded_rx_packet_count_;
+            out.rx_raw = raw_rx_packet_count_;
+            out.rx_missing = missing_rx_packet_count_;
+            out.rx_saved = saved_rx_file_count_;
+            out.rx_saved_bytes = saved_rx_byte_count_;
+            out.rx_last_name = last_saved_rx_file_;
+            out.rx_last_path = last_saved_rx_file_.empty() ? "" : buildFilePath(last_saved_rx_file_);
+            out.last_fault = status.last_fault;
+            out.rpd = status.carrier_detected;
+            out.rx.state_name = ReliableTransferV2::receiverStateName(receiver_.state());
+            out.rx.error_name = ProtocolV2::errorName(receiver_.error());
+            out.rx.id = receiver_.transferId();
+            out.rx.bytes = receiver_.acceptedBytes();
+            out.rx.total = receiver_.totalSize();
+            out.rx.sequence = receiver_.expectedSequence();
+            out.rx.packets = receiver_.totalPackets();
+            out.rx.crc32 = receiver_.calculatedCrc32();
+            tx_report = copyTransferReport(last_tx_report_);
+            tx_report.radio = status;
+            tx_report.radio_valid = true;
+            publishTransferReport(last_tx_report_, tx_report);
+            giveRadio();
+        } else {
+            // Only the separately published report is read while the sender
+            // owns radio_mutex_. Cached RX metadata remains the last known RX
+            // snapshot; the live sender owns the radio during this interval.
+            tx_report = copyTransferReport(last_tx_report_);
+            const bool tx_active = tx_report.state == ReliableTransferV2::SenderState::Preparing ||
+                tx_report.state == ReliableTransferV2::SenderState::WaitingForReady ||
+                tx_report.state == ReliableTransferV2::SenderState::SendingData ||
+                tx_report.state == ReliableTransferV2::SenderState::WaitingForDataAck ||
+                tx_report.state == ReliableTransferV2::SenderState::WaitingForComplete ||
+                tx_report.state == ReliableTransferV2::SenderState::Cancelling;
+            if (tx_active && tx_report.radio_valid) {
+                out.state_name = "TxBusy";
+                out.channel = tx_report.radio.channel;
+                out.power_level = tx_report.radio.power_level;
+                out.last_fault = tx_report.radio.last_fault;
+                out.tx_ok = tx_report.radio.last_tx_ok;
+                out.tx_timeout = tx_report.radio.last_tx_timed_out;
+                out.rx_pending = false;
+            } else {
+                out.state_name = "Unavailable";
+            }
+        }
+        out.tx.state_name = ReliableTransferV2::senderStateName(tx_report.state);
+        out.tx.error_name = ProtocolV2::errorName(tx_report.error);
+        out.tx.id = tx_report.transfer_id;
+        out.tx.file_name = tx_report.file_name;
+        out.tx.bytes = tx_report.bytes_transferred;
+        out.tx.total = tx_report.total_bytes;
+        out.tx.sequence = tx_report.current_sequence;
+        out.tx.packets = tx_report.total_packets;
+        out.tx.retries = tx_report.retry_count;
+        out.tx.crc32 = tx_report.crc32;
+        out.tx.peer_complete = tx_report.peer_complete;
         size_t selected_bytes = 0;
-        if (statFileSize(buildFilePath(selected_file_), selected_bytes)) {
-            out.selected_bytes = static_cast<uint32_t>(selected_bytes);
-        }
-
-        out.channel = status.channel;
-        out.power_level = status.power_level;
-        out.tx_ok = status.last_tx_ok;
-        out.test_mode = test_mode_;
-        out.test_tx_count = test_tx_count_;
-        out.test_tx_bytes = test_tx_bytes_;
-        out.tx_timeout = status.last_tx_timed_out;
-        out.rx_packets = status.rx_packets;
-        out.rx_stream = decoded_rx_packet_count_;
-        out.rx_raw = raw_rx_packet_count_;
-        out.rx_missing = missing_rx_packet_count_;
-        out.rx_saved = saved_rx_file_count_;
-        out.rx_saved_bytes = saved_rx_byte_count_;
-        out.rx_last_name = last_saved_rx_file_;
-        if (!last_saved_rx_file_.empty()) {
-            out.rx_last_path = buildFilePath(last_saved_rx_file_);
-        }
-        out.last_fault = status.last_fault;
-        out.rx_pending = rx_pending;
-        out.rpd = status.carrier_detected;
-        giveRadio();
+        out.selected_bytes = statFileSize(buildFilePath(out.selected_name), selected_bytes)
+            ? static_cast<uint32_t>(selected_bytes) : 0;
+        cached_host_status_ = out;
+        xSemaphoreGive(status_mutex_);
         return true;
     }
 
     std::string buildStatusJson()
     {
         HttpStatusSnapshot snapshot{};
-        if (!captureHttpStatus(snapshot)) {
-            snapshot.state_name = "Unavailable";
-        }
-
-        std::string json;
-                appendFormat(json,
-                     "{\"node_name\":\"%s\",\"hostname\":\"%s\",\"state\":\"%s\",\"selected\":\"%s\",\"selected_bytes\":%u,"
-                     "\"channel\":%u,\"power\":%d,"
-                     "\"tx_ok\":%s,\"tx_timeout\":%s,\"rx_packets\":%u,"
-                     "\"rx_stream\":%u,\"rx_raw\":%u,\"rx_missing\":%u,\"rx_saved\":%u,"
-                     "\"rx_saved_bytes\":%u,\"rx_last\":\"%s\",\"rx_last_path\":\"%s\",\"last_fault\":%d,"
-                     "\"rx_pending\":%s,\"rpd\":%s,\"test_mode\":%s,"
-                     "\"test_tx_count\":%lu,\"test_tx_bytes\":%lu,\"test_tx_state\":\"%s\","
-                     "\"text\":\"enabled\",\"host_upload\":\"enabled\","
-                     "\"host_download\":\"enabled\",\"host_retry\":\"enabled\",\"host_echo\":\"%s\"}",
-                     snapshot.node_name,
-                     snapshot.hostname,
-                     snapshot.state_name,
-                     snapshot.selected_name,
-                     static_cast<unsigned>(snapshot.selected_bytes),
-                     static_cast<unsigned>(snapshot.channel),
-                     snapshot.power_level,
-                     snapshot.tx_ok ? "true" : "false",
-                     snapshot.tx_timeout ? "true" : "false",
-                     static_cast<unsigned>(snapshot.rx_packets),
-                     static_cast<unsigned>(snapshot.rx_stream),
-                     static_cast<unsigned>(snapshot.rx_raw),
-                     static_cast<unsigned>(snapshot.rx_missing),
-                     static_cast<unsigned>(snapshot.rx_saved),
-                     static_cast<unsigned>(snapshot.rx_saved_bytes),
-                     snapshot.rx_last_name.c_str(),
-                     snapshot.rx_last_path.c_str(),
-                     snapshot.last_fault,
-                     snapshot.rx_pending ? "true" : "false",
-                     snapshot.rpd ? "true" : "false",
-                     snapshot.test_mode ? "true" : "false",
-                     static_cast<unsigned long>(snapshot.test_tx_count),
-                     static_cast<unsigned long>(snapshot.test_tx_bytes),
-                     snapshot.test_tx_count ? "Completed" : "Idle",
-                     HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard ? "enabled" : "disabled");
-        return json;
+        if (!captureHttpStatus(snapshot)) snapshot.state_name = "Unavailable";
+        return HostStatusProtocol::json(snapshot);
     }
 
     bool dispatchHttpCommand(const std::string& line)
@@ -2895,6 +2999,7 @@ private:
             }
         }
         host_upload_ = HostUploadStorage{};
+        host_session_owns_rx_.store(host_download_.active);
     }
 
     void resetHostDownload()
@@ -2904,6 +3009,7 @@ private:
             host_download_.file = nullptr;
         }
         host_download_ = HostDownloadStorage{};
+        host_session_owns_rx_.store(host_upload_.active);
     }
 
     uint32_t hostSessionEpoch(CommandOrigin origin) const
@@ -2964,12 +3070,16 @@ private:
         if (action == "BEGIN") {
             uint32_t expected_size = 0;
             uint32_t expected_crc32 = 0;
-            if (words.size() != 5 || !isValidHostFilename(words[2]) ||
+            size_t chunk_bytes = HostTransferProtocol::kLegacyChunkBytes;
+            const bool chunk_requested = words.size() == 6;
+            if ((words.size() != 5 && words.size() != 6) || !isValidHostFilename(words[2]) ||
                 !parseUint32Arg(words[3], 0, ProtocolV2::kMaxFileSize, expected_size) ||
-                !parseHexUint32Arg(words[4], expected_crc32)) {
+                !parseHexUint32Arg(words[4], expected_crc32) ||
+                !HostTransferProtocol::negotiateChunk(chunk_requested,
+                    chunk_requested ? std::string_view(words[5]) : std::string_view(), chunk_bytes)) {
                 emitHostTransferResponse(
                     origin,
-                    "UPLOAD ERROR usage: UPLOAD BEGIN <name> <size> <crc32>");
+                    "UPLOAD ERROR usage: UPLOAD BEGIN <name> <size> <crc32> [chunk64to256]");
                 return false;
             }
 
@@ -3000,6 +3110,8 @@ private:
             }
 
             host_upload_.active = true;
+            host_session_owns_rx_.store(true);
+            host_upload_.chunk_bytes = chunk_bytes;
             host_upload_.final_name = words[2];
             host_upload_.file = file;
             host_upload_.expected_size = expected_size;
@@ -3015,6 +3127,7 @@ private:
                          host_upload_.final_name.c_str(),
                          static_cast<unsigned long>(expected_size),
                          static_cast<unsigned long>(expected_crc32));
+            HostTransferProtocol::appendReadyChunk(response, chunk_requested, chunk_bytes);
             emitHostTransferResponse(origin, response);
             return true;
         }
@@ -3046,9 +3159,12 @@ private:
                     "UPLOAD ERROR usage: UPLOAD DATA <sequence> <hex>");
                 return false;
             }
-            if (host_upload_.next_sequence > 0 && sequence == host_upload_.next_sequence - 1 &&
-                decoded.size() == host_upload_.last_chunk_size &&
-                std::equal(decoded.begin(), decoded.end(), host_upload_.last_chunk.begin())) {
+            if (!HostTransferProtocol::validChunkLength(decoded.size(), host_upload_.chunk_bytes)) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR exceeds_negotiated_chunk");
+                return false;
+            }
+            if (HostTransferProtocol::matchesPrevious(sequence, host_upload_.next_sequence,
+                    decoded.data(), decoded.size(), host_upload_.last_chunk.data(), host_upload_.last_chunk_size)) {
                 std::string response;
                 appendFormat(response, "UPLOAD ACK %lu %lu", static_cast<unsigned long>(sequence),
                              static_cast<unsigned long>(host_upload_.received_size));
@@ -3130,7 +3246,8 @@ private:
             }
 
             host_upload_ = HostUploadStorage{};
-            selected_file_ = final_name;
+            host_session_owns_rx_.store(host_download_.active);
+            setSelectedFile(final_name);
             std::string response;
             appendFormat(response,
                          "UPLOAD COMPLETE %s %lu %08lX",
@@ -3143,6 +3260,120 @@ private:
 
         emitHostTransferResponse(origin, "UPLOAD ERROR expected BEGIN, DATA, END, or CANCEL");
         return false;
+    }
+
+    bool commandStorage(const std::vector<std::string>& words, CommandOrigin origin)
+    {
+        const auto fail = [&](const std::string& message) {
+            emitHostTransferResponse(origin, HostStorageProtocol::error(message));
+            return false;
+        };
+        if ((origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth) ||
+            !filesystem_ready_) return fail("storage_unavailable");
+        const std::string action = words.size() >= 2 ? uppercaseCopy(words[1]) : "";
+        if (action == "LIST") {
+            uint32_t offset = 0;
+            if (words.size() != 3 || !parseUint32Arg(words[2], 0, UINT32_MAX, offset)) {
+                return fail("usage_STORAGE_LIST_offset");
+            }
+            // RX publication/rename is protected by the radio mutex. Keep one
+            // consistent page snapshot, and report directory/stat failures.
+            if (!takeRadio(pdMS_TO_TICKS(100))) return fail("radio_busy_retry_list");
+            bool accepted = false;
+            const std::string response = [&]() {
+                size_t capacity = 0;
+                size_t used = 0;
+                if (esp_spiffs_info(nullptr, &capacity, &used) != ESP_OK || used > capacity) {
+                    return HostStorageProtocol::error("storage_info_failed");
+                }
+                DIR* directory = opendir(kSpiffsRoot);
+                if (!directory) return HostStorageProtocol::error("directory_open_failed_errno_" + std::to_string(errno));
+                std::vector<HostStorageProtocol::File> files;
+                std::string failure;
+                while (true) {
+                    errno = 0;
+                    const dirent* entry = readdir(directory);
+                    if (!entry) {
+                        if (errno) failure = "directory_read_failed_errno_" + std::to_string(errno);
+                        break;
+                    }
+                    const std::string name(entry->d_name);
+                    if (HostStorageProtocol::protectedName(name)) continue;
+                    if (!HostStorageProtocol::validFilename(name)) {
+                        failure = "unsupported_visible_filename";
+                        break;
+                    }
+                    struct stat info {};
+                    if (::stat(buildFilePath(name).c_str(), &info) != 0) {
+                        failure = "file_stat_failed_errno_" + std::to_string(errno);
+                        break;
+                    }
+                    if (!S_ISREG(info.st_mode) || info.st_size < 0) {
+                        failure = "unsupported_directory_entry";
+                        break;
+                    }
+                    files.push_back({name, static_cast<size_t>(info.st_size)});
+                }
+                if (closedir(directory) != 0 && failure.empty()) failure = "directory_close_failed_errno_" + std::to_string(errno);
+                if (!failure.empty()) return HostStorageProtocol::error(failure);
+                std::sort(files.begin(), files.end(), [](const auto& left, const auto& right) {
+                    return left.name < right.name;
+                });
+                accepted = offset <= files.size();
+                return HostStorageProtocol::listing(files, offset, used, capacity);
+            }();
+            giveRadio();
+            emitHostTransferResponse(origin, response);
+            return accepted;
+        }
+        if (action != "DELETE" || words.size() != 3) return fail("usage_STORAGE_LIST_offset_or_DELETE_hexname");
+        std::string name;
+        if (!HostStorageProtocol::decodeName(words[2], name)) return fail("invalid_or_protected_filename");
+        // The command mutex already protects host sessions. Fail closed if
+        // either activity lock is unavailable, then hold both through remove.
+        if (!takeLoop(pdMS_TO_TICKS(50))) return fail("loop_busy");
+        if (!takeRadio(pdMS_TO_TICKS(100))) {
+            giveLoop();
+            return fail("radio_busy_stop_first");
+        }
+        bool accepted = false;
+        const std::string response = [&]() {
+            HostStorageProtocol::DeleteGuards guards;
+            guards.host_transfer_active = host_upload_.active || host_download_.active;
+            guards.loop_active = loop_config_.active;
+            const RadioState radio_state = manager_.status().state;
+            guards.radio_active = radio_state == RadioState::TxBusy ||
+                radio_state == RadioState::RxListening || radio_state == RadioState::CwTest;
+            guards.receive_active = receiver_.active() || incoming_file_.file != nullptr || active_api_receive_id_ != 0;
+            for (const char* recovery_name : {HostUploadPublish::kJournal, HostUploadPublish::kBackup}) {
+                struct stat recovery {};
+                if (::stat(buildFilePath(recovery_name).c_str(), &recovery) == 0) {
+                    guards.recovery_pending = true;
+                } else if (errno != ENOENT) {
+                    return HostStorageProtocol::error("recovery_stat_failed_errno_" + std::to_string(errno));
+                }
+            }
+            if (const char* reason = HostStorageProtocol::deleteError(guards)) {
+                return HostStorageProtocol::error(reason);
+            }
+            struct stat info {};
+            const std::string path = buildFilePath(name);
+            if (::stat(path.c_str(), &info) != 0) return HostStorageProtocol::error("file_stat_failed_errno_" + std::to_string(errno));
+            if (!S_ISREG(info.st_mode)) return HostStorageProtocol::error("not_a_regular_file");
+            if (std::remove(path.c_str()) != 0) return HostStorageProtocol::error("delete_failed_errno_" + std::to_string(errno));
+            if (selected_file_ == name) {
+                setSelectedFile("");
+                const auto remaining = listFiles();
+                if (!remaining.empty()) setSelectedFile(remaining.front().name);
+            }
+            if (last_saved_rx_file_ == name) last_saved_rx_file_.clear();
+            accepted = true;
+            return HostStorageProtocol::deleted(name);
+        }();
+        giveRadio();
+        giveLoop();
+        emitHostTransferResponse(origin, response);
+        return accepted;
     }
 
     bool commandDownload(const std::vector<std::string>& words, CommandOrigin origin)
@@ -3162,14 +3393,25 @@ private:
         }
 
         const std::string action = words.size() >= 2 ? uppercaseCopy(words[1]) : "";
-        if (action == "BEGIN") {
-            if (words.size() != 3) {
-                emitHostTransferResponse(origin, "DOWNLOAD ERROR usage: DOWNLOAD BEGIN <name>");
+        if (action == "BEGIN" || action == "BEGINHEX") {
+            size_t chunk_bytes = HostTransferProtocol::kLegacyChunkBytes;
+            const bool chunk_requested = words.size() == 4;
+            if ((words.size() != 3 && words.size() != 4) ||
+                !HostTransferProtocol::negotiateChunk(chunk_requested,
+                    chunk_requested ? std::string_view(words[3]) : std::string_view(), chunk_bytes)) {
+                emitHostTransferResponse(origin, "DOWNLOAD ERROR usage: DOWNLOAD BEGIN <name> or BEGINHEX <utf8hex> [chunk64to256]");
                 return false;
             }
 
             FileInfo info{};
-            if (!resolveFile(words[2], info) || info.bytes > ProtocolV2::kMaxFileSize) {
+            bool resolved = false;
+            if (action == "BEGINHEX") {
+                resolved = HostStorageProtocol::decodeName(words[2], info.name) &&
+                    statFileSize(buildFilePath(info.name), info.bytes);
+            } else {
+                resolved = resolveFile(words[2], info);
+            }
+            if (!resolved || info.bytes > ProtocolV2::kMaxFileSize) {
                 emitHostTransferResponse(origin, "DOWNLOAD ERROR file_not_found_or_too_large");
                 return false;
             }
@@ -3202,6 +3444,9 @@ private:
             }
 
             host_download_.active = true;
+            host_session_owns_rx_.store(true);
+            host_download_.encoded_name = action == "BEGINHEX";
+            host_download_.chunk_bytes = chunk_bytes;
             host_download_.name = info.name;
             host_download_.file = file;
             host_download_.total_size = static_cast<uint32_t>(info.bytes);
@@ -3212,10 +3457,12 @@ private:
 
             std::string response;
             appendFormat(response,
-                         "DOWNLOAD READY %s %lu %08lX",
-                         info.name.c_str(),
+                         "DOWNLOAD %s %s %lu %08lX",
+                         host_download_.encoded_name ? "READYHEX" : "READY",
+                         (host_download_.encoded_name ? HostStorageProtocol::encodeName(info.name) : info.name).c_str(),
                          static_cast<unsigned long>(host_download_.total_size),
                          static_cast<unsigned long>(host_download_.crc32));
+            HostTransferProtocol::appendReadyChunk(response, chunk_requested, chunk_bytes);
             emitHostTransferResponse(origin, response);
             return true;
         }
@@ -3264,8 +3511,8 @@ private:
             }
 
             std::array<uint8_t, kHostTransferChunkBytes> buffer{};
-            const size_t wanted = std::min(
-                buffer.size(),
+            const size_t wanted = HostTransferProtocol::downloadChunkSize(
+                host_download_.chunk_bytes,
                 static_cast<size_t>(host_download_.total_size - host_download_.sent_size));
             const size_t read = std::fread(buffer.data(), 1, wanted, host_download_.file);
             if (read != wanted) {
@@ -3292,20 +3539,22 @@ private:
             }
 
             const std::string name = host_download_.name;
+            const bool encoded_name = host_download_.encoded_name;
             const uint32_t size = host_download_.total_size;
             const uint32_t crc32 = host_download_.crc32;
             resetHostDownload();
             std::string response;
             appendFormat(response,
-                         "DOWNLOAD COMPLETE %s %lu %08lX",
-                         name.c_str(),
+                         "DOWNLOAD %s %s %lu %08lX",
+                         encoded_name ? "COMPLETEHEX" : "COMPLETE",
+                         (encoded_name ? HostStorageProtocol::encodeName(name) : name).c_str(),
                          static_cast<unsigned long>(size),
                          static_cast<unsigned long>(crc32));
             emitHostTransferResponse(origin, response);
             return true;
         }
 
-        emitHostTransferResponse(origin, "DOWNLOAD ERROR expected BEGIN, DATA, END, or CANCEL");
+        emitHostTransferResponse(origin, "DOWNLOAD ERROR expected BEGIN, BEGINHEX, DATA, END, or CANCEL");
         return false;
     }
 
@@ -3313,6 +3562,72 @@ private:
     {
         printFileTable(listFiles(), selected_file_);
         return true;
+    }
+
+    bool commandStoredName(const std::vector<std::string>& words, CommandOrigin origin)
+    {
+        const std::string command = uppercaseCopy(words.front());
+        const bool transmit = command == "TXHEX";
+        const std::string echoed = command + (words.size() >= 2 ? " " + words[1] : "");
+        const auto finish = [&](bool accepted, const char* reason = nullptr) {
+            std::string response = (accepted ? "OK " : "ERR ") + echoed;
+            if (reason) response += " " + std::string(reason);
+            emitHostTransferResponse(origin, response);
+            return accepted;
+        };
+        if ((origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth) || !filesystem_ready_)
+            return finish(false, "host_storage_unavailable");
+        std::string name;
+        if (words.size() != 2 || !HostStorageProtocol::decodeName(words[1], name))
+            return finish(false, "invalid_or_protected_filename");
+        if (!takeLoop(pdMS_TO_TICKS(50))) return finish(false, "loop_busy_retry");
+        if (!takeRadio(pdMS_TO_TICKS(100))) {
+            giveLoop();
+            return finish(false, "radio_busy_retry");
+        }
+        const auto operation = [&]() -> const char* {
+            HostStorageProtocol::StoredGuards guards;
+            guards.host_transfer_active = host_upload_.active || host_download_.active;
+            guards.loop_active = loop_config_.active;
+            manager_.refreshSnapshot();
+            const RadioStatus radio = manager_.status();
+            guards.radio_active = radio.state == RadioState::TxBusy || radio.state == RadioState::CwTest;
+            guards.receive_active = receiver_.active() || incoming_file_.file != nullptr || active_api_receive_id_ != 0;
+            guards.radio_ready = radio.state != RadioState::Boot && radio.state != RadioState::Fault && radio.power_level >= 0;
+            guards.test_mode = test_mode_.load();
+            for (const char* recovery_name : {HostUploadPublish::kJournal, HostUploadPublish::kBackup}) {
+                struct stat recovery {};
+                if (::stat(buildFilePath(recovery_name).c_str(), &recovery) == 0) guards.recovery_pending = true;
+                else if (errno != ENOENT) return "recovery_stat_failed";
+            }
+            if (const char* error = HostStorageProtocol::storedOperationError(guards, transmit)) return error;
+            struct stat info {};
+            if (::stat(buildFilePath(name).c_str(), &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0)
+                return "stored_file_not_found";
+            if (transmit && static_cast<uint64_t>(info.st_size) > ProtocolV2::kMaxFileSize)
+                return "unsupported_file_size";
+            FileTypeMetadata::Extension extension{};
+            if (transmit && !FileTypeMetadata::derive(name, extension))
+                return "unsupported_file_extension_max10_ASCII_alnum_underscore_hyphen";
+            if (transmit) {
+                if (!ensureStandbyLocked()) return "radio_not_ready";
+                loop_stop_requested_.store(false);
+                loop_config_ = LoopConfig{};
+                loop_config_.mode = LoopMode::Tx;
+                loop_config_.active = true;
+                loop_owns_radio_.store(true);
+                loop_config_.remaining_iterations = 1;
+                loop_config_.file_name = name;
+                prepareTransferReport(last_tx_report_, FileInfo{name, static_cast<size_t>(info.st_size)},
+                                      manager_.status(), nextTransferId());
+            }
+            setSelectedFile(name);
+            return nullptr;
+        };
+        const char* failure = operation();
+        giveRadio();
+        giveLoop();
+        return finish(failure == nullptr, failure);
     }
 
     bool commandSelect(const std::vector<std::string>& words)
@@ -3331,7 +3646,7 @@ private:
             return false;
         }
 
-        selected_file_ = file.name;
+        setSelectedFile(file.name);
         std::printf("Selected %s (%u bytes)\n",
             selected_file_.c_str(),
             static_cast<unsigned>(file.bytes));
@@ -3373,6 +3688,11 @@ private:
                     return false;
                 }
 
+                FileTypeMetadata::Extension extension{};
+                if (!FileTypeMetadata::derive(file.name, extension)) {
+                    std::printf("ERR TX unsupported_file_extension_max10_ASCII_alnum_underscore_hyphen\n");
+                    return false;
+                }
                 if (!stopLoopAndWait()) {
                     std::printf("Could not stop the current loop cleanly.\n");
                     return false;
@@ -3383,16 +3703,25 @@ private:
                     return false;
                 }
 
-                selected_file_ = file.name;
+                if (!takeRadio(pdMS_TO_TICKS(100))) {
+                    giveLoop();
+                    std::printf("Radio is busy; TX was not queued.\n");
+                    return false;
+                }
+                manager_.refreshSnapshot();
+                setSelectedFile(file.name);
                 loop_stop_requested_.store(false);
                 loop_config_ = LoopConfig{};
                 loop_config_.mode = LoopMode::Tx;
                 loop_config_.active = true;
+                loop_owns_radio_.store(true);
                 loop_config_.infinite = infinite;
                 loop_config_.restore_rx_after_completion =
                     origin == CommandOrigin::Remote && kWirelessControlEnabled && kWirelessControlAutoRx;
                 loop_config_.remaining_iterations = loop_count;
                 loop_config_.file_name = file.name;
+                prepareTransferReport(last_tx_report_, file, manager_.status(), nextTransferId());
+                giveRadio();
                 giveLoop();
 
                 if (infinite) {
@@ -3415,6 +3744,11 @@ private:
             return false;
         }
 
+        FileTypeMetadata::Extension extension{};
+        if (!FileTypeMetadata::derive(file.name, extension)) {
+            std::printf("ERR TX unsupported_file_extension_max10_ASCII_alnum_underscore_hyphen\n");
+            return false;
+        }
         if (!stopLoopAndWait()) {
             std::printf("Could not stop the current loop cleanly.\n");
             return false;
@@ -3425,16 +3759,25 @@ private:
             return false;
         }
 
-        selected_file_ = file.name;
+        if (!takeRadio(pdMS_TO_TICKS(100))) {
+            giveLoop();
+            std::printf("Radio is busy; TX was not queued.\n");
+            return false;
+        }
+        manager_.refreshSnapshot();
+        setSelectedFile(file.name);
         loop_stop_requested_.store(false);
         loop_config_ = LoopConfig{};
         loop_config_.mode = LoopMode::Tx;
         loop_config_.active = true;
+                loop_owns_radio_.store(true);
         loop_config_.infinite = false;
         loop_config_.restore_rx_after_completion =
             origin == CommandOrigin::Remote && kWirelessControlEnabled && kWirelessControlAutoRx;
         loop_config_.remaining_iterations = 1;
         loop_config_.file_name = file.name;
+        prepareTransferReport(last_tx_report_, file, manager_.status(), nextTransferId());
+        giveRadio();
         giveLoop();
 
         std::printf("TX started for %s. Use STOP to abort.\n", file.name.c_str());
@@ -3743,6 +4086,7 @@ private:
         loop_config_ = LoopConfig{};
         loop_config_.mode = LoopMode::Morse;
         loop_config_.active = true;
+                loop_owns_radio_.store(true);
         loop_config_.infinite = false;
         loop_config_.restore_rx_after_completion =
             origin == CommandOrigin::Remote && kWirelessControlEnabled && kWirelessControlAutoRx;
@@ -3774,7 +4118,10 @@ private:
         }
 
         const RadioStatus before = manager_.status();
-        const bool ok = ensureStandbyLocked();
+        if (hasActiveIncomingReceiveLocked())
+            discardIncomingFileTransfer("Operator STOP cancelled active RX");
+        const bool receive_cleanup_ok = !receiver_.cleanupFailed();
+        const bool ok = ensureStandbyLocked() && receive_cleanup_ok;
         const RadioStatus after = manager_.status();
         giveRadio();
 
@@ -3806,31 +4153,38 @@ private:
 
     bool commandRx()
     {
-        // Receive (RX) is a persistent mode rather than a one-shot action. The
-        // background
-        // rxTask() is what actually polls for and logs packets afterward.
-        if (!stopLoopAndWait()) {
-            std::printf("Could not stop the current loop cleanly.\n");
+        // RX is a persistent listening mode. Repeating it must not leave RX,
+        // close the current partial sink, clear counters, or reset its session.
+        if (!takeRadio(pdMS_TO_TICKS(100))) {
+            std::printf("ERR RX radio_busy_retry\n");
             return false;
         }
-
-        if (!takeRadio()) {
-            std::printf("Radio is busy.\n");
+        const RadioStatus before = manager_.status();
+        if (host_session_owns_rx_.load() || loop_owns_radio_.load()) {
+            giveRadio();
+            std::printf("ERR RX host_or_loop_active_use_STOP\n");
             return false;
         }
-
+        if (before.state == RadioState::RxListening) {
+            giveRadio();
+            std::printf("RX listening on channel %u\n", static_cast<unsigned>(before.channel));
+            return true;
+        }
+        if (hasActiveIncomingReceiveLocked()) {
+            giveRadio();
+            std::printf("ERR RX receive_active_use_STOP\n");
+            return false;
+        }
+        // No peer can start a receive while this hardware lock is held. Stop
+        // is deliberately a separate action for queued RF loops/host sessions.
         const bool ok = startRxLocked();
-
         const RadioStatus status = manager_.status();
         giveRadio();
-
         if (!ok) {
-            std::printf("Could not enter RX mode. state=%s fault=%d\n",
-                        RadioManager::stateName(status.state),
-                        status.last_fault);
+            std::printf("ERR RX start_failed_state_%s_fault_%d\n",
+                        RadioManager::stateName(status.state), status.last_fault);
             return false;
         }
-
         std::printf("RX listening on channel %u\n", static_cast<unsigned>(status.channel));
         return true;
     }
@@ -4132,6 +4486,7 @@ private:
             loop_config_ = LoopConfig{};
             loop_config_.mode = LoopMode::Cw;
             loop_config_.active = true;
+                loop_owns_radio_.store(true);
             loop_config_.infinite = true;
             loop_config_.cw_on_ms = on_ms;
             loop_config_.cw_off_ms = off_ms;
@@ -4235,6 +4590,12 @@ private:
             return;
         }
 
+        ProtocolTransferReport queued = copyTransferReport(last_tx_report_);
+        if (queued.state != ReliableTransferV2::SenderState::Preparing || loop.file_name != queued.file_name) {
+            size_t bytes = 0;
+            (void)statFileSize(buildFilePath(loop.file_name), bytes);
+            prepareTransferReport(last_tx_report_, FileInfo{loop.file_name, bytes}, manager_.status(), nextTransferId());
+        }
         bool ok = ensureStandbyLocked();
         RadioStatus status = manager_.status();
         if (ok) {
@@ -4246,6 +4607,13 @@ private:
                 &loop_stop_requested_,
                 &last_tx_report_);
             status = manager_.status();
+        } else {
+            ProtocolTransferReport failed = copyTransferReport(last_tx_report_);
+            failed.state = ReliableTransferV2::SenderState::Failed;
+            failed.error = ProtocolV2::ErrorCode::TransportFailure;
+            failed.radio = status;
+            failed.radio_valid = true;
+            publishTransferReport(last_tx_report_, failed);
         }
         giveRadio();
 
@@ -4607,6 +4975,11 @@ private:
             std::vector<std::string> received_texts;
 
             if (takeRadio(pdMS_TO_TICKS(10))) {
+                if (receiveWorkerPaused()) {
+                    giveRadio();
+                    vTaskDelay(kRxPollPeriod);
+                    continue;
+                }
                 if (manager_.status().state == RadioState::RxListening) {
                     manager_.refreshSnapshot();
                     const RadioStatus snapshot = manager_.status();
@@ -4704,6 +5077,42 @@ private:
         }
     }
 
+    bool hasActiveIncomingReceiveLocked() const
+    {
+        return receiver_.active() || incoming_file_.file != nullptr || active_api_receive_id_ != 0;
+    }
+
+    bool receiveWorkerPaused() const
+    {
+        return receive_mutation_reserved_.load() || host_session_owns_rx_.load() || loop_owns_radio_.load();
+    }
+
+    bool beginReceiveMutation(const std::vector<std::string>& words, CommandOrigin origin)
+    {
+        const char* reason = "radio_busy_retry";
+        if (takeRadio(pdMS_TO_TICKS(100))) {
+            const bool receiving = hasActiveIncomingReceiveLocked();
+            if (!receiving) receive_mutation_reserved_.store(true);
+            giveRadio();
+            if (!receiving) return true;
+            reason = "receive_active_use_STOP_to_cancel";
+        }
+        const std::string command = uppercaseCopy(words.front());
+        if (command == "UPLOAD" || command == "DOWNLOAD") {
+            emitHostTransferResponse(origin, command + " ERROR " + reason);
+        } else if (command == "STORAGE") {
+            emitHostTransferResponse(origin, HostStorageProtocol::error(reason));
+        } else if (command == "SELECTHEX" || command == "TXHEX") {
+            emitHostTransferResponse(origin, "ERR " + command +
+                (words.size() > 1 ? " " + words[1] : "") + " " + reason);
+        } else {
+            // USB receives this correlated error; SPP's existing command reply
+            // emits the matching ERR command and the intact receiver snapshot.
+            std::printf("ERR %s %s\n", command.c_str(), reason);
+        }
+        return false;
+    }
+
     bool handleCommand(const std::string& line, CommandOrigin origin)
     {
         // Command dispatch is a simple keyword router. Each handler owns its
@@ -4719,6 +5128,12 @@ private:
         }
 
         const std::string command = uppercaseCopy(words.front());
+        const std::string action = words.size() > 1 ? uppercaseCopy(words[1]) : "";
+        HostRxCommandGuard::Reservation reservation;
+        if (HostRxCommandGuard::needsReservation(command, action)) {
+            if (!beginReceiveMutation(words, origin)) return false;
+            reservation.acquired(receive_mutation_reserved_);
+        }
         if (command == "ECHO") {
             const size_t separator = line.find_first_of(" \t");
             const std::string text = separator == std::string::npos
@@ -4802,9 +5217,16 @@ private:
         if (command == "DOWNLOAD") {
             return commandDownload(words, origin);
         }
+        if (command == "STORAGE") {
+            return commandStorage(words, origin);
+        }
+        if (command == "SELECTHEX" || command == "TXHEX") {
+            return commandStoredName(words, origin);
+        }
         if (test_mode_) {
             if (command == "STATUS") {
                 printStatus();
+                if (origin == CommandOrigin::Local) std::printf("%s\n", buildStatusJson().c_str());
                 return true;
             }
             if (command == "HELP" || command == "?") {
@@ -4823,6 +5245,7 @@ private:
         }
         if (command == "STATUS") {
             printStatus();
+            if (origin == CommandOrigin::Local) std::printf("%s\n", buildStatusJson().c_str());
             return true;
         }
         if (command == "FILES" || command == "LS") {
@@ -4874,7 +5297,60 @@ private:
 
     bool dispatchCommand(const std::string& line, CommandOrigin origin, uint32_t epoch = 0)
     {
+        // Establish the PC-to-ESP link even while an RF command owns the
+        // command/radio mutexes. Identity is immutable build information.
+        const auto identity_words = splitWords(line);
+        if ((origin == CommandOrigin::Local || origin == CommandOrigin::Bluetooth) &&
+            identity_words.size() == 1 && uppercaseCopy(identity_words.front()) == "HELLO") {
+            const std::string response = HostConnectionProtocol::hello(
+                WifiControlConfig::kNodeName, HardwareProfile::kSelectedName,
+                ProtocolV2::kVersion);
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+            if (origin == CommandOrigin::Bluetooth) {
+                if (!bluetooth_client_connected_.load() || epoch != bluetooth_epoch_.load()) {
+                    return false;
+                }
+                return sendBluetoothText(response + "\r\n", epoch);
+            }
+#endif
+            std::printf("%s\n", response.c_str());
+            std::fflush(stdout);
+            return true;
+        }
         if (!takeCommand(pdMS_TO_TICKS(500))) {
+            if ((origin == CommandOrigin::Local || origin == CommandOrigin::Bluetooth) &&
+                !identity_words.empty() &&
+                (uppercaseCopy(identity_words.front()) == "SELECTHEX" || uppercaseCopy(identity_words.front()) == "TXHEX")) {
+                const std::string response = "ERR " + uppercaseCopy(identity_words.front()) +
+                    (identity_words.size() > 1 ? " " + identity_words[1] : "") + " command_busy_retry";
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+                if (origin == CommandOrigin::Bluetooth) {
+                    if (bluetooth_client_connected_.load() && epoch == bluetooth_epoch_.load())
+                        sendBluetoothText(response + "\r\n", epoch);
+                } else
+#endif
+                {
+                    std::printf("%s\n", response.c_str());
+                    std::fflush(stdout);
+                }
+                return false;
+            }
+            if ((origin == CommandOrigin::Local || origin == CommandOrigin::Bluetooth) &&
+                !identity_words.empty() && uppercaseCopy(identity_words.front()) == "STORAGE") {
+                const std::string response = HostStorageProtocol::error("command_busy_retry");
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+                if (origin == CommandOrigin::Bluetooth) {
+                    if (bluetooth_client_connected_.load() && epoch == bluetooth_epoch_.load()) {
+                        sendBluetoothText(response + "\r\n", epoch);
+                    }
+                } else
+#endif
+                {
+                    std::printf("%s\n", response.c_str());
+                    std::fflush(stdout);
+                }
+                return false;
+            }
             if (origin == CommandOrigin::Remote) {
                 ESP_LOGW(TAG, "Dropping remote command while another command is active: %s", line.c_str());
             } else {
@@ -4905,6 +5381,9 @@ private:
 
     RadioManager& manager_;
     FileTransfer::Service transfer_service_;  // Subsystem-facing Protocol v2 transfer API.
+    SemaphoreHandle_t status_mutex_ = nullptr;  // Only serializes status/cache string ownership.
+    HttpStatusSnapshot cached_host_status_{};
+    char selected_status_name_[HostStorageProtocol::kFilenameMaxBytes + 1]{};
     SemaphoreHandle_t radio_mutex_ = nullptr;  // Serializes all radio access.
     TaskHandle_t rx_task_ = nullptr;           // Background receive (RX) polling task.
     SemaphoreHandle_t loop_mutex_ = nullptr;   // Guards background TX/CW loop configuration.
@@ -4921,6 +5400,9 @@ private:
     ProtocolTransferReport last_tx_report_{}; // Last reliable sender state for STATUS.
     HostUploadStorage host_upload_{};         // Current PC-to-SPIFFS staged upload.
     HostDownloadStorage host_download_{};     // Current SPIFFS-to-PC export session.
+    std::atomic_bool receive_mutation_reserved_{false};  // Acquired under radio, released after command.
+    std::atomic_bool host_session_owns_rx_{false};      // Holds RX-start exclusion across host chunks.
+    std::atomic_bool loop_owns_radio_{false};           // Holds RX-start exclusion until queued worker clears.
     std::atomic_bool test_mode_{false};
     std::atomic<uint32_t> test_tx_count_{0};
     std::atomic<uint32_t> test_tx_bytes_{0};

@@ -23,11 +23,17 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QAbstractItemView,
+    QHeaderView,
     QVBoxLayout,
     QWidget,
 )
 
 from rf3_gui.app.controller import AppController
+from rf3_gui.app.receive_rate import ReceiveRateTracker
+from rf3_gui.protocol import console_protocol
 from rf3_gui.app.state_model import (
     CONSOLE_COMMAND_MAX_CHARS,
     ConnectionState,
@@ -36,6 +42,8 @@ from rf3_gui.app.state_model import (
     MAX_CHANNEL,
     MIN_CHANNEL,
     REMOTE_COMMAND_MAX_BYTES,
+    RadioState,
+    StorageListing,
     TEXT_MESSAGE_MAX_BYTES,
     TransferProgress,
     TransferState,
@@ -48,11 +56,24 @@ class MainWindow(QMainWindow):
         self._controller = controller
         self._devices: list[DeviceInfo] = []
         self._pending_test_mode: bool | None = None
+        self._draft_dirty: set[str] = set()
+        self._syncing_drafts = False
+        self._drafts_initialized = False
+        self._connection_epoch = 0
+        self._was_connected = False
+        self._closing = False
+        self._rx_rate_tracker = ReceiveRateTracker()
+        self._rx_rate_snapshot = None
 
         self.setWindowTitle("RF3 Desktop")
         self._build_ui()
         self._connect_signals()
         self._apply_snapshot(controller.snapshot)
+
+    def closeEvent(self, event) -> None:
+        self._closing = True
+        self._controller.disconnect()
+        super().closeEvent(event)
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -96,10 +117,164 @@ class MainWindow(QMainWindow):
             scroll.setWidgetResizable(True)
             scroll.setWidget(page)
             tabs.addTab(scroll, label)
+        tabs.addTab(self._build_storage_page(), "SPIFFS Files")
         root.addWidget(tabs, 1)
 
         self.setCentralWidget(central)
         self.statusBar().showMessage("Ready")
+
+    def _build_storage_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        help_text = QLabel("Files on the connected ESP32. Import copies a PC file into SPIFFS and verifies it; export saves a selected file to the PC.")
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+        self.storage_summary = QLabel("Connect and refresh to view SPIFFS files.")
+        self.storage_summary.setWordWrap(True)
+        layout.addWidget(self.storage_summary)
+        self.storage_table = QTableWidget(0, 2)
+        self.storage_table.setHorizontalHeaderLabels(["File name", "Size (bytes)"])
+        self.storage_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.storage_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.storage_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.storage_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.storage_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.storage_table, 1)
+        buttons = QHBoxLayout()
+        self.storage_refresh_button = QPushButton("Refresh Files")
+        self.storage_import_button = QPushButton("Import from PC")
+        self.storage_export_button = QPushButton("Export to PC")
+        self.storage_delete_button = QPushButton("Delete from SPIFFS")
+        self.storage_delete_button.setToolTip("Delete the selected file after confirmation; stop radio activity first")
+        for button in (self.storage_refresh_button, self.storage_import_button,
+                       self.storage_export_button, self.storage_delete_button):
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        tx_buttons = QHBoxLayout()
+        self.storage_select_button = QPushButton("Select on ESP")
+        self.storage_transmit_button = QPushButton("Transmit Stored File")
+        self.storage_select_button.setToolTip("Set the ESP's selected file to this row; no upload or transmission")
+        self.storage_transmit_button.setToolTip("Transmit this stored file over nRF24 without uploading it again")
+        tx_buttons.addWidget(self.storage_select_button)
+        tx_buttons.addWidget(self.storage_transmit_button)
+        layout.addLayout(tx_buttons)
+        self.storage_progress = QProgressBar()
+        self.storage_progress.setRange(0, 1000)
+        self.storage_operation = QLabel("Import and export use the host connection; import does not transmit over nRF24.")
+        self.storage_operation.setWordWrap(True)
+        layout.addWidget(self.storage_progress)
+        layout.addWidget(self.storage_operation)
+        return page
+
+    def _selected_storage_file(self):
+        row = self.storage_table.currentRow()
+        files = self._controller.storage.files
+        return files[row] if 0 <= row < len(files) else None
+
+    def _apply_storage_listing(self, listing: StorageListing) -> None:
+        old_item = self.storage_table.item(self.storage_table.currentRow(), 0)
+        selected_name = old_item.text() if old_item else None
+        self.storage_table.setRowCount(len(listing.files))
+        selected_row = -1
+        for row, entry in enumerate(listing.files):
+            self.storage_table.setItem(row, 0, QTableWidgetItem(entry.name))
+            self.storage_table.setItem(row, 1, QTableWidgetItem(str(entry.size)))
+            if selected_name == entry.name:
+                selected_row = row
+        if selected_row >= 0:
+            self.storage_table.selectRow(selected_row)
+        else:
+            self.storage_table.clearSelection()
+            self.storage_table.setCurrentCell(-1, -1)
+        if listing.available:
+            self.storage_summary.setText(f"{len(listing.files)} file(s) | used {listing.used:,} / {listing.capacity:,} bytes | free {listing.capacity - listing.used:,} bytes")
+        else:
+            self.storage_summary.setText("Refresh Files to read this board's SPIFFS contents. Updated firmware is required.")
+        self._apply_storage_controls()
+
+    def _apply_storage_controls(self) -> None:
+        snapshot = self._controller.snapshot
+        ready = (snapshot.connection_state == ConnectionState.CONNECTED
+                 and snapshot.capabilities.supports_host_storage and self._pending_test_mode is None)
+        entry = self._selected_storage_file()
+        listed = self._controller.storage.available
+        self.storage_refresh_button.setEnabled(ready)
+        self.storage_import_button.setEnabled(ready and listed and snapshot.capabilities.supports_host_file_upload
+                                              and snapshot.capabilities.supports_host_file_download)
+        self.storage_export_button.setEnabled(ready and listed and entry is not None
+                                              and snapshot.capabilities.supports_host_file_download)
+        self.storage_delete_button.setEnabled(ready and listed and entry is not None
+                                              and snapshot.confirmed_radio_state not in
+                                              {RadioState.RX_LISTENING, RadioState.TX_BUSY, RadioState.CW_TEST})
+        can_select = (ready and listed and entry is not None
+                      and snapshot.capabilities.supports_stored_file_tx
+                      and snapshot.confirmed_radio_state not in {RadioState.TX_BUSY, RadioState.CW_TEST})
+        self.storage_select_button.setEnabled(can_select)
+        self.storage_transmit_button.setEnabled(
+            can_select and not snapshot.test_mode
+            and snapshot.confirmed_radio_state in {RadioState.STANDBY, RadioState.RX_LISTENING})
+
+    def _select_storage_file(self) -> None:
+        entry = self._selected_storage_file()
+        if entry is not None:
+            self._controller.select_stored_file(entry.name)
+
+    def _transmit_storage_file(self) -> None:
+        entry = self._selected_storage_file()
+        if entry is not None:
+            self._controller.start_stored_tx(entry.name)
+
+    def _dialog_connection_valid(self, epoch: int) -> bool:
+        return (epoch == self._connection_epoch
+                and self._controller.snapshot.connection_state == ConnectionState.CONNECTED)
+
+    def _import_storage_file(self) -> None:
+        epoch = self._connection_epoch
+        path_text, _ = QFileDialog.getOpenFileName(self, "Import file into ESP SPIFFS")
+        if not path_text:
+            return
+        if not self._dialog_connection_valid(epoch):
+            return
+        path = Path(path_text)
+        try:
+            console_protocol.upload_extension(path.name)
+            remote_name = console_protocol.import_filename(path.name)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Unsupported file type", str(exc))
+            return
+        existing = {entry.name for entry in self._controller.storage.files}
+        if remote_name in existing:
+            answer = QMessageBox.question(self, "Replace SPIFFS file?",
+                                          f"Replace {remote_name} on the connected ESP32?",
+                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                          QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        if not self._dialog_connection_valid(epoch):
+            return
+        self.storage_operation.setText(f"Importing {path.name} as {remote_name}; no nRF24 transmission")
+        self._controller.import_file(path)
+
+    def _export_storage_file(self) -> None:
+        epoch = self._connection_epoch
+        entry = self._selected_storage_file()
+        if entry is None:
+            return
+        path_text, _ = QFileDialog.getSaveFileName(self, "Export SPIFFS file to PC", entry.name)
+        if path_text and self._dialog_connection_valid(epoch):
+            self._controller.export_file(entry.name, Path(path_text))
+
+    def _delete_storage_file(self) -> None:
+        epoch = self._connection_epoch
+        entry = self._selected_storage_file()
+        if entry is None:
+            return
+        answer = QMessageBox.question(self, "Delete SPIFFS file?",
+                                      f"Delete {entry.name} ({entry.size:,} bytes) from the connected ESP32?",
+                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                      QMessageBox.StandardButton.No)
+        if answer == QMessageBox.StandardButton.Yes and self._dialog_connection_valid(epoch):
+            self._controller.delete_file(entry.name)
 
     def _build_connection_group(self) -> QGroupBox:
         group = QGroupBox("Connection")
@@ -121,6 +296,8 @@ class MainWindow(QMainWindow):
 
         self.connection_state_label = QLabel("Disconnected")
         self.connection_state_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.connection_detail_label = QLabel()
+        self.connection_detail_label.setWordWrap(True)
 
         layout.addWidget(QLabel("Device"), 0, 0)
         layout.addWidget(self.device_combo, 0, 1, 1, 3)
@@ -135,6 +312,7 @@ class MainWindow(QMainWindow):
         guidance.setToolTip("BLE-only devices require a separate transport and compatible firmware.")
         guidance.setWordWrap(True)
         layout.addWidget(guidance, 3, 1, 1, 4)
+        layout.addWidget(self.connection_detail_label, 4, 1, 1, 4)
         layout.setColumnStretch(1, 1)
 
         return group
@@ -149,6 +327,9 @@ class MainWindow(QMainWindow):
         self.power_value = QLabel("unknown")
         self.battery_value = QLabel("not reported")
         self.selected_file_value = QLabel("")
+        self.active_tx_file_value = QLabel("")
+        self.fault_value = QLabel("None")
+        self.fault_value.setWordWrap(True)
         self.last_tx_value = QLabel("false")
         self.test_tx_value = QLabel("0 acknowledged")
         self.rx_value = QLabel("0 packets, 0 saved")
@@ -158,7 +339,9 @@ class MainWindow(QMainWindow):
         layout.addRow("Channel", self.channel_value)
         layout.addRow("TX power", self.power_value)
         layout.addRow("Battery", self.battery_value)
-        layout.addRow("Selected file", self.selected_file_value)
+        layout.addRow("Selected SPIFFS file (ESP)", self.selected_file_value)
+        layout.addRow("RF file (current/last)", self.active_tx_file_value)
+        layout.addRow("Radio fault", self.fault_value)
         layout.addRow("Last RF TX ok", self.last_tx_value)
         layout.addRow("Legacy TESTTX counter", self.test_tx_value)
         layout.addRow("RX summary", self.rx_value)
@@ -232,37 +415,51 @@ class MainWindow(QMainWindow):
         self.transfer_detail_label.setWordWrap(True)
         self.transfer_detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
-        layout.addWidget(QLabel("Source"), 0, 0)
+        layout.addWidget(QLabel("PC source"), 0, 0)
         layout.addWidget(self.file_path_edit, 0, 1)
         layout.addWidget(self.browse_button, 0, 2)
         layout.addWidget(self.transmit_button, 0, 3)
         layout.addWidget(self.progress_bar, 1, 1, 1, 2)
         layout.addWidget(self.transfer_state_label, 1, 3)
         layout.addWidget(self.transfer_detail_label, 2, 1, 1, 3)
+        self.upload_name_value = QLabel("SPIFFS upload name: no PC file chosen")
+        self.upload_name_value.setWordWrap(True)
+        layout.addWidget(self.upload_name_value, 3, 1, 1, 3)
         layout.setColumnStretch(1, 1)
 
         return group
 
     def _build_received_group(self) -> QGroupBox:
-        group = QGroupBox("Received Files")
+        group = QGroupBox("Incoming && Saved Files")
         layout = QGridLayout(group)
 
         self.rx_storage_value = QLabel("ESP SPIFFS (/spiffs)")
         self.rx_last_file_value = QLabel("No received file reported")
         self.rx_last_file_value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.rx_saved_detail_value = QLabel("0 files, 0 bytes")
+        self.rx_transfer_value = QLabel("Idle")
+        self.rx_transfer_value.setWordWrap(True)
+        self.rx_progress = QProgressBar()
+        self.rx_progress.setRange(0, 1000)
+        self.rx_rate_value = QLabel("Not receiving")
+        self.rx_rate_value.setToolTip("Received payload bytes per second, averaged over about 10 seconds of status samples. Time starts when this window first observes the transfer; protocol overhead is excluded.")
         self.copy_rx_path_button = QPushButton("Copy ESP Path")
         self.save_received_button = QPushButton("Save to PC")
         self.save_received_button.setToolTip("Download the received file from ESP storage")
 
-        layout.addWidget(QLabel("Storage"), 0, 0)
-        layout.addWidget(self.rx_storage_value, 0, 1, 1, 2)
-        layout.addWidget(QLabel("Last file"), 1, 0)
-        layout.addWidget(self.rx_last_file_value, 1, 1, 1, 2)
-        layout.addWidget(QLabel("Saved"), 2, 0)
-        layout.addWidget(self.rx_saved_detail_value, 2, 1, 1, 2)
-        layout.addWidget(self.copy_rx_path_button, 3, 1)
-        layout.addWidget(self.save_received_button, 3, 2)
+        layout.addWidget(QLabel("Incoming RF"), 0, 0)
+        layout.addWidget(self.rx_transfer_value, 0, 1, 1, 2)
+        layout.addWidget(self.rx_progress, 1, 1, 1, 2)
+        layout.addWidget(QLabel("Payload rate"), 2, 0)
+        layout.addWidget(self.rx_rate_value, 2, 1, 1, 2)
+        layout.addWidget(QLabel("Last file"), 3, 0)
+        layout.addWidget(self.rx_last_file_value, 3, 1, 1, 2)
+        layout.addWidget(QLabel("Saved"), 4, 0)
+        layout.addWidget(self.rx_saved_detail_value, 4, 1, 1, 2)
+        layout.addWidget(QLabel("Storage"), 5, 0)
+        layout.addWidget(self.rx_storage_value, 5, 1, 1, 2)
+        layout.addWidget(self.copy_rx_path_button, 6, 1)
+        layout.addWidget(self.save_received_button, 6, 2)
         layout.setColumnStretch(1, 1)
 
         return group
@@ -345,10 +542,15 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(group)
         self.show_debug_checkbox = QCheckBox("Show debug traffic")
         self.show_debug_checkbox.setChecked(False)
+        self.show_debug_checkbox.setToolTip("TX/RX arrows show PC connection traffic. OK STATUS is an acknowledgement, not RF delivery.")
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setMaximumBlockCount(1000)
+        self.log_location_label = QLabel("Diagnostic log: not configured")
+        self.log_location_label.setWordWrap(True)
+        self.log_location_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.show_debug_checkbox)
+        layout.addWidget(self.log_location_label)
         layout.addWidget(self.log_output)
         return group
 
@@ -369,6 +571,10 @@ class MainWindow(QMainWindow):
         self.power_down_button.clicked.connect(self._controller.power_down)
         self.apply_channel_button.clicked.connect(self._set_channel)
         self.apply_power_button.clicked.connect(self._set_power)
+        self.channel_spin.valueChanged.connect(lambda: self._mark_draft("channel"))
+        self.cw_channel_spin.valueChanged.connect(lambda: self._mark_draft("cw_channel"))
+        self.power_combo.currentIndexChanged.connect(lambda: self._mark_draft("power"))
+        self.cw_power_combo.currentIndexChanged.connect(lambda: self._mark_draft("cw_power"))
 
         self.browse_button.clicked.connect(self._choose_file)
         self.transmit_button.clicked.connect(self._controller.start_tx)
@@ -390,6 +596,47 @@ class MainWindow(QMainWindow):
         self._controller.log_event.connect(self._append_log)
         self._controller.command_finished.connect(self._on_command_finished)
         self._controller.text_message_received.connect(self._append_text_message)
+        self._controller.storage_changed.connect(self._apply_storage_listing)
+        self.storage_table.itemSelectionChanged.connect(self._apply_storage_controls)
+        self.storage_refresh_button.clicked.connect(self._controller.refresh_storage)
+        self.storage_import_button.clicked.connect(self._import_storage_file)
+        self.storage_export_button.clicked.connect(self._export_storage_file)
+        self.storage_delete_button.clicked.connect(self._delete_storage_file)
+        self.storage_select_button.clicked.connect(self._select_storage_file)
+        self.storage_transmit_button.clicked.connect(self._transmit_storage_file)
+
+    def _mark_draft(self, name: str) -> None:
+        if not self._syncing_drafts:
+            self._draft_dirty.add(name)
+
+    def _sync_drafts(self, snapshot: DeviceSnapshot, connected: bool) -> None:
+        if not connected:
+            self._drafts_initialized = False
+            return
+        if snapshot.confirmed_radio_state == RadioState.UNKNOWN:
+            return
+        self._syncing_drafts = True
+        try:
+            for name, widget, value in (("channel", self.channel_spin, snapshot.channel),
+                                        ("cw_channel", self.cw_channel_spin, snapshot.channel),
+                                        ("power", self.power_combo, snapshot.power_level),
+                                        ("cw_power", self.cw_power_combo, snapshot.power_level)):
+                if value is None or ("power" in name and value not in range(4)):
+                    continue
+                current = widget.value() if isinstance(widget, QSpinBox) else widget.currentData()
+                if not self._drafts_initialized or name not in self._draft_dirty:
+                    if isinstance(widget, QSpinBox):
+                        widget.setValue(value)
+                    else:
+                        widget.setCurrentIndex(widget.findData(value))
+                    self._draft_dirty.discard(name)
+                elif current == value:
+                    # A confirmed value has caught up with this draft. An ACK
+                    # alone never clears a draft before telemetry confirms it.
+                    self._draft_dirty.discard(name)
+            self._drafts_initialized = True
+        finally:
+            self._syncing_drafts = False
 
     def _on_devices_changed(self, devices: list[DeviceInfo]) -> None:
         self._devices = devices
@@ -424,6 +671,10 @@ class MainWindow(QMainWindow):
             ConnectionState.BUSY,
         }
         busy = snapshot.connection_state == ConnectionState.BUSY
+        if connected != self._was_connected:
+            self._connection_epoch += 1
+            self._was_connected = connected
+        self._sync_drafts(snapshot, connected)
         if not connected:
             self._pending_test_mode = None
         elif self._pending_test_mode == snapshot.test_mode:
@@ -435,29 +686,35 @@ class MainWindow(QMainWindow):
             self.test_mode_checkbox.blockSignals(False)
         self.test_mode_checkbox.setEnabled(
             connected and not busy and self._pending_test_mode is None
+            and snapshot.confirmed_radio_state != RadioState.UNKNOWN
+            and snapshot.capabilities.supports_test_mode
             and self._controller.selected_device is not None
             and self._controller.selected_device.transport in {"serial", "bluetooth"}
         )
-        controls_enabled = connected and not busy and not snapshot.test_mode and self._pending_test_mode is None
+        controls_enabled = (connected and not busy and not snapshot.test_mode
+                            and snapshot.confirmed_radio_state != RadioState.UNKNOWN
+                            and self._pending_test_mode is None)
+        rf_ready = controls_enabled and snapshot.confirmed_radio_state in {RadioState.STANDBY, RadioState.RX_LISTENING}
 
         self.connection_state_label.setText(snapshot.connection_state.value)
+        self.connection_detail_label.setText(snapshot.connection_detail)
+        selected_device = self._controller.selected_device
+        identity = (f"{selected_device.name} [{selected_device.address}]" if selected_device else snapshot.profile)
+        self.setWindowTitle("RF3 Desktop" + (f" — {identity}" if identity else ""))
         self.requested_state_value.setText(snapshot.requested_radio_state.value)
         self.confirmed_state_value.setText(snapshot.confirmed_radio_state.value)
         self.channel_value.setText(str(snapshot.channel))
-        self.channel_spin.setValue(snapshot.channel)
-        self.cw_channel_spin.setValue(snapshot.channel)
-        self.power_value.setText("unknown" if snapshot.power_level is None else str(snapshot.power_level))
-        if snapshot.power_level is not None:
-            index = self.power_combo.findData(snapshot.power_level)
-            if index >= 0:
-                self.power_combo.setCurrentIndex(index)
-            cw_index = self.cw_power_combo.findData(snapshot.power_level)
-            if cw_index >= 0:
-                self.cw_power_combo.setCurrentIndex(cw_index)
+        self.power_value.setText(str(snapshot.power_level) if snapshot.power_level in range(4) else "Unknown")
+        faults = {0: "None", 1: "SPI probe / RX entry failed", 2: "Register initialization / RX exit failed",
+                  3: "Transmit failed or timed out", 4: "RX payload read failed", 5: "Sleep transition failed",
+                  6: "Power-down failed", 7: "Wake failed", 8: "CW start failed", 9: "Power change failed"}
+        fault = snapshot.telemetry.last_fault
+        self.fault_value.setText(f"{fault}: {faults.get(fault, 'Radio error')}" if fault else "None")
 
         battery = snapshot.telemetry.battery_percent
         self.battery_value.setText("not reported" if battery is None else f"{battery}%")
         self.selected_file_value.setText(snapshot.selected_file or "")
+        self.active_tx_file_value.setText(snapshot.active_tx_file or "None reported")
         self.last_tx_value.setText("true" if snapshot.telemetry.last_tx_ok else "false")
         self.test_tx_value.setText(f"{snapshot.test_tx_count} acknowledged ({snapshot.test_tx_bytes} bytes last)")
         self.rx_value.setText(
@@ -478,6 +735,37 @@ class MainWindow(QMainWindow):
         self.rx_saved_detail_value.setText(
             f"{snapshot.telemetry.rx_saved} files, {snapshot.telemetry.rx_saved_bytes} bytes"
         )
+        rx_state = snapshot.rx_transfer_state or "Idle"
+        detail = (f"{rx_state} | {snapshot.rx_transfer_id} | "
+                  f"{snapshot.rx_received_bytes:,}/{snapshot.rx_total_bytes:,} bytes"
+                  if snapshot.rx_transfer_id else rx_state)
+        if snapshot.rx_error and snapshot.rx_error != "none":
+            detail += f" | {snapshot.rx_error}"
+        self.rx_transfer_value.setText(detail)
+        ratio = (snapshot.rx_received_bytes / snapshot.rx_total_bytes if snapshot.rx_total_bytes
+                 else 1.0 if rx_state == "Completed" else 0.0)
+        self.rx_progress.setValue(int(min(1.0, max(0.0, ratio)) * 1000))
+        if snapshot is not self._rx_rate_snapshot:
+            self._rx_rate_snapshot = snapshot
+            estimate = self._rx_rate_tracker.observe(snapshot.rx_transfer_id,
+                snapshot.rx_transfer_state, snapshot.rx_received_bytes)
+            if estimate is None:
+                self.rx_rate_value.setText("Waiting for samples" if snapshot.rx_transfer_id else "Not receiving")
+            else:
+                rate_text = (f"{estimate.bytes_per_second / 1024:.2f} KiB/s"
+                             if estimate.bytes_per_second is not None else "Waiting for samples")
+                self.rx_rate_value.setText(f"{rate_text} | {estimate.elapsed_seconds:.1f} s observed")
+        telemetry_available = connected and snapshot.confirmed_radio_state != RadioState.UNKNOWN
+        if not telemetry_available:
+            for label in (self.channel_value, self.power_value, self.fault_value,
+                          self.last_tx_value, self.test_tx_value, self.rx_value,
+                          self.rx_saved_detail_value, self.rx_last_file_value,
+                          self.selected_file_value, self.active_tx_file_value,
+                          self.rx_transfer_value):
+                label.setText("Unavailable")
+            self.rx_progress.setValue(0)
+            self.rx_rate_value.setText("Unavailable")
+            self._rx_rate_tracker.reset()
 
         connecting = snapshot.connection_state == ConnectionState.CONNECTING
         searching = snapshot.connection_state == ConnectionState.SEARCHING
@@ -491,13 +779,16 @@ class MainWindow(QMainWindow):
         self.device_combo.setEnabled(not (connected or busy or connecting or searching))
         self.refresh_button.setEnabled(connected and not busy)
         self.stop_button.setEnabled((connected or busy) and not snapshot.test_mode and self._pending_test_mode is None)
+        receiving = snapshot.rx_transfer_state in {"Receiving", "WaitingForEnd", "Verifying", "Publishing"}
+        self.stop_button.setText("Cancel Receive" if receiving else "Stop")
+        self.stop_button.setToolTip("Cancel the incoming RF file" if receiving else "Stop the current RF operation")
         self.standby_button.setEnabled(controls_enabled)
-        self.rx_button.setEnabled(controls_enabled)
-        self.sleep_button.setEnabled(controls_enabled)
+        self.rx_button.setEnabled(rf_ready)
+        self.sleep_button.setEnabled(rf_ready)
         self.wake_button.setEnabled(controls_enabled)
         self.power_down_button.setEnabled(controls_enabled)
         self.apply_channel_button.setEnabled(controls_enabled)
-        self.apply_power_button.setEnabled(controls_enabled)
+        self.apply_power_button.setEnabled(rf_ready)
         self.transmit_button.setText("Upload && Verify" if snapshot.test_mode else "Transmit")
         self.transmit_button.setToolTip(
             "Upload the actual file, read it back from ESP SPIFFS, and compare every byte. No nRF24 TX."
@@ -505,27 +796,30 @@ class MainWindow(QMainWindow):
         )
         self.transmit_button.setEnabled(
             connected and self._controller.selected_file is not None and not busy
+            and (snapshot.test_mode or snapshot.confirmed_radio_state in
+                 {RadioState.STANDBY, RadioState.RX_LISTENING})
             and self._pending_test_mode is None
             and snapshot.capabilities.supports_host_file_upload
             and (not snapshot.test_mode or snapshot.capabilities.supports_host_file_download)
         )
-        self.copy_rx_path_button.setEnabled(bool(rx_path or rx_file))
+        self.copy_rx_path_button.setEnabled(telemetry_available and bool(rx_path or rx_file))
         self.save_received_button.setEnabled(
             connected
+            and not busy
             and snapshot.telemetry.rx_saved > 0
             and snapshot.capabilities.supports_host_file_download
             and not snapshot.test_mode
             and self._pending_test_mode is None
         )
         self.morse_text_edit.setEnabled(controls_enabled)
-        self.send_morse_button.setEnabled(controls_enabled)
-        remote_enabled = controls_enabled and snapshot.capabilities.supports_remote_commands
+        self.send_morse_button.setEnabled(rf_ready)
+        remote_enabled = rf_ready and snapshot.capabilities.supports_remote_commands
         self.remote_command_edit.setEnabled(remote_enabled)
         self.send_remote_button.setEnabled(remote_enabled)
         text_enabled = connected and not busy and self._pending_test_mode is None and (
             snapshot.capabilities.supports_host_echo if snapshot.test_mode
             else snapshot.capabilities.supports_text_messages
-        )
+        ) and (snapshot.test_mode or snapshot.confirmed_radio_state in {RadioState.STANDBY, RadioState.RX_LISTENING})
         self.send_text_button.setText("Send to ESP" if snapshot.test_mode else "Send to Peer")
         if snapshot.test_mode:
             description = (
@@ -548,16 +842,22 @@ class MainWindow(QMainWindow):
         self.cw_power_combo.setEnabled(controls_enabled)
         self.cw_on_spin.setEnabled(controls_enabled)
         self.cw_off_spin.setEnabled(controls_enabled)
-        self.cw_start_button.setEnabled(controls_enabled)
-        self.cw_loop_button.setEnabled(controls_enabled)
+        self.cw_start_button.setEnabled(rf_ready)
+        self.cw_loop_button.setEnabled(rf_ready)
         self.cw_stop_button.setEnabled((connected or busy) and not snapshot.test_mode and self._pending_test_mode is None)
+        self.cw_stop_button.setText("Cancel Receive" if receiving else "Stop")
 
         self.statusBar().showMessage(
             f"{snapshot.connection_state.value} | radio {snapshot.confirmed_radio_state.value}"
             + (" | TEST MODE: no nRF24 TX" if snapshot.test_mode else "")
+            + (f" | Receiving {snapshot.rx_received_bytes:,}/{snapshot.rx_total_bytes:,} bytes"
+               if receiving else "")
         )
+        self._apply_storage_controls()
 
     def _apply_transfer_progress(self, progress: TransferProgress) -> None:
+        self.storage_progress.setValue(int(progress.ratio * 1000))
+        self.storage_operation.setText(progress.message)
         self.progress_bar.setValue(int(progress.ratio * 1000))
         label = progress.state.value
         if progress.total_bytes:
@@ -566,7 +866,7 @@ class MainWindow(QMainWindow):
         self.transfer_detail_label.setText(progress.message)
         self.transfer_detail_label.setToolTip(progress.message)
 
-        if progress.state == TransferState.FAILED:
+        if progress.state == TransferState.FAILED and not self._closing:
             QMessageBox.warning(self, "Transfer failed", progress.message)
 
     def _append_log(self, level: str, message: str) -> None:
@@ -575,6 +875,10 @@ class MainWindow(QMainWindow):
         self.log_output.appendPlainText(f"{level.upper():5} {message}")
 
     def _on_command_finished(self, _command: str, accepted: bool, message: str) -> None:
+        if self._closing or message == "Connection closed before command completion":
+            return  # Closing/cancelling a link already has a visible connection result.
+        if _command.startswith("STORAGE"):
+            self.storage_operation.setText(message)
         if _command.startswith("TESTMODE") and not accepted:
             self._pending_test_mode = None
             self._apply_snapshot(self._controller.snapshot)
@@ -599,7 +903,8 @@ class MainWindow(QMainWindow):
             self.file_path_edit.setText(str(path))
             self.progress_bar.setValue(0)
             self.transfer_state_label.setText("Idle")
-            self.transfer_detail_label.setText("File selected. Test mode uploads and verifies without nRF24 TX.")
+            self.upload_name_value.setText(f"SPIFFS upload name: {console_protocol.import_filename(path.name)}")
+            self.transfer_detail_label.setText("PC source chosen. Transmit uploads this file first. Use SPIFFS Files to transmit an existing stored file.")
             self._apply_snapshot(self._controller.snapshot)
 
     def _set_channel(self) -> None:
@@ -620,12 +925,14 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Copied {text}")
 
     def _save_received_file(self) -> None:
+        epoch = self._connection_epoch
         source_name = self._controller.snapshot.telemetry.last_rx_file
         if not source_name:
             QMessageBox.warning(self, "No received file", "The ESP has not reported a received file.")
             return
         path_text, _ = QFileDialog.getSaveFileName(self, "Save received RF3 file", source_name)
-        if path_text:
+        if (path_text and self._dialog_connection_valid(epoch)
+                and self._controller.snapshot.telemetry.last_rx_file == source_name):
             self._controller.save_received_file(Path(path_text))
 
     def _send_morse_text(self) -> None:

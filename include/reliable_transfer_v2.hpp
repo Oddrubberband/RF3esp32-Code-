@@ -48,6 +48,7 @@ struct Metadata {
     uint32_t total_size = 0;
     uint32_t total_packets = 0;
     uint32_t crc32 = 0;
+    FileTypeMetadata::Extension extension{};
 };
 
 inline InspectResult inspectSource(void* context,
@@ -150,6 +151,8 @@ public:
                                            metadata.total_packets)) {
             return fail(ProtocolV2::ErrorCode::UnsupportedSize);
         }
+        if (!FileTypeMetadata::canonical(metadata.extension))
+            return fail(ProtocolV2::ErrorCode::InvalidMetadata);
         if (!source_.reset(source_context_)) {
             return fail(ProtocolV2::ErrorCode::SourceRead);
         }
@@ -163,6 +166,8 @@ public:
         packet.total_size = metadata_.total_size;
         packet.total_packets = metadata_.total_packets;
         packet.crc32 = metadata_.crc32;
+        packet.extension = metadata_.extension;
+        packet.flags = FileTypeMetadata::empty(metadata_.extension) ? 0 : FileTypeMetadata::kStartExtensionFlag;
         if (!setOutbound(packet)) {
             return fail(ProtocolV2::ErrorCode::StateViolation);
         }
@@ -701,6 +706,7 @@ public:
     uint32_t totalPackets() const { return metadata_.total_packets; }
     uint32_t totalSize() const { return metadata_.total_size; }
     uint32_t expectedCrc32() const { return metadata_.crc32; }
+    std::string_view fileExtension() const { return FileTypeMetadata::view(metadata_.extension); }
     uint32_t calculatedCrc32() const { return crc_.value(); }
     uint64_t lastActivityMs() const { return last_activity_ms_; }
     uint32_t timeoutMs() const { return inactivity_timeout_ms_; }
@@ -716,10 +722,14 @@ private:
                               uint64_t now_ms,
                               ProtocolV2::Frame& response)
     {
+        if (!FileTypeMetadata::startMetadataValid(packet.flags, packet.extension))
+            return makeReady(packet.transfer_id, false, 0, ProtocolV2::ErrorCode::InvalidMetadata, response)
+                ? ReceiverEvent::ResponseReady : ReceiverEvent::Failed;
         const Metadata incoming{
             packet.total_size,
             packet.total_packets,
             packet.crc32,
+            packet.extension,
         };
         if (!ProtocolV2::metadataSupported(incoming.total_size,
                                            incoming.total_packets)) {
@@ -728,6 +738,10 @@ private:
                        ? ReceiverEvent::ResponseReady : ReceiverEvent::Failed;
         }
 
+        if (packet.transfer_id == transfer_id_ && state_ != ReceiverState::Idle &&
+            !metadataEqual(incoming, metadata_))
+            return makeReady(packet.transfer_id, false, 0, ProtocolV2::ErrorCode::Busy, response)
+                ? ReceiverEvent::ResponseReady : ReceiverEvent::Failed;
         if (active()) {
             if (packet.transfer_id == transfer_id_ && metadataEqual(incoming, metadata_)) {
                 last_activity_ms_ = now_ms;
@@ -1016,7 +1030,7 @@ private:
     {
         return lhs.total_size == rhs.total_size &&
                lhs.total_packets == rhs.total_packets &&
-               lhs.crc32 == rhs.crc32;
+               lhs.crc32 == rhs.crc32 && lhs.extension == rhs.extension;
     }
 
     void* sink_context_ = nullptr;

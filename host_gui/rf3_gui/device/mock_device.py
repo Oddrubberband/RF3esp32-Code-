@@ -19,6 +19,8 @@ from rf3_gui.app.state_model import (
     Telemetry,
     TransferProgress,
     TransferState,
+    StoredFile,
+    StorageListing,
 )
 from rf3_gui.device.base import DeviceBackend
 from rf3_gui.protocol import console_protocol
@@ -35,6 +37,8 @@ class MockDeviceBackend(DeviceBackend):
             protocol_version="2",
         )
         self._capabilities = RadioCapabilities(
+            supports_stored_file_tx=True,
+            supports_host_storage=True,
             supports_host_file_upload=True,
             supports_host_file_download=True,
             supports_remote_commands=True,
@@ -49,6 +53,7 @@ class MockDeviceBackend(DeviceBackend):
             capabilities=self._capabilities,
         )
         self._connected = False
+        self._stored_files = {"README.md": b"RF3 mock SPIFFS storage\n"}
         self._battery_percent = 87
         self._transfer_timer = QTimer(self)
         self._transfer_timer.timeout.connect(self._advance_transfer)
@@ -95,8 +100,77 @@ class MockDeviceBackend(DeviceBackend):
         self.command_finished.emit(console_protocol.status_command(), True, "Status refreshed")
         self.status_changed.emit(self._snapshot)
 
+    def refresh_storage(self) -> None:
+        if self._require_connected("STORAGE LIST"):
+            self.storage_changed.emit(StorageListing(
+                tuple(StoredFile(name, len(data)) for name, data in sorted(self._stored_files.items())),
+                sum(map(len, self._stored_files.values())), 1_048_576, True))
+
+    def import_file(self, source_path: Path) -> None:
+        if not self._require_connected("UPLOAD"):
+            return
+        try:
+            console_protocol.upload_extension(source_path.name)
+            with source_path.open("rb") as file:
+                data = file.read(PROTOCOL_V2_MAX_FILE_SIZE + 1)
+            if len(data) > PROTOCOL_V2_MAX_FILE_SIZE:
+                raise ValueError("File exceeds the supported transfer size")
+            name = console_protocol.import_filename(source_path.name)
+            self._stored_files[name] = data
+            self.transfer_changed.emit(TransferProgress(state=TransferState.COMPLETED,
+                sent_bytes=len(data), total_bytes=len(data),
+                message=f"Mock import of {name}; no nRF24 TX", source_path=source_path))
+            self.refresh_storage()
+        except (OSError, ValueError) as exc:
+            self.command_finished.emit("UPLOAD", False, str(exc))
+
+    def export_file(self, remote_name: str, destination_path: Path) -> None:
+        if not self._require_connected("DOWNLOAD"):
+            return
+        try:
+            data = self._stored_files[remote_name]
+            destination_path.write_bytes(data)
+            self.transfer_changed.emit(TransferProgress(state=TransferState.COMPLETED,
+                sent_bytes=len(data), total_bytes=len(data), message="Mock SPIFFS export complete",
+                source_path=destination_path))
+        except (OSError, KeyError) as exc:
+            self.command_finished.emit("DOWNLOAD", False, str(exc))
+
+    def delete_file(self, remote_name: str) -> None:
+        if not self._require_connected("STORAGE DELETE"):
+            return
+        if remote_name not in self._stored_files or not console_protocol.valid_storage_name(remote_name):
+            self.command_finished.emit("STORAGE DELETE", False, "Invalid SPIFFS file")
+            return
+        del self._stored_files[remote_name]
+        self.command_finished.emit("STORAGE DELETE", True, f"Deleted {remote_name} from mock SPIFFS")
+        self.refresh_storage()
+
     def set_test_mode(self, enabled: bool) -> None:
         self.command_finished.emit("TESTMODE", False, "Use a serial ESP32 devboard for test mode")
+
+    def select_stored_file(self, remote_name: str) -> None:
+        if not self._require_connected("SELECTHEX"):
+            return
+        if remote_name not in self._stored_files or not console_protocol.valid_storage_name(remote_name):
+            self.command_finished.emit("SELECTHEX", False, "Invalid SPIFFS file")
+            return
+        self._snapshot = self._replace_snapshot(selected_file=remote_name)
+        self.status_changed.emit(self._snapshot)
+        self.command_finished.emit("SELECTHEX", True, f"Selected {remote_name}")
+
+    def start_stored_tx(self, remote_name: str) -> None:
+        if not self._require_connected("TXHEX"):
+            return
+        if remote_name not in self._stored_files or not console_protocol.valid_storage_name(remote_name):
+            self.command_finished.emit("TXHEX", False, "Invalid SPIFFS file")
+            return
+        self._snapshot = self._replace_snapshot(selected_file=remote_name, active_tx_file=remote_name)
+        self.status_changed.emit(self._snapshot)
+        self.transfer_changed.emit(TransferProgress(
+            state=TransferState.COMPLETED, sent_bytes=len(self._stored_files[remote_name]),
+            total_bytes=len(self._stored_files[remote_name]),
+            message=f"Mock stored-file TX: {remote_name}; no hardware transmission"))
 
     def set_channel(self, channel: int) -> None:
         command = console_protocol.channel_command(channel)
@@ -400,6 +474,13 @@ class MockDeviceBackend(DeviceBackend):
 
     def _replace_snapshot(self, **changes) -> DeviceSnapshot:
         values = {
+            "rx_transfer_state": self._snapshot.rx_transfer_state,
+            "rx_transfer_id": self._snapshot.rx_transfer_id,
+            "rx_received_bytes": self._snapshot.rx_received_bytes,
+            "rx_total_bytes": self._snapshot.rx_total_bytes,
+            "rx_error": self._snapshot.rx_error,
+            "profile": self._snapshot.profile,
+            "active_tx_file": self._snapshot.active_tx_file,
             "connection_state": self._snapshot.connection_state,
             "test_mode": self._snapshot.test_mode,
             "test_tx_count": self._snapshot.test_tx_count,

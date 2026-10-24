@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "file_type_metadata.hpp"
+
 // ProtocolV2 defines the complete RF3 reliable-transfer wire codec. It has no
 // dependency on ESP-IDF, FreeRTOS, a filesystem, or the radio driver.
 namespace ProtocolV2 {
@@ -95,6 +97,7 @@ struct Packet {
     uint32_t total_packets = 0;
     uint32_t crc32 = 0;
     uint8_t flags = 0;
+    FileTypeMetadata::Extension extension{};
 
     // DATA and ACK sequence, and READY/NACK next expected sequence.
     uint16_t sequence = 0;
@@ -226,13 +229,14 @@ inline bool encode(const Packet& packet, Frame& out)
     switch (packet.type) {
         case PacketType::Start:
             if (!metadataSupported(packet.total_size, packet.total_packets) ||
-                packet.flags != 0) {
+                !FileTypeMetadata::startMetadataValid(packet.flags, packet.extension)) {
                 return false;
             }
             storeLe32(out.data() + 9, packet.total_size);
             storeLe32(out.data() + 13, packet.total_packets);
             storeLe32(out.data() + 17, packet.crc32);
             out[21] = packet.flags;
+            std::copy(packet.extension.begin(), packet.extension.end(), out.begin() + 22);
             return true;
 
         case PacketType::Ready:
@@ -347,12 +351,14 @@ inline DecodeStatus decode(const uint8_t* frame, size_t length, Packet& out)
             out.total_packets = loadLe32(frame + 13);
             out.crc32 = loadLe32(frame + 17);
             out.flags = frame[21];
+            std::copy(frame + 22, frame + kFrameSize, out.extension.begin());
             if (!metadataSupported(out.total_size, out.total_packets) ||
-                out.flags != 0) {
+                (out.flags != 0 && out.flags != FileTypeMetadata::kStartExtensionFlag))
                 return DecodeStatus::InvalidField;
-            }
-            return allZero(frame, 22, kFrameSize)
-                       ? DecodeStatus::Ok : DecodeStatus::NonzeroReserved;
+            if (out.flags == 0)
+                return allZero(frame, 22, kFrameSize) ? DecodeStatus::Ok : DecodeStatus::NonzeroReserved;
+            return FileTypeMetadata::startMetadataValid(out.flags, out.extension)
+                ? DecodeStatus::Ok : DecodeStatus::InvalidField;
 
         case PacketType::Ready:
             out.expected_sequence = loadLe32(frame + 9);

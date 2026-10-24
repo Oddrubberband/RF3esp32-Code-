@@ -15,8 +15,10 @@ from rf3_gui.app.state_model import (
     TEXT_MESSAGE_MAX_BYTES,
     TransferProgress,
     TransferState,
+    StorageListing,
 )
 from rf3_gui.device.base import DeviceBackend
+from rf3_gui.protocol import console_protocol
 
 
 class AppController(QObject):
@@ -26,6 +28,7 @@ class AppController(QObject):
     log_event = Signal(str, str)
     command_finished = Signal(str, bool, str)
     text_message_received = Signal(str, str)
+    storage_changed = Signal(object)
 
     def __init__(self, backend: DeviceBackend) -> None:
         super().__init__()
@@ -34,6 +37,7 @@ class AppController(QObject):
         self._selected_device: DeviceInfo | None = None
         self._snapshot = DeviceSnapshot()
         self._selected_file: Path | None = None
+        self._storage = StorageListing()
 
         backend.devices_discovered.connect(self._on_devices_discovered)
         backend.status_changed.connect(self._on_status_changed)
@@ -41,6 +45,33 @@ class AppController(QObject):
         backend.command_finished.connect(self._on_command_finished)
         backend.log_event.connect(self.log_event)
         backend.text_message_received.connect(self.text_message_received)
+        backend.storage_changed.connect(self._on_storage_changed)
+
+    @property
+    def storage(self) -> StorageListing:
+        return self._storage
+
+    def _on_storage_changed(self, listing: StorageListing) -> None:
+        self._storage = listing
+        self.storage_changed.emit(listing)
+
+    def refresh_storage(self) -> None:
+        self._backend.refresh_storage()
+
+    def import_file(self, source_path: Path) -> None:
+        self._backend.import_file(source_path)
+
+    def export_file(self, remote_name: str, destination_path: Path) -> None:
+        self._backend.export_file(remote_name, destination_path)
+
+    def delete_file(self, remote_name: str) -> None:
+        self._backend.delete_file(remote_name)
+
+    def select_stored_file(self, remote_name: str) -> None:
+        self._backend.select_stored_file(remote_name)
+
+    def start_stored_tx(self, remote_name: str) -> None:
+        self._backend.start_stored_tx(remote_name)
 
     @property
     def devices(self) -> list[DeviceInfo]:
@@ -105,6 +136,12 @@ class AppController(QObject):
     def set_selected_file(self, path: Path) -> bool:
         if not path.exists() or not path.is_file():
             self.command_finished.emit("FILE", False, "Selected path is not a file")
+            return False
+        try:
+            console_protocol.upload_extension(path.name)
+            console_protocol.import_filename(path.name)
+        except ValueError as exc:
+            self.command_finished.emit("FILE", False, str(exc))
             return False
         if path.stat().st_size > PROTOCOL_V2_MAX_FILE_SIZE:
             self.command_finished.emit(

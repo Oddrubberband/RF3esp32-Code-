@@ -1,6 +1,6 @@
 # RF3 Reliable File-Transfer Protocol v2
 
-Status: implementation specification for `codex/reliable-protocol-v2`
+Status: local R2 implementation, including optional START file-extension metadata.
 
 ## Goals
 
@@ -34,6 +34,11 @@ version and never interprets a Protocol v1 file frame as a v2 frame.
 
 Legacy source components may remain for component tests or non-file remote
 console control, but the production file-transfer path uses Protocol v2.
+
+R2 adds an optional file-extension flag to START. Both boards need R2 firmware
+for extension-bearing transfers. Updated receivers accept byte-identical legacy
+flag-zero START frames; older receivers reject flag-one frames. There is no
+silent downgrade that loses the requested file extension.
 
 ## Byte order and encoding rules
 
@@ -85,11 +90,31 @@ Unknown packet types are rejected.
 | 9 | 4 | Total file size in bytes |
 | 13 | 4 | Total DATA packet count |
 | 17 | 4 | Final file CRC32 |
-| 21 | 1 | Flags; currently zero |
-| 22 | 10 | Reserved; zero |
+| 21 | 1 | Flags: 0 for legacy metadata, 1 for a file extension |
+| 22 | 10 | Zero for legacy; canonical ASCII extension when flag is 1 |
 
 The receiver validates the size/count relationship, limit, flags, transfer ID,
 and reserved bytes before creating a partial file or returning READY.
+
+Flag 1 uses up to ten bytes including the leading dot, followed by zero padding
+when shorter. The final suffix preserves case and permits ASCII letters, digits,
+underscore and hyphen after the dot. Paths, controls, non-ASCII bytes, unknown
+flags, noncanonical padding, an empty flagged suffix, and `.part` (case insensitive)
+are rejected. Unsupported suffixes are rejected before source reads or queueing,
+never truncated. `.tar.gz` carries its final `.gz` suffix. No-extension and legacy
+transfers publish with `.bin`.
+
+The sender derives this suffix from its logical SPIFFS source name. GUI upload
+normalization retains a supported suffix even when the stem changes; host-only
+imports may preserve longer suffixes when the complete SPIFFS name fits. The
+receiver publishes `rx_<transfer-id>.<extension>` with a collision index when
+needed. Partial files remain internal `.part` files, and publication still waits
+for the exact file size and CRC. Duplicate START identity includes the suffix;
+it cannot retarget an active or completed transfer to a different file type.
+
+The file-content CRC covers the original payload bytes. It does not include the
+filename metadata. Frame width, DATA capacity, packet counts, END/COMPLETE fields
+and payload CRC calculation are unchanged by this extension.
 
 ### READY
 

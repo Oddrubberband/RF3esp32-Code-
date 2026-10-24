@@ -1841,7 +1841,7 @@ void test_streamSync_gate_stop_returns_to_waiting_for_start(void)
                       static_cast<int>(gate.accept(stop_packet, stop_len)));
     TEST_ASSERT_EQUAL(static_cast<int>(StreamSync::ReceiverGate::State::WaitingForStart),
                       static_cast<int>(gate.state()));
-}                 
+}
 
 int main(void)
 {

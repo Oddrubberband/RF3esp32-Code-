@@ -1,61 +1,46 @@
-# Build and test RF3
+# Build and verify the current implementation
 
-RF3 uses PlatformIO Core 6.1.19 and pins the Espressif32 platform to 7.0.1.
-Run commands from the repository root. Build output and generated sdkconfig
-files remain under the ignored .pio directory. The only active repository root
-on this machine is the direct path below; no directory junction is required:
+Run commands from the repository root. Firmware uses ESP-IDF through PlatformIO; the desktop GUI requires Windows for its Bluetooth SPP backend. Python 3.11 is used by release CI.
 
 ```powershell
-Set-Location 'C:\Users\Pare\Desktop\SCHOOL\fall_2026\404\CodE_project\RF3esp32-Code-clean'
+py -3.11 -m venv .venv-host
+.\.venv-host\Scripts\python.exe -m pip install -r host_gui\requirements.txt -r requirements.txt
+$env:PYTHONPATH = "$PWD\host_gui"
+$env:QT_QPA_PLATFORM = 'offscreen'
+.\.venv-host\Scripts\python.exe -m unittest discover -s host_gui/tests -v
+.\.venv-host\Scripts\python.exe -m unittest discover -s test -p 'test_*.py' -v
+.\.venv-host\Scripts\python.exe -m platformio test -e native
+.\.venv-host\Scripts\python.exe -m platformio run -e rf3_custom_pcb -e rf3_esp32_devboard
+.\.venv-host\Scripts\python.exe -m PyInstaller --noconfirm RF3Desktop.spec
 ```
 
-Documentation-only edits do not trigger any of these builds or packaging.
-When code validation or delivery requires a build, reuse the existing output
-directories. GUI packaging uses only `RF3Desktop.spec`, updates
-`dist/RF3DesktopFixed/` in place, and reuses `build/RF3Desktop/`:
+Native tests require a C++ compiler available as `g++`. The production-method harnesses below compile the selected production methods with controlled platform adapters. They supplement the native suite; they are not RF hardware tests.
 
 ```powershell
-.\.venv-host\Scripts\python.exe -m PyInstaller --noconfirm --distpath dist --workpath build RF3Desktop.spec
+python tools/tests/test_host_runtime_contract.py --output .test-output/runtime
+python tools/tests/test_rx_command_guard.py --output .test-output/rx
+python tools/tests/test_file_type_metadata.py --output .test-output/extensions
+python tools/check_repository_hygiene.py
 ```
 
-## Native validation
+Use `--help` on a harness to select its compiler or retain evidence. The old flag-zero codec used for compatibility checks is bundled under `test/fixtures/legacy_v2`; no previous private checkout is needed.
 
-    platformio test -e native -v
-    python -m unittest discover -s test -p "test_*.py"
-    git diff --check
+## Portable packages
 
-The native environment requires a host C and C++ compiler (gcc/g++, Clang, or
-an appropriately configured MSVC toolchain).
+After building, use the packaging tool. In a Git checkout it records the exact HEAD; an extracted source tree requires `--commit` with its exact source commit. Do not label locally modified code with an unrelated commit.
 
-## Firmware
+```powershell
+python tools/package_current_release.py --help
+```
 
-    platformio run -e rf3_custom_pcb -t clean
-    platformio run -e rf3_custom_pcb
-    platformio run -e rf3_esp32_devboard -t clean
-    platformio run -e rf3_esp32_devboard
+GitHub validation builds both firmware profiles on Linux and tests/packages the GUI on Windows. A release runs only after successful validation on an explicitly marked main push or manual dispatch. The release contains a portable Windows GUI, both sets of firmware images, exact-source manifests and SHA-256 checksums. Generated packages are not committed to source control.
 
-The custom PCB is the ESP32-WROOM-32UE-N16 target. The devboard profile is the
-4 MB ESP32 development-board target. Their pin mappings are intentionally
-different and compile-time checked.
+## Manual programming
 
-## SPIFFS images
+The Windows manual helper expects the VS Code PlatformIO extension and its default user-profile Python/esptool installation. Install that extension before using the helper; the virtual environment above is for builds and tests. Clear `$env:QT_QPA_PLATFORM` after offscreen tests before launching the GUI interactively.
 
-PlatformIO packs the repository data directory:
+Use the complete firmware release package and its `Flash_Manual.ps1`; its image hash manifest must match the three selected images. Select the correct board and its USB programming port, not its Bluetooth port. BOOT and EN remain manual before and after flashing. See the root README for the sequence. A normal application update does not erase or upload SPIFFS.
 
-    platformio run -e rf3_custom_pcb -t buildfs
-    platformio run -e rf3_esp32_devboard -t buildfs
+For rollback, extract a previous complete release to a separate directory. Launch its GUI directly or pass that directory explicitly with `-Version Previous -PreviousRoot`. Preserve local files separately: changing firmware does not undo SPIFFS mutations.
 
-Stage an arbitrary binary file before building:
-
-    python tools\stage_demo_file.py C:\path\to\payload.bin
-
-The stage helper validates the resulting directory against the selected
-partition capacity. Files ending in .part are never staged.
-
-## Local upload and monitor ports
-
-Ports are deliberately not stored in platformio.ini:
-
-    platformio run -e rf3_custom_pcb -t upload --upload-port COMx
-    platformio run -e rf3_custom_pcb -t uploadfs --upload-port COMx
-    platformio device monitor --baud 115200 --port COMx
+The current verification record is [current_verification.md](verification/current_verification.md), with each change and its evidence in [CHANGELOG.md](../CHANGELOG.md).

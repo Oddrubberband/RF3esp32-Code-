@@ -16,6 +16,7 @@ from rf3_gui.app.state_model import (
     DeviceInfo,
     DeviceSnapshot,
     RadioCapabilities,
+    RadioState,
     Telemetry,
     TransferState,
 )
@@ -39,6 +40,7 @@ class TestHostFileTransfer(unittest.TestCase):
         )
         backend._snapshot = DeviceSnapshot(
             connection_state=ConnectionState.CONNECTED,
+            confirmed_radio_state=RadioState.STANDBY,
             capabilities=RadioCapabilities(
                 supports_host_file_upload=True,
                 supports_host_file_download=True,
