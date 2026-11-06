@@ -17,6 +17,8 @@
 #include <vector>
 
 #include "esp_err.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
@@ -31,6 +33,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 
 #if RF3_BLUETOOTH_CONTROL_ENABLED
 #include "esp_bt.h"
@@ -41,6 +44,7 @@
 #endif
 
 #include "audio_packet.hpp"
+#include "devboard_power.hpp"
 #include "bluetooth_tx_flow.hpp"
 #include "host_upload_publish.hpp"
 #include "host_transfer_guard.hpp"
@@ -51,6 +55,7 @@
 #include "host_rx_command_guard.hpp"
 #include "esp32_nrf24_hal.hpp"
 #include "file_transfer_service.hpp"
+#include "no_ack_transfer.hpp"
 #include "hardware_profile.hpp"
 #include "morse.hpp"
 #include "nrf24.hpp"
@@ -58,6 +63,8 @@
 #include "radio_manager.hpp"
 #include "reliable_transfer_v2.hpp"
 #include "rx_drain.hpp"
+#include "runtime_diagnostics.hpp"
+#include "task_timing.hpp"
 #include "tx_helpers.hpp"
 #include "transfer_rate_limiter.hpp"
 #include "validation.hpp"
@@ -103,6 +110,113 @@
 // files keep packet formatting and radio access focused and testable.
 namespace {
 constexpr const char* TAG = "APP";
+
+class DevboardPowerIo final : public DevboardPower::Io {
+public:
+    bool output(int pin, bool high) override
+    {
+        const auto gpio = static_cast<gpio_num_t>(pin);
+        // ESP-IDF GPIO latch-before-direction sequence avoids a software LOW
+        // pulse at enable. Reset/strapping levels remain a hardware contract.
+        return gpio_set_level(gpio, high ? 1 : 0) == ESP_OK &&
+               gpio_set_direction(gpio, GPIO_MODE_OUTPUT) == ESP_OK;
+    }
+
+    bool beginAdc(int gpio) override
+    {
+        // ESP32 ADC1 oneshot + line-fitting calibration per ESP-IDF ADC API.
+        // ADC1 stays available alongside Classic SPP and optional Wi-Fi.
+        adc_unit_t unit;
+        if (adc_oneshot_io_to_channel(gpio, &unit, &channel_) != ESP_OK ||
+            unit != ADC_UNIT_1) return false;
+        adc_oneshot_unit_init_cfg_t unit_config{};
+        unit_config.unit_id = unit;
+        if (adc_oneshot_new_unit(&unit_config, &adc_) != ESP_OK) return false;
+        adc_oneshot_chan_cfg_t channel_config{};
+        channel_config.atten = ADC_ATTEN_DB_12;
+        channel_config.bitwidth = ADC_BITWIDTH_12;
+        if (adc_oneshot_config_channel(adc_, channel_, &channel_config) != ESP_OK) {
+            (void)adc_oneshot_del_unit(adc_);
+            adc_ = nullptr;
+            return false;
+        }
+        adc_cali_line_fitting_efuse_val_t source;
+        calibrated_ = adc_cali_scheme_line_fitting_check_efuse(&source) == ESP_OK &&
+            source != ADC_CALI_LINE_FITTING_EFUSE_VAL_DEFAULT_VREF;
+        adc_cali_line_fitting_config_t calibration{};
+        calibration.unit_id = unit;
+        calibration.atten = channel_config.atten;
+        calibration.bitwidth = channel_config.bitwidth;
+        calibration.default_vref = 1100; // Explicitly labeled estimated without eFuse.
+        if (adc_cali_create_scheme_line_fitting(&calibration, &calibration_) == ESP_OK) {
+            adc_mutex_ = xSemaphoreCreateMutex();
+            if (adc_mutex_) return true;
+            (void)adc_cali_delete_scheme_line_fitting(calibration_);
+            calibration_ = nullptr;
+        }
+        (void)adc_oneshot_del_unit(adc_);
+        adc_ = nullptr;
+        return false;
+    }
+
+    bool loadCutoff(bool& latched) override
+    {
+        // Never erase NVS to recover this safety latch. GPIO15 is not actively
+        // asserted before it is read; a stored trip survives application resets.
+        if (nvs_flash_init() != ESP_OK || nvs_open("rf3_batt", NVS_READWRITE, &battery_nvs_) != ESP_OK)
+            return false;
+        uint8_t value=0;
+        const esp_err_t result=nvs_get_u8(battery_nvs_, "cutoff", &value);
+        latched=value!=0;
+        return result==ESP_OK || result==ESP_ERR_NVS_NOT_FOUND;
+    }
+
+    bool storeCutoff(bool latched) override
+    {
+        return battery_nvs_ && nvs_set_u8(battery_nvs_, "cutoff", latched ? 1 : 0)==ESP_OK &&
+            nvs_commit(battery_nvs_)==ESP_OK;
+    }
+
+    DevboardPower::Reading readAdc() override
+    {
+        DevboardPower::Reading result;
+        // Calibration handles are shared by USB/SPP and optional HTTP STATUS.
+        // Serialize the whole sample, bounded to 50 ms when another poll owns it.
+        if (!adc_mutex_ || xSemaphoreTake(adc_mutex_, pdMS_TO_TICKS(50)) != pdTRUE) return result;
+        std::array<int,64> raw_values{}, mv_values{};
+        for (size_t i=0; i<raw_values.size(); ++i) {
+            int raw=0, mv=0;
+            if (adc_oneshot_read(adc_,channel_,&raw)!=ESP_OK ||
+                adc_cali_raw_to_voltage(calibration_,raw,&mv)!=ESP_OK) {
+                xSemaphoreGive(adc_mutex_);
+                return DevboardPower::Reading{};
+            }
+            raw_values[i]=raw; mv_values[i]=mv;
+            result.saturated=result.saturated || raw==4095;
+        }
+        std::sort(raw_values.begin(),raw_values.end());
+        std::sort(mv_values.begin(),mv_values.end());
+        int sum_raw=0, sum_mv=0;
+        // Trim the eight highest/lowest samples, average the central 48.
+        for (size_t i=8; i<56; ++i) { sum_raw+=raw_values[i]; sum_mv+=mv_values[i]; }
+        result.raw=(sum_raw+24)/48;
+        result.microvolts=(sum_mv * 1000 + 24)/48;
+        result.millivolts=(result.microvolts + 500)/1000;
+        result.calibrated=calibrated_;
+        result.noisy=mv_values[55]-mv_values[8]>100;
+        xSemaphoreGive(adc_mutex_);
+        return result;
+    }
+
+private:
+    adc_oneshot_unit_handle_t adc_ = nullptr;
+    adc_cali_handle_t calibration_ = nullptr;
+    adc_channel_t channel_ = ADC_CHANNEL_6;
+    bool calibrated_ = false;
+    SemaphoreHandle_t adc_mutex_ = nullptr;
+    nvs_handle_t battery_nvs_ = 0;
+};
+
 constexpr const char* kSpiffsRoot = "/spiffs";
 constexpr const char* kDefaultFile = "payload.bin";
 constexpr uint16_t kMaxReceivedFileCollisionIndex = 999;
@@ -110,11 +224,15 @@ constexpr uint32_t kDefaultMorseDotMs = 120;
 constexpr uint8_t kDefaultMorsePowerLevel = 3;
 constexpr TickType_t kLoopWorkerPeriod = pdMS_TO_TICKS(20);
 constexpr TickType_t kLoopStopPollPeriod = pdMS_TO_TICKS(20);
-constexpr TickType_t kLoopStopTimeout = pdMS_TO_TICKS(2000);
+// Eleven 500 ms cancellation waits plus local TX/recovery overhead fit in
+// this bounded stop window; keep it below the GUI command-response deadline.
+constexpr TickType_t kLoopStopTimeout = pdMS_TO_TICKS(8000);
 constexpr TickType_t kWifiControlPollPeriod = pdMS_TO_TICKS(100);
 // The nRF24 RX FIFO is only three packets deep, so polling much slower than
 // the packet cadence will overrun the queue during live data transfer.
-constexpr TickType_t kRxPollPeriod = pdMS_TO_TICKS(2) > 0 ? pdMS_TO_TICKS(2) : 1;
+constexpr TickType_t kRxPollPeriod = TaskTiming::nonzeroTicks(2, configTICK_RATE_HZ);
+static_assert(configTICK_RATE_HZ == 1000 && pdMS_TO_TICKS(2) == 2,
+              "RX diagnostics firmware requires CONFIG_FREERTOS_HZ=1000 for 2 ms service");
 constexpr TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(15000);
 constexpr size_t kConsoleLineBytes = HostTransferProtocol::kConsoleLineBytes;
 constexpr size_t kHostTransferChunkBytes = HostTransferProtocol::kMaxChunkBytes;
@@ -124,7 +242,9 @@ constexpr size_t kHostFilenameMaxBytes = 30;
 constexpr char kHostUploadPartialName[] = "host_upload.part";
 constexpr size_t kBluetoothCommandQueueDepth = 8;
 constexpr size_t kBluetoothTxQueueDepth = 8;
-constexpr size_t kBluetoothTxMessageBytes = 1536;
+constexpr size_t kBluetoothTxMessageBytes = 2048;
+// RF3 STATUS JSON + CRLF remains one bounded Bluetooth SIG SPP message.
+static_assert(HostStatusProtocol::kMaxResponseBytes + 2 <= kBluetoothTxMessageBytes);
 constexpr int64_t kBluetoothWriteTimeoutUs = 8000000;
 constexpr int64_t kHostSessionTimeoutUs = 60000000;
 constexpr bool kWirelessControlEnabled = WIRELESS_CONTROL_ENABLED != 0;
@@ -180,6 +300,7 @@ struct BluetoothTxMessage {
 };
 
 struct LoopConfig {
+    bool no_ack = false;
     LoopMode mode = LoopMode::None;
     bool active = false;
     bool infinite = false;
@@ -239,6 +360,7 @@ struct HostDownloadStorage {
 };
 
 struct ProtocolTransferReport {
+    bool no_ack = false;
     ReliableTransferV2::SenderState state = ReliableTransferV2::SenderState::Idle;
     ProtocolV2::ErrorCode error = ProtocolV2::ErrorCode::None;
     uint32_t transfer_id = 0;
@@ -283,6 +405,12 @@ void prepareTransferReport(ProtocolTransferReport& destination, const FileInfo& 
     next.radio = radio;
     next.radio_valid = true;
     publishTransferReport(destination, next);
+}
+
+const char* transferReportStateName(const ProtocolTransferReport& report)
+{
+    if (report.no_ack && report.state == ReliableTransferV2::SenderState::Completed) return "SentUnconfirmed";
+    return ReliableTransferV2::senderStateName(report.state);
 }
 
 const char* loopModeName(LoopMode mode)
@@ -506,14 +634,17 @@ uint64_t monotonicMilliseconds()
 
 void delayAtLeastMs(uint32_t duration_ms)
 {
-    const TickType_t ticks = pdMS_TO_TICKS(duration_ms);
-    vTaskDelay(ticks > 0 ? ticks : 1);
+    vTaskDelay(TaskTiming::nonzeroTicks(duration_ms, configTICK_RATE_HZ));
 }
 
 bool initializeNvsFlash(const char* owner)
 {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        if (HardwareProfile::kSelectedId==HardwareProfile::Id::Esp32Devboard) {
+            ESP_LOGE(TAG,"Refusing to erase persistent battery cutoff state for %s",owner);
+            return false;
+        }
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
@@ -825,11 +956,67 @@ void updateTransferReport(ProtocolTransferReport* report,
     publishTransferReport(*report, next);
 }
 
+using TxBatteryCheck = bool (*)(void*);
+
+bool sendDataFileNoAck(RadioManager& manager, const char* path,
+                       const std::atomic_bool* stop_requested,
+                       ProtocolTransferReport* report,
+                       TxBatteryCheck battery_check = nullptr, void* battery_context = nullptr)
+{
+    ProtocolTransferReport next = copyTransferReport(*report);
+    next.no_ack = true;
+    next.peer_complete = false;
+    std::FILE* file = std::fopen(path, "rb");
+    const auto finish = [&](ReliableTransferV2::SenderState state, ProtocolV2::ErrorCode error) {
+        next.state = state; next.error = error; next.radio = manager.status();
+        next.radio_valid = true; publishTransferReport(*report, next);
+        if (file) std::fclose(file);
+        return state == ReliableTransferV2::SenderState::Completed;
+    };
+    if (!file) return finish(ReliableTransferV2::SenderState::Failed, ProtocolV2::ErrorCode::SourceRead);
+    if (!manager.disableAutoAck())
+        return finish(ReliableTransferV2::SenderState::Failed, ProtocolV2::ErrorCode::TransportFailure);
+    NoAckTransfer::Sender sender(file, {&resetFileSource, &readFileSource});
+    const char* name = std::strrchr(path, '/');
+    if (!sender.begin(next.transfer_id, name ? name + 1 : path))
+        return finish(ReliableTransferV2::SenderState::Failed, sender.error());
+    next.total_bytes = sender.metadata().total_size;
+    next.total_packets = sender.metadata().total_packets;
+    next.crc32 = sender.metadata().crc32;
+    next.state = ReliableTransferV2::SenderState::SendingData;
+    publishTransferReport(*report, next);
+    while (!sender.done()) {
+        if (battery_check && !battery_check(battery_context))
+            return finish(ReliableTransferV2::SenderState::Cancelled, ProtocolV2::ErrorCode::Cancelled);
+        if (stop_requested && stop_requested->load()) {
+            ProtocolV2::Packet cancel{}; cancel.type = ProtocolV2::PacketType::Cancel;
+            cancel.transfer_id = next.transfer_id; cancel.error = ProtocolV2::ErrorCode::Cancelled;
+            ProtocolV2::Frame frame{};
+            if (NoAckTransfer::encode(cancel, frame)) (void)manager.sendPayload(frame.data(), frame.size(), false);
+            return finish(ReliableTransferV2::SenderState::Cancelled, ProtocolV2::ErrorCode::Cancelled);
+        }
+        ProtocolV2::Frame frame{}, adapted{}; ProtocolV2::Packet packet{};
+        if (!sender.frame(frame) || !NoAckTransfer::decode(frame.data(), frame.size(), packet, adapted))
+            return finish(ReliableTransferV2::SenderState::Failed, sender.error());
+        if (!manager.sendPayload(frame.data(), frame.size(), false))
+            return finish(ReliableTransferV2::SenderState::Failed, ProtocolV2::ErrorCode::TransportFailure);
+        if (!sender.noteSent()) return finish(ReliableTransferV2::SenderState::Failed, sender.error());
+        next.bytes_transferred = sender.sentBytes(); next.current_sequence = sender.sequence();
+        next.radio = manager.status(); publishTransferReport(*report, next);
+        if (packet.type == ProtocolV2::PacketType::Start) delayAtLeastMs(NoAckTransfer::kStartGuardMs);
+        else if (packet.type == ProtocolV2::PacketType::Data) delayAtLeastMs(NoAckTransfer::kDataGapMs);
+    }
+    ESP_LOGI(TAG, "NO ACK: sent locally, delivery unconfirmed id=%08lX bytes=%lu",
+             static_cast<unsigned long>(next.transfer_id), static_cast<unsigned long>(next.bytes_transferred));
+    return finish(ReliableTransferV2::SenderState::Completed, ProtocolV2::ErrorCode::None);
+}
+
 bool sendDataFile(RadioManager& manager,
                   FileTransfer::Service& transfer_service,
                   const char* path,
                   const std::atomic_bool* stop_requested = nullptr,
-                  ProtocolTransferReport* report = nullptr)
+                  ProtocolTransferReport* report = nullptr,
+                  TxBatteryCheck battery_check = nullptr, void* battery_context = nullptr)
 {
     std::FILE* file = std::fopen(path, "rb");
     if (!file) {
@@ -898,6 +1085,10 @@ bool sendDataFile(RadioManager& manager,
 
     bool cancellation_started = false;
     while (!sender.terminal()) {
+        if (battery_check && !battery_check(battery_context)) {
+            sender.cancelLocally();
+            break;
+        }
         if (stop_requested && stop_requested->load() && !cancellation_started) {
             cancellation_started = true;
             (void)transfer_service.cancelTransfer(transfer_id, monotonicMilliseconds());
@@ -924,6 +1115,7 @@ bool sendDataFile(RadioManager& manager,
                 delayAtLeastMs(rate_delay_ms);
             }
         }
+        const int64_t send_start_us = esp_timer_get_time();
         const uint64_t send_time_ms = monotonicMilliseconds();
         if (!manager.sendPayload(outbound.data(), outbound.size())) {
             (void)sender.onTransportFailure(send_time_ms);
@@ -968,6 +1160,14 @@ bool sendDataFile(RadioManager& manager,
                 }
                 const ReliableTransferV2::SenderEvent event = sender.onFrame(
                     incoming.data(), incoming_length, now_ms);
+                if (outbound_packet.type == ProtocolV2::PacketType::Data &&
+                    event == ReliableTransferV2::SenderEvent::OutboundReady) {
+                    ProtocolV2::Packet response_packet{};
+                    if (ProtocolV2::decode(incoming.data(), incoming_length, response_packet) == ProtocolV2::DecodeStatus::Ok &&
+                        response_packet.type == ProtocolV2::PacketType::Ack)
+                        RuntimeDiagnostics::global().ack_wait.record(
+                            static_cast<uint64_t>(esp_timer_get_time() - send_start_us));
+                }
                 leave_wait = event == ReliableTransferV2::SenderEvent::OutboundReady ||
                              event == ReliableTransferV2::SenderEvent::Completed ||
                              event == ReliableTransferV2::SenderEvent::Cancelled ||
@@ -1020,8 +1220,9 @@ bool sendDataFile(RadioManager& manager,
 
 class DemoConsoleApp {
 public:
-    explicit DemoConsoleApp(RadioManager& manager)
-        : manager_(manager),
+    explicit DemoConsoleApp(RadioManager& manager, DevboardPower::Controller& power,
+                            Esp32Nrf24Hal& hal)
+        : manager_(manager), power_(power), hal_(hal),
           transfer_service_(&DemoConsoleApp::queuedTransferIdEntry, this),
           receiver_(this, incomingStorageCallbacks())
     {
@@ -1095,7 +1296,8 @@ public:
 
         // Channel 76 is used as the demo default, but the console can
         // reinitialize on another channel later.
-        const bool boot_ok = manager_.boot(76);
+        const bool boot_ok = power_.nrfRail() && manager_.boot(76);
+        if (!power_.nrfRail()) (void)manager_.powerDown();
         const RadioStatus status = manager_.status();
         giveRadio();
 
@@ -1130,6 +1332,14 @@ public:
 
         if (xTaskCreate(&DemoConsoleApp::loopTaskEntry, "radio_loop", 4096, this, 4, &loop_task_) != pdPASS) {
             ESP_LOGE(TAG, "Failed to start loop task");
+            return false;
+        }
+
+        if (power_.supported() && xTaskCreate(&DemoConsoleApp::batteryTaskEntry,
+                "battery",4096,this,2,nullptr)!=pdPASS) {
+            ESP_LOGE(TAG,"Failed to start autonomous battery protection task");
+            (void)hal_.setSignalOutputsEnabled(false);
+            (void)power_.applyCutoff(monotonicMilliseconds());
             return false;
         }
 
@@ -1279,6 +1489,15 @@ private:
         // plain C-style entry point, so this static trampoline forwards to the
         // class instance.
         static_cast<DemoConsoleApp*>(ctx)->rxTask();
+    }
+
+    static void batteryTaskEntry(void* ctx)
+    {
+        auto* app=static_cast<DemoConsoleApp*>(ctx);
+        while (true) {
+            app->serviceBatteryOnce();
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
     }
 
     static void loopTaskEntry(void* ctx)
@@ -1642,11 +1861,12 @@ private:
         const bool host_echo_command = !response_words.empty() &&
             uppercaseCopy(response_words.front()) == "ECHO";
         const bool host_hello_command = response_words.size() == 1 &&
-            uppercaseCopy(response_words.front()) == "HELLO";
+            (uppercaseCopy(response_words.front()) == "HELLO" ||
+             uppercaseCopy(response_words.front()) == "DIAG");
         const bool host_storage_command = !response_words.empty() &&
             (uppercaseCopy(response_words.front()) == "STORAGE" ||
              uppercaseCopy(response_words.front()) == "SELECTHEX" ||
-             uppercaseCopy(response_words.front()) == "TXHEX");
+             (uppercaseCopy(response_words.front()) == "TXHEX" || uppercaseCopy(response_words.front()) == "TXNOACKHEX"));
         if (host_file_command || host_echo_command || host_hello_command || host_storage_command) {
             // These handlers emit their own structured response. HELLO must
             // not acquire a radio snapshot through the generic STATUS reply.
@@ -1664,7 +1884,7 @@ private:
             sendBluetoothText(buildStatusJson() + "\r\n", epoch);
     }
 
-    bool sendBluetoothText(const std::string& text, uint32_t expected_epoch = 0)
+    bool sendBluetoothText(std::string_view text, uint32_t expected_epoch = 0)
     {
         if (!bluetooth_client_connected_.load()) {
             return false;
@@ -1710,7 +1930,7 @@ private:
                 const int64_t deadline = esp_timer_get_time() + kBluetoothWriteTimeoutUs;
                 while (bluetooth_tx_flow_.congested() && esp_timer_get_time() < deadline &&
                        bluetooth_tx_flow_.matches(message.handle, message.epoch)) {
-                    vTaskDelay(pdMS_TO_TICKS(2));
+                    delayAtLeastMs(2);
                 }
                 if (!bluetooth_tx_flow_.begin(message.handle, message.epoch)) {
                     failBluetoothLink(message.handle, message.epoch);
@@ -1726,7 +1946,7 @@ private:
                 }
                 while (bluetooth_tx_flow_.pending() && esp_timer_get_time() < deadline &&
                        bluetooth_tx_flow_.matches(message.handle, message.epoch)) {
-                    vTaskDelay(pdMS_TO_TICKS(2));
+                    delayAtLeastMs(2);
                 }
                 if (bluetooth_tx_flow_.pending() || bluetooth_tx_flow_.failed()) {
                     ESP_LOGW(TAG, "Bluetooth write acknowledgement failed/timed out");
@@ -2188,6 +2408,7 @@ private:
             "\nCommands:\n"
             "  HELP                 Show this command list\n"
             "  HELLO                Identify the host link without accessing the radio\n"
+            "  DIAG                 Read build identity and lifetime timing/counters (host only)\n"
             "  STORAGE LIST <offset>  List visible SPIFFS files (host JSON pages)\n"
             "  STORAGE DELETE <hex>   Delete one idle visible file (host only)\n"
             "  STATUS               Show radio state and selected file\n"
@@ -2196,10 +2417,14 @@ private:
             "  SELECT <file>        Choose which staged file TX will send\n"
             "  SELECTHEX <UTF8hex>  Select exact SPIFFS filename (host only)\n"
             "  TXHEX <UTF8hex>      Transmit exact SPIFFS filename (host only)\n"
+            "  TXNOACKHEX <hex>     One-way file TX, delivery unconfirmed\n"
+            "  RXNOACK              Silent one-way file receiver\n"
             "  TX [file]            Start sending the selected or named file\n"
             "  UPLOAD ...           Stage a host file using BEGIN/DATA/END/CANCEL\n"
             "  DOWNLOAD ...         Export a SPIFFS file using BEGIN/DATA/END/CANCEL\n"
             "  TESTMODE ON|OFF      Devboard-only, no-nRF24-TX test mode\n"
+            "  NRFRAIL ON|OFF       Devboard GPIO21 rail request (also in TESTMODE)\n"
+            "  BATTERY RESET        Clear latched cutoff after fresh quiet reading >=21V\n"
             "  TESTTX <bytes>       Simulate TX acknowledgment (no nRF24 TX)\n"
             "  TX LOOP [n|INF] [f]  Repeatedly send the selected or named file\n"
             "  TEXT <message>       Send live text to a listening peer\n"
@@ -2302,6 +2527,12 @@ private:
         return static_cast<DemoConsoleApp*>(context)->removeIncomingPartial();
     }
 
+    static bool resumeIncomingStorageEntry(void* context, uint32_t id,
+                                           uint32_t bytes, uint32_t crc)
+    {
+        return static_cast<DemoConsoleApp*>(context)->resumeIncomingStorage(id, bytes, crc);
+    }
+
     static ReliableTransferV2::SinkCallbacks incomingStorageCallbacks()
     {
         return {
@@ -2310,6 +2541,7 @@ private:
             &DemoConsoleApp::closeIncomingStorageEntry,
             &DemoConsoleApp::publishIncomingStorageEntry,
             &DemoConsoleApp::removeIncomingPartialEntry,
+            &DemoConsoleApp::resumeIncomingStorageEntry,
         };
     }
 
@@ -2392,7 +2624,11 @@ private:
         if (!incoming_file_.file || !data || length == 0) {
             return 0;
         }
-        return std::fwrite(data, 1, length, incoming_file_.file);
+        const int64_t start_us = esp_timer_get_time();
+        const size_t written = std::fwrite(data, 1, length, incoming_file_.file);
+        RuntimeDiagnostics::global().storage_write.record(
+            static_cast<uint64_t>(esp_timer_get_time() - start_us));
+        return written;
     }
 
     bool closeIncomingStorage()
@@ -2413,6 +2649,42 @@ private:
             ok = false;
         }
         return ok;
+    }
+
+    bool resumeIncomingStorage(uint32_t id, uint32_t bytes, uint32_t expected_crc)
+    {
+        if (incoming_file_.file) return false;
+        const bool published = incoming_file_.partial_name.empty();
+        const std::string name = published ? incoming_file_.final_name : incoming_file_.partial_name;
+        if (name.empty()) return false;
+        const std::string path = buildFilePath(name);
+        std::FILE* file = std::fopen(path.c_str(), published ? "rb" : "rb+");
+        if (!file) return false;
+        ProtocolV2::Crc32 crc;
+        std::array<uint8_t, 256> buffer{};
+        uint32_t count = 0;
+        bool valid = true;
+        while (count < bytes) {
+            const size_t wanted = std::min<size_t>(buffer.size(), bytes - count);
+            const size_t read = std::fread(buffer.data(), 1, wanted, file);
+            if (read != wanted) { valid = false; break; }
+            crc.update(buffer.data(), read);
+            count += static_cast<uint32_t>(read);
+        }
+        // Check EOF as well as the prefix; never append after unknown bytes.
+        if (std::fgetc(file) != EOF || std::ferror(file) || crc.value() != expected_crc)
+            valid = false;
+        if (published) {
+            const bool closed = std::fclose(file) == 0;
+            return valid && closed;
+        }
+        if (!valid || std::fseek(file, static_cast<long>(bytes), SEEK_SET) != 0) {
+            std::fclose(file);
+            return false;
+        }
+        incoming_file_.file = file;
+        incoming_file_.transfer_id = id;
+        return true;
     }
 
     bool publishIncomingStorage()
@@ -2639,7 +2911,7 @@ private:
 
     void tryResumeWirelessRx(const char* reason)
     {
-        if (test_mode_ || !kWirelessControlEnabled || !kWirelessControlAutoRx || isLoopActive()) {
+        if (!power_.nrfRail() || test_mode_ || !kWirelessControlEnabled || !kWirelessControlAutoRx || isLoopActive()) {
             return;
         }
 
@@ -2683,7 +2955,7 @@ private:
             return;
         }
 
-        manager_.refreshSnapshot();
+        if (power_.nrfRail()) manager_.refreshSnapshot();
         const bool rx_pending =
             manager_.status().state == RadioState::RxListening ? manager_.hasPendingRx() : false;
         const RadioStatus status = manager_.status();
@@ -2748,7 +3020,7 @@ private:
         std::printf(" protocol=%u tx_id=%08lX tx_state=%s tx_bytes=%lu/%lu tx_seq=%lu/%lu tx_retries=%lu tx_error=%s tx_crc32=%08lX peer_complete=%s rx_id=%08lX rx_state=%s rx_bytes=%lu/%lu rx_seq=%lu/%lu rx_error=%s rx_crc32=%08lX",
                     static_cast<unsigned>(ProtocolV2::kVersion),
                     static_cast<unsigned long>(tx_report.transfer_id),
-                    ReliableTransferV2::senderStateName(tx_report.state),
+                    transferReportStateName(tx_report),
                     static_cast<unsigned long>(tx_report.bytes_transferred),
                     static_cast<unsigned long>(tx_report.total_bytes),
                     static_cast<unsigned long>(tx_report.current_sequence),
@@ -2830,6 +3102,20 @@ private:
         } else {
             std::printf(" loop=None");
         }
+        if (power_.supported()) {
+            const auto reading = power_.sample();
+            std::printf(" board_power=enabled sense_raw=%d sense_mv=%d sense_calibrated=%s "
+                "sense_saturated=%s power_good=%s nrf_rail=%s", reading.raw, reading.millivolts,
+                reading.calibrated ? "true" : "false", reading.saturated ? "true" : "false",
+                power_.powerGood() ? "true" : "false", power_.nrfRail() ? "true" : "false");
+            const auto battery=power_.battery(monotonicMilliseconds());
+            std::printf(" sense_noisy=%s battery_profile=soikon_6s_3300 battery_mv=%d "
+                "battery_estimated_mv=%d battery_percent=%d battery_remaining_mah=%d "
+                "battery_age_ms=%d battery_state=%s battery_cutoff=%s battery_persisted=%s",
+                reading.noisy ? "true" : "false", battery.pack_mv, battery.estimated_mv,
+                battery.percent, battery.remaining_mah, battery.age_ms, battery.state,
+                battery.cutoff ? "true" : "false",battery.persisted ? "true" : "false");
+        }
         std::printf("\n");
     }
 
@@ -2884,7 +3170,7 @@ private:
         ProtocolTransferReport tx_report{};
         const bool acquired = takeRadio(pdMS_TO_TICKS(50));
         if (acquired) {
-            manager_.refreshSnapshot();
+            if (power_.nrfRail()) manager_.refreshSnapshot();
             out.rx_pending = manager_.status().state == RadioState::RxListening
                 ? manager_.hasPendingRx() : false;
             const RadioStatus status = manager_.status();
@@ -2908,6 +3194,7 @@ private:
             out.rx.id = receiver_.transferId();
             out.rx.bytes = receiver_.acceptedBytes();
             out.rx.total = receiver_.totalSize();
+            out.rx_no_ack = rx_no_ack_mode_;
             out.rx.sequence = receiver_.expectedSequence();
             out.rx.packets = receiver_.totalPackets();
             out.rx.crc32 = receiver_.calculatedCrc32();
@@ -2939,7 +3226,7 @@ private:
                 out.state_name = "Unavailable";
             }
         }
-        out.tx.state_name = ReliableTransferV2::senderStateName(tx_report.state);
+        out.tx.state_name = transferReportStateName(tx_report);
         out.tx.error_name = ProtocolV2::errorName(tx_report.error);
         out.tx.id = tx_report.transfer_id;
         out.tx.file_name = tx_report.file_name;
@@ -2950,6 +3237,7 @@ private:
         out.tx.retries = tx_report.retry_count;
         out.tx.crc32 = tx_report.crc32;
         out.tx.peer_complete = tx_report.peer_complete;
+        out.tx.no_ack = tx_report.no_ack;
         size_t selected_bytes = 0;
         out.selected_bytes = statFileSize(buildFilePath(out.selected_name), selected_bytes)
             ? static_cast<uint32_t>(selected_bytes) : 0;
@@ -2962,6 +3250,11 @@ private:
     {
         HttpStatusSnapshot snapshot{};
         if (!captureHttpStatus(snapshot)) snapshot.state_name = "Unavailable";
+        snapshot.board_power = power_.supported();
+        snapshot.sense = power_.sample();
+        snapshot.power_good = power_.powerGood();
+        snapshot.nrf_rail = power_.nrfRail();
+        snapshot.battery = power_.battery(monotonicMilliseconds());
         return HostStatusProtocol::json(snapshot);
     }
 
@@ -3567,7 +3860,8 @@ private:
     bool commandStoredName(const std::vector<std::string>& words, CommandOrigin origin)
     {
         const std::string command = uppercaseCopy(words.front());
-        const bool transmit = command == "TXHEX";
+        const bool transmit = (command == "TXHEX" || command == "TXNOACKHEX");
+        const bool no_ack = command == "TXNOACKHEX";
         const std::string echoed = command + (words.size() >= 2 ? " " + words[1] : "");
         const auto finish = [&](bool accepted, const char* reason = nullptr) {
             std::string response = (accepted ? "OK " : "ERR ") + echoed;
@@ -3589,7 +3883,7 @@ private:
             HostStorageProtocol::StoredGuards guards;
             guards.host_transfer_active = host_upload_.active || host_download_.active;
             guards.loop_active = loop_config_.active;
-            manager_.refreshSnapshot();
+            if (power_.nrfRail()) manager_.refreshSnapshot();
             const RadioStatus radio = manager_.status();
             guards.radio_active = radio.state == RadioState::TxBusy || radio.state == RadioState::CwTest;
             guards.receive_active = receiver_.active() || incoming_file_.file != nullptr || active_api_receive_id_ != 0;
@@ -3617,9 +3911,12 @@ private:
                 loop_config_.active = true;
                 loop_owns_radio_.store(true);
                 loop_config_.remaining_iterations = 1;
+                loop_config_.no_ack = no_ack;
                 loop_config_.file_name = name;
                 prepareTransferReport(last_tx_report_, FileInfo{name, static_cast<size_t>(info.st_size)},
                                       manager_.status(), nextTransferId());
+                ProtocolTransferReport queued = copyTransferReport(last_tx_report_);
+                queued.no_ack = no_ack; publishTransferReport(last_tx_report_, queued);
             }
             setSelectedFile(name);
             return nullptr;
@@ -3708,7 +4005,7 @@ private:
                     std::printf("Radio is busy; TX was not queued.\n");
                     return false;
                 }
-                manager_.refreshSnapshot();
+                if (power_.nrfRail()) manager_.refreshSnapshot();
                 setSelectedFile(file.name);
                 loop_stop_requested_.store(false);
                 loop_config_ = LoopConfig{};
@@ -3764,7 +4061,7 @@ private:
             std::printf("Radio is busy; TX was not queued.\n");
             return false;
         }
-        manager_.refreshSnapshot();
+        if (power_.nrfRail()) manager_.refreshSnapshot();
         setSelectedFile(file.name);
         loop_stop_requested_.store(false);
         loop_config_ = LoopConfig{};
@@ -4118,7 +4415,7 @@ private:
         }
 
         const RadioStatus before = manager_.status();
-        if (hasActiveIncomingReceiveLocked())
+        if (hasActiveIncomingReceiveLocked() || receiver_.resumable())
             discardIncomingFileTransfer("Operator STOP cancelled active RX");
         const bool receive_cleanup_ok = !receiver_.cleanupFailed();
         const bool ok = ensureStandbyLocked() && receive_cleanup_ok;
@@ -4153,6 +4450,7 @@ private:
 
     bool commandRx()
     {
+        const bool no_ack = rx_no_ack_requested_;
         // RX is a persistent listening mode. Repeating it must not leave RX,
         // close the current partial sink, clear counters, or reset its session.
         if (!takeRadio(pdMS_TO_TICKS(100))) {
@@ -4165,7 +4463,7 @@ private:
             std::printf("ERR RX host_or_loop_active_use_STOP\n");
             return false;
         }
-        if (before.state == RadioState::RxListening) {
+        if (before.state == RadioState::RxListening && no_ack == rx_no_ack_mode_) {
             giveRadio();
             std::printf("RX listening on channel %u\n", static_cast<unsigned>(before.channel));
             return true;
@@ -4175,9 +4473,16 @@ private:
             std::printf("ERR RX receive_active_use_STOP\n");
             return false;
         }
+        if (!power_.allowRf(monotonicMilliseconds())) {
+            giveRadio();
+            std::printf("ERR RX battery_requires_fresh_quiet_measurement_or_cutoff_reset\n");
+            return false;
+        }
         // No peer can start a receive while this hardware lock is held. Stop
         // is deliberately a separate action for queued RF loops/host sessions.
-        const bool ok = startRxLocked();
+        if (before.state == RadioState::RxListening && !manager_.leaveRx()) { giveRadio(); return false; }
+        bool ok = !no_ack || manager_.disableAutoAck();
+        if (ok) { rx_no_ack_mode_ = no_ack; ok = startRxLocked(); }
         const RadioStatus status = manager_.status();
         giveRadio();
         if (!ok) {
@@ -4566,7 +4871,7 @@ private:
             return;
         }
 
-        manager_.refreshSnapshot();
+        if (power_.nrfRail()) manager_.refreshSnapshot();
         const RadioStatus status = manager_.status();
         giveRadio();
 
@@ -4596,21 +4901,23 @@ private:
             (void)statFileSize(buildFilePath(loop.file_name), bytes);
             prepareTransferReport(last_tx_report_, FileInfo{loop.file_name, bytes}, manager_.status(), nextTransferId());
         }
-        bool ok = ensureStandbyLocked();
+        const bool cutoff = power_.battery(monotonicMilliseconds()).cutoff;
+        bool ok = !cutoff && power_.nrfRail() && ensureStandbyLocked();
         RadioStatus status = manager_.status();
         if (ok) {
             const std::string path = buildFilePath(loop.file_name);
-            ok = sendDataFile(
-                manager_,
-                transfer_service_,
-                path.c_str(),
-                &loop_stop_requested_,
-                &last_tx_report_);
+            const auto check = power_.supported() ? &DemoConsoleApp::txBatteryCheckEntry : nullptr;
+            ok = loop.no_ack
+                ? sendDataFileNoAck(manager_, path.c_str(), &loop_stop_requested_, &last_tx_report_, check, this)
+                : sendDataFile(manager_, transfer_service_, path.c_str(), &loop_stop_requested_,
+                               &last_tx_report_, check, this);
             status = manager_.status();
         } else {
             ProtocolTransferReport failed = copyTransferReport(last_tx_report_);
-            failed.state = ReliableTransferV2::SenderState::Failed;
-            failed.error = ProtocolV2::ErrorCode::TransportFailure;
+            failed.state = cutoff ? ReliableTransferV2::SenderState::Cancelled :
+                ReliableTransferV2::SenderState::Failed;
+            failed.error = cutoff ? ProtocolV2::ErrorCode::Cancelled :
+                ProtocolV2::ErrorCode::TransportFailure;
             failed.radio = status;
             failed.radio_valid = true;
             publishTransferReport(last_tx_report_, failed);
@@ -4651,7 +4958,8 @@ private:
                      status.last_fault);
         }
 
-        if (restore_rx) {
+        if (restore_rx && power_.nrfRail() &&
+            !power_.battery(monotonicMilliseconds()).cutoff) {
             tryResumeWirelessRx("Remote control RX resumed after TX");
         }
     }
@@ -4821,6 +5129,7 @@ private:
 
     bool sendProtocolResponseLocked(const ProtocolV2::Frame& response)
     {
+        if (rx_no_ack_mode_) return true;  // All RF response types, including timeout/error, remain silent.
         if (manager_.status().state != RadioState::RxListening ||
             !manager_.leaveRx()) {
             return false;
@@ -4832,6 +5141,11 @@ private:
 
     void processRxPayload(const uint8_t* payload, size_t len)
     {
+        ProtocolV2::Frame adapted{}; ProtocolV2::Packet one_way{};
+        if (rx_no_ack_mode_) {
+            if (!NoAckTransfer::decode(payload, len, one_way, adapted)) { ++raw_rx_packet_count_; return; }
+            payload = adapted.data(); len = adapted.size();
+        }
         const uint64_t now_ms = monotonicMilliseconds();
         ProtocolV2::Packet incoming{};
         const ProtocolV2::DecodeStatus decoded_status =
@@ -4839,11 +5153,13 @@ private:
         const uint32_t expected_before = receiver_.expectedSequence();
         const bool was_complete = receiver_.complete();
         ProtocolV2::Frame response{};
+        receiver_.setResumeEnabled(!rx_no_ack_mode_);
         const ReliableTransferV2::ReceiverEvent event = receiver_.onFrame(
             payload, len, now_ms, response);
 
         if (decoded_status == ProtocolV2::DecodeStatus::Ok &&
             incoming.type == ProtocolV2::PacketType::Start &&
+            receiver_.active() &&
             receiver_.transferId() == incoming.transfer_id &&
             active_api_receive_id_ != incoming.transfer_id) {
             active_api_receive_id_ = incoming.transfer_id;
@@ -4853,6 +5169,9 @@ private:
                 receiver_.totalPackets(),
                 receiver_.expectedCrc32(),
                 now_ms);
+            transfer_service_.reportReceiveProgress(
+                receiver_.transferId(), receiver_.acceptedBytes(),
+                receiver_.expectedSequence(), now_ms);
         }
 
         if (event == ReliableTransferV2::ReceiverEvent::Ignored) {
@@ -4898,7 +5217,7 @@ private:
         if (event == ReliableTransferV2::ReceiverEvent::Duplicate) {
             ++raw_rx_packet_count_;
             ESP_LOGW(TAG,
-                     "Protocol v2 duplicate DATA re-ACKed id=%08lX seq=%u expected=%lu",
+                     "Protocol v2 duplicate DATA received id=%08lX seq=%u expected=%lu",
                      static_cast<unsigned long>(receiver_.transferId()),
                      static_cast<unsigned>(incoming.sequence),
                      static_cast<unsigned long>(expected_before));
@@ -4961,6 +5280,104 @@ private:
         active_api_receive_id_ = 0;
     }
 
+    static bool txBatteryCheckEntry(void* context)
+    {
+        auto* app = static_cast<DemoConsoleApp*>(context);
+        return app->serviceBatteryLocked(monotonicMilliseconds(), true);
+    }
+
+    void announceBatteryCutoff()
+    {
+        constexpr std::string_view event =
+            "BATTERY SHUTOFF turn_physical_power_boot_switch_OFF_connect_charged_replacement_source\r\n";
+        // STATUS uses several writes. Start a line even if a concurrent
+        // console response has written a fragment without its terminator.
+        std::printf("\n%.*s\n", static_cast<int>(event.size() - 2), event.data());
+        std::fflush(stdout);
+        // Queue the warning before power removal. Actual delivery depends on
+        // the link and the ESP32 remaining powered long enough.
+        (void)sendBluetoothText(event);
+    }
+
+    void applyBatteryCutoffLocked(uint64_t now)
+    {
+        if (power_.requestCutoff()) {
+            announceBatteryCutoff();
+            loop_stop_requested_.store(true);
+            discardIncomingFileTransfer("Battery cutoff discarded incomplete RX");
+        }
+        if (power_.nrfRail()) (void)manager_.powerDown();
+        (void)hal_.setSignalOutputsEnabled(false);
+        const bool outputs_low = power_.applyCutoff(now);
+        if (!outputs_low) ESP_LOGW(TAG, "Battery cutoff could not request both enables LOW");
+    }
+
+    // Caller owns radio_mutex_ from classifying the RF state through sampling
+    // and, for a scheduled check, through any standby and resume transitions.
+    bool serviceBatteryLocked(uint64_t now, bool file_tx)
+    {
+        const auto battery = power_.battery(now);
+        if (battery.cutoff && (power_.powerGood() || power_.nrfRail() || !battery.persisted)) {
+            applyBatteryCutoffLocked(now);
+            return false;
+        }
+        if (file_tx && battery.cutoff) return false;
+
+        const RadioState state = manager_.status().state;
+        const bool quiet_radio = !hal_.ceAsserted() &&
+            (state == RadioState::Standby || state == RadioState::Sleep ||
+             state == RadioState::PowerDown || state == RadioState::Fault);
+        const bool listening = state == RadioState::RxListening &&
+            !receiveWorkerPaused() && !loop_owns_radio_.load();
+        if (((file_tx && state == RadioState::Standby && quiet_radio) || listening) &&
+            power_.activeCheckDue(now)) {
+            (void)power_.poll(now, false);
+            if (listening && !manager_.leaveRx()) {
+                power_.endActiveCheck(now);
+                return true;
+            }
+
+            constexpr uint32_t pause_ms = 7500;
+            const uint32_t serial = power_.readingSerial();
+            const uint64_t deadline = now + pause_ms;
+            // Finish the check after one fresh average, a stop, or the
+            // deadline. Leave time for RF to progress between low checks.
+            for (uint64_t sample_ms = now; sample_ms < deadline;
+                 sample_ms = monotonicMilliseconds()) {
+                if (file_tx && loop_stop_requested_.load()) break;
+                if (power_.poll(sample_ms, !hal_.ceAsserted(), hal_.lastRadioActivityMs(), true)) {
+                    power_.endActiveCheck(sample_ms);
+                    applyBatteryCutoffLocked(sample_ms);
+                    return false;
+                }
+                if (power_.readingSerial() != serial) break;
+                delayAtLeastMs(static_cast<uint32_t>(std::min<uint64_t>(25, deadline - sample_ms)));
+            }
+            power_.endActiveCheck(monotonicMilliseconds());
+            // Reenter RX without resetting the receiver or its partial file.
+            if (listening) (void)manager_.enterRx();
+            return true;
+        }
+
+        if (!file_tx) {
+            const bool quiet = quiet_radio && !loop_owns_radio_.load() &&
+                !hasActiveIncomingReceiveLocked();
+            const unsigned context = (static_cast<unsigned>(state) << 1) | power_.nrfRail();
+            if (power_.poll(now, quiet, hal_.lastRadioActivityMs(), false, context)) {
+                applyBatteryCutoffLocked(now);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void serviceBatteryOnce()
+    {
+        if (!power_.supported() || !takeRadio(pdMS_TO_TICKS(10))) return;
+        (void)serviceBatteryLocked(monotonicMilliseconds(), false);
+        giveRadio();
+    }
+
     void rxTask()
     {
         // This background task is intentionally conservative:
@@ -4969,6 +5386,7 @@ private:
         // - it drains any queued packets before releasing the radio again
         // - it saves accepted payload streams into SPIFFS as completed files
         std::array<uint8_t, AudioPacket::kPacketBytes> payload{};
+        int64_t previous_poll_us = 0;
 
         while (true) {
             std::string remote_command;
@@ -4976,12 +5394,17 @@ private:
 
             if (takeRadio(pdMS_TO_TICKS(10))) {
                 if (receiveWorkerPaused()) {
+                    previous_poll_us = 0;
                     giveRadio();
                     vTaskDelay(kRxPollPeriod);
                     continue;
                 }
                 if (manager_.status().state == RadioState::RxListening) {
-                    manager_.refreshSnapshot();
+                    const int64_t poll_us = esp_timer_get_time();
+                    if (previous_poll_us != 0)
+                        RuntimeDiagnostics::global().rx_poll.record(static_cast<uint64_t>(poll_us - previous_poll_us));
+                    previous_poll_us = poll_us;
+                    if (power_.nrfRail()) manager_.refreshSnapshot();
                     const RadioStatus snapshot = manager_.status();
 
                     if (snapshot.carrier_detected && !last_carrier_detected_) {
@@ -4996,6 +5419,10 @@ private:
                         [&]() {
                             size_t out_len = 0;
                             if (manager_.receivePayload(payload.data(), payload.size(), out_len)) {
+                                if (rx_no_ack_mode_) {
+                                    processRxPayload(payload.data(), out_len);
+                                    return RxDrain::StepResult::Processed;
+                                }
                                 std::string_view completed_text;
                                 const StreamSync::TextMessageAssembler::Action text_action =
                                     text_message_assembler_.accept(
@@ -5039,6 +5466,7 @@ private:
                                  static_cast<unsigned>(drain_result.processed));
                     }
                 } else {
+                    previous_poll_us = 0;
                     last_carrier_detected_ = false;
                 }
 
@@ -5102,7 +5530,7 @@ private:
             emitHostTransferResponse(origin, command + " ERROR " + reason);
         } else if (command == "STORAGE") {
             emitHostTransferResponse(origin, HostStorageProtocol::error(reason));
-        } else if (command == "SELECTHEX" || command == "TXHEX") {
+        } else if (command == "SELECTHEX" || (command == "TXHEX" || command == "TXNOACKHEX")) {
             emitHostTransferResponse(origin, "ERR " + command +
                 (words.size() > 1 ? " " + words[1] : "") + " " + reason);
         } else {
@@ -5111,6 +5539,54 @@ private:
             std::printf("ERR %s %s\n", command.c_str(), reason);
         }
         return false;
+    }
+
+    bool commandNrfRail(const std::vector<std::string>& words, CommandOrigin origin)
+    {
+        // Local USB / Bluetooth SPP board control only; never an over-air REMOTE
+        // operation. GPIO21 is a logic request to an external rail switch.
+        if (!power_.supported() ||
+            (origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth) ||
+            words.size() != 2 || (uppercaseCopy(words[1]) != "ON" && uppercaseCopy(words[1]) != "OFF")) {
+            std::printf("NRFRAIL ERROR use_ON_or_OFF_on_devboard_USB_or_Bluetooth\n");
+            return false;
+        }
+        if (host_upload_.active || host_download_.active || isLoopActive() || !takeRadio()) {
+            std::printf("NRFRAIL ERROR busy\n");
+            return false;
+        }
+        const auto status = manager_.status();
+        if (hasActiveIncomingReceiveLocked() || status.state == RadioState::RxListening || status.state == RadioState::TxBusy ||
+            status.state == RadioState::CwTest) {
+            giveRadio();
+            std::printf("NRFRAIL ERROR stop_radio_activity_first\n");
+            return false;
+        }
+        const bool enabled = uppercaseCopy(words[1]) == "ON";
+        bool ok = true;
+        if (enabled != power_.nrfRail()) {
+            if (enabled) {
+                ok = power_.setNrfRail(true);
+                if (ok) {
+                    delayAtLeastMs(10); // External rail settling + nRF startup guard.
+                    ok = hal_.setSignalOutputsEnabled(true);
+                    if (ok) (void)manager_.boot(status.channel);
+                    if (!ok) {
+                        (void)hal_.setSignalOutputsEnabled(false);
+                        (void)power_.setNrfRail(false);
+                    }
+                    // A missing radio is reported separately; rail HIGH is not proof of power-good.
+                }
+            } else {
+                ok = manager_.powerDown();
+                if (ok) ok = hal_.setSignalOutputsEnabled(false);
+                if (ok) ok = power_.setNrfRail(false);
+                if (!ok) (void)hal_.setSignalOutputsEnabled(true);
+            }
+        }
+        giveRadio();
+        std::printf("NRFRAIL %s %s\n", ok ? "OK" : "ERROR", enabled ? "ON" : "OFF");
+        return ok;
     }
 
     bool handleCommand(const std::string& line, CommandOrigin origin)
@@ -5133,6 +5609,34 @@ private:
         if (HostRxCommandGuard::needsReservation(command, action)) {
             if (!beginReceiveMutation(words, origin)) return false;
             reservation.acquired(receive_mutation_reserved_);
+        }
+        if (command == "NRFRAIL") return commandNrfRail(words, origin);
+        if (command == "BATTERY") {
+            if (!power_.supported() || (origin!=CommandOrigin::Local && origin!=CommandOrigin::Bluetooth) ||
+                words.size()!=2 || action!="RESET" || !takeRadio(pdMS_TO_TICKS(50))) {
+                std::printf("BATTERY ERROR reset_requires_local_devboard_and_idle_radio\n"); return false;
+            }
+            const bool ok=power_.resetCutoff(monotonicMilliseconds());
+            giveRadio();
+            std::printf("BATTERY %s RESET%s\n",ok ? "OK" : "ERROR",
+                ok ? " nRF_rail_remains_OFF" : " requires_fresh_quiet_pack_at_least_21V");
+            return ok;
+        }
+        const bool rf_command = command == "TX" || command == "TXNOACK" || command == "TXHEX" ||
+            command == "TXNOACKHEX" || command == "RX" || command == "RXNOACK" || command == "MORSE" ||
+            command == "REMOTE" || command == "TEXT" || command == "CW" || command == "CHANNEL" ||
+            command == "POWER" || command == "POWERDOWN" || command == "STANDBY" ||
+            command == "SLEEP" || command == "WAKE";
+        const bool rf_start=command=="TX" || command=="TXNOACK" || command=="TXHEX" ||
+            command=="TXNOACKHEX" || command=="TEXT" ||
+            command=="REMOTE" || command=="MORSE" || (command=="CW" && action!="STOP");
+        if (rf_start && !power_.allowRf(monotonicMilliseconds())) {
+            std::printf("ERR %s battery_requires_fresh_quiet_measurement_or_cutoff_reset\n",command.c_str());
+            return false;
+        }
+        if (!power_.nrfRail() && rf_command) {
+            std::printf("ERR %s nrf_rail_off_use_NRFRAIL_ON\n", command.c_str());
+            return false;
         }
         if (command == "ECHO") {
             const size_t separator = line.find_first_of(" \t");
@@ -5220,7 +5724,7 @@ private:
         if (command == "STORAGE") {
             return commandStorage(words, origin);
         }
-        if (command == "SELECTHEX" || command == "TXHEX") {
+        if (command == "SELECTHEX" || (command == "TXHEX" || command == "TXNOACKHEX")) {
             return commandStoredName(words, origin);
         }
         if (test_mode_) {
@@ -5266,8 +5770,12 @@ private:
         if (command == "REMOTE") {
             return commandRemote(line);
         }
-        if (command == "RX") {
-            return commandRx();
+        if (command == "RX" || command == "RXNOACK") {
+            rx_no_ack_requested_ = command == "RXNOACK";
+            const bool accepted = commandRx();
+            if (command == "RXNOACK" && origin == CommandOrigin::Local)
+                std::printf("%s RXNOACK\n", accepted ? "OK" : "ERR");
+            return accepted;
         }
         if (command == "STANDBY") {
             return commandStandby();
@@ -5301,18 +5809,24 @@ private:
         // command/radio mutexes. Identity is immutable build information.
         const auto identity_words = splitWords(line);
         if ((origin == CommandOrigin::Local || origin == CommandOrigin::Bluetooth) &&
-            identity_words.size() == 1 && uppercaseCopy(identity_words.front()) == "HELLO") {
-            const std::string response = HostConnectionProtocol::hello(
-                WifiControlConfig::kNodeName, HardwareProfile::kSelectedName,
-                ProtocolV2::kVersion);
+            identity_words.size() == 1 && (uppercaseCopy(identity_words.front()) == "HELLO" ||
+                                         uppercaseCopy(identity_words.front()) == "DIAG")) {
+            const bool diagnostics = uppercaseCopy(identity_words.front()) == "DIAG";
+            const std::string response = diagnostics
+                ? RuntimeDiagnostics::json(RuntimeDiagnostics::global(), HardwareProfile::kSelectedName,
+                                           configTICK_RATE_HZ)
+                : HostConnectionProtocol::hello(WifiControlConfig::kNodeName, HardwareProfile::kSelectedName,
+                                               ProtocolV2::kVersion, true, RuntimeDiagnostics::kBuild);
 #if RF3_BLUETOOTH_CONTROL_ENABLED
             if (origin == CommandOrigin::Bluetooth) {
                 if (!bluetooth_client_connected_.load() || epoch != bluetooth_epoch_.load()) {
                     return false;
                 }
+                if (diagnostics && !sendBluetoothText("OK DIAG\r\n", epoch)) return false;
                 return sendBluetoothText(response + "\r\n", epoch);
             }
 #endif
+            if (diagnostics) std::printf("OK DIAG\n");
             std::printf("%s\n", response.c_str());
             std::fflush(stdout);
             return true;
@@ -5320,7 +5834,7 @@ private:
         if (!takeCommand(pdMS_TO_TICKS(500))) {
             if ((origin == CommandOrigin::Local || origin == CommandOrigin::Bluetooth) &&
                 !identity_words.empty() &&
-                (uppercaseCopy(identity_words.front()) == "SELECTHEX" || uppercaseCopy(identity_words.front()) == "TXHEX")) {
+                (uppercaseCopy(identity_words.front()) == "SELECTHEX" || (uppercaseCopy(identity_words.front()) == "TXHEX" || uppercaseCopy(identity_words.front()) == "TXNOACKHEX"))) {
                 const std::string response = "ERR " + uppercaseCopy(identity_words.front()) +
                     (identity_words.size() > 1 ? " " + identity_words[1] : "") + " command_busy_retry";
 #if RF3_BLUETOOTH_CONTROL_ENABLED
@@ -5380,6 +5894,8 @@ private:
     }
 
     RadioManager& manager_;
+    DevboardPower::Controller& power_;
+    Esp32Nrf24Hal& hal_;
     FileTransfer::Service transfer_service_;  // Subsystem-facing Protocol v2 transfer API.
     SemaphoreHandle_t status_mutex_ = nullptr;  // Only serializes status/cache string ownership.
     HttpStatusSnapshot cached_host_status_{};
@@ -5395,6 +5911,8 @@ private:
     bool last_carrier_detected_ = false;      // Edge detector for RPD logging while in RX.
     uint32_t carrier_event_count_ = 0;        // Number of distinct RPD-high events seen while listening.
     IncomingFileStorage incoming_file_{};     // SPIFFS adapter state for the current RX partial file.
+    bool rx_no_ack_requested_ = false;
+    bool rx_no_ack_mode_ = false;
     ReliableTransferV2::ReceiverSession receiver_;  // Verified Protocol v2 RX session.
     uint32_t active_api_receive_id_ = 0;       // Receiver transfer mirrored into the subsystem API.
     ProtocolTransferReport last_tx_report_{}; // Last reliable sender state for STATUS.
@@ -5444,6 +5962,14 @@ extern "C" void app_main(void);
 
 void app_main(void)
 {
+    DevboardPowerIo power_io;
+    DevboardPower::Controller power(power_io,
+        HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard);
+    if (!power.initialize()) {
+        ESP_LOGE(TAG, "Could not initialize devboard power outputs; stopping startup.");
+        return;
+    }
+    if (power.supported()) delayAtLeastMs(10);
     // app_main is the firmware entry point the Espressif IoT Development
     // Framework (ESP-IDF) calls after the operating system (OS) and
     // drivers are ready. Everything else is built from the default pin config
@@ -5460,9 +5986,10 @@ void app_main(void)
              static_cast<int>(config.irq_pin));
 
     Esp32Nrf24Hal hal(config);
+    if (!power.nrfRail()) (void)hal.setSignalOutputsEnabled(false);
     Nrf24 radio(hal);
     RadioManager manager(radio);
-    DemoConsoleApp app(manager);
+    DemoConsoleApp app(manager, power, hal);
 
     if (!app.initialize()) {
         // Keep the firmware alive after initialization failure so the serial

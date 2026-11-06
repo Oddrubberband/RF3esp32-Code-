@@ -37,9 +37,13 @@ def harness(root: Path) -> str:
 #include <vector>
 #include <sys/stat.h>
 #include "radio_manager.hpp"
+#include "runtime_diagnostics.hpp"
+#include "task_timing.hpp"
+constexpr unsigned configTICK_RATE_HZ=1000;
 #include "file_transfer_service.hpp"
 #include "transfer_rate_limiter.hpp"
 #include "reliable_transfer_v2.hpp"
+#include "no_ack_transfer.hpp"
 #include "host_storage_protocol.hpp"
 #include "host_status_protocol.hpp"
 #include "host_transfer_protocol.hpp"
@@ -66,6 +70,7 @@ enum class CommandOrigin { Local, Bluetooth, Remote, Http };
 enum class LoopMode { None, Tx, Cw, Morse };
 struct FileInfo {std::string name; size_t bytes=0;};
 struct LoopConfig {
+    bool no_ack=false;
     LoopMode mode=LoopMode::None;
     bool active=false, infinite=false, restore_rx_after_completion=false;
     uint32_t remaining_iterations=0, completed_iterations=0;
@@ -81,10 +86,15 @@ class FakeRadioManager {
 public:
     RadioStatus value{};
     unsigned refresh_count=0, send_attempts=0;
-    bool sendPayload(const uint8_t*,size_t){++send_attempts;value.state=RadioState::Fault;value.last_fault=3;return false;}
+    bool send_success=false, ack_disable_success=true;
+    unsigned ack_disable_calls=0;
+    std::vector<ProtocolV2::Frame> sent_frames;
+    bool disableAutoAck(){++ack_disable_calls;return ack_disable_success;}
+    bool sendPayload(const uint8_t* bytes,size_t length,bool=true){++send_attempts;if(send_success){assert(length==32);ProtocolV2::Frame f{};std::copy(bytes,bytes+length,f.begin());sent_frames.push_back(f);value.state=RadioState::Standby;return true;}value.state=RadioState::Fault;value.last_fault=3;return false;}
     bool enterRx(){return true;}
     bool receivePayload(uint8_t*,size_t,size_t&){return false;}
     bool leaveRx(){return true;}
+    bool powerDown(){value.state=RadioState::PowerDown;return true;}
     RadioStatus status() const{return value;}
     void refreshSnapshot(){++refresh_count;}
     bool hasPendingRx(){return false;}
@@ -112,8 +122,11 @@ constexpr uint32_t kTransferRateLimitBytesPerSecond=0;
 template<class... T> void testLog(T&&...){}
 #define ESP_LOGE(...) testLog(__VA_ARGS__)
 #define ESP_LOGI(...) testLog(__VA_ARGS__)
-uint64_t monotonicMilliseconds(){static uint64_t clock=0;return ++clock;}
-void delayAtLeastMs(unsigned){}
+int64_t fake_time_us=0;
+int64_t esp_timer_get_time(){return ++fake_time_us;}
+uint64_t runtime_test_clock_ms=0;
+uint64_t monotonicMilliseconds(){return runtime_test_clock_ms;}
+void delayAtLeastMs(unsigned delay){runtime_test_clock_ms += delay;}
 using HttpStatusSnapshot=HostStatusProtocol::Snapshot;
 struct FakeReceiver {
     bool active_value=false;
@@ -135,9 +148,25 @@ struct FakeReceiver {
     report = report.replace("RadioManager", "FakeRadioManager")
     member_fragments = (capture + command + human).replace("RadioManager", "FakeRadioManager")
     adapter = r"""
+struct FakePowerIo : DevboardPower::Io {
+    std::vector<std::pair<int,bool>> outputs;
+    bool output(int gpio, bool high) override { outputs.emplace_back(gpio,high); return true; }
+    bool beginAdc(int) override { return true; }
+    unsigned reads=0;
+    DevboardPower::Reading reading{2048,2400,true,false};
+    DevboardPower::Reading readAdc() override {++reads;return reading;}
+};
 class DemoConsoleApp {
 public:
     FakeRadioManager manager_;
+    struct FakeHal {bool enabled=true,ce=false;uint64_t activity=0;bool setSignalOutputsEnabled(bool value){enabled=value;return true;}bool ceAsserted()const{return ce;}uint64_t lastRadioActivityMs()const{return activity;}} hal_;
+    FakePowerIo power_io_;
+    DevboardPower::Controller power_{power_io_, HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard};
+    DemoConsoleApp() {
+        assert(power_.initialize());
+        for (uint64_t t = 10000; t <= 14000; t += 250) assert(!power_.poll(t, true));
+        runtime_test_clock_ms = 14000;
+    }
     ProtocolTransferReport last_tx_report_{};
     SemaphoreHandle_t status_mutex_=1;
     HttpStatusSnapshot cached_host_status_{};
@@ -155,6 +184,7 @@ public:
     struct HostSession {bool active=false;} host_upload_, host_download_;
     struct Incoming {std::FILE* file=nullptr;} incoming_file_;
     FakeReceiver receiver_;
+    bool rx_no_ack_mode_=false, rx_no_ack_requested_=false;
     LoopConfig loop_config_;
     std::vector<std::string> replies;
     bool takeRadio(TickType_t){++radio_take_count;if(!radio_available)return false;assert(!radio_held);radio_held=true;return true;}

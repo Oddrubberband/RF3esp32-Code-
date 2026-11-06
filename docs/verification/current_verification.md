@@ -1,3 +1,26 @@
+# Current verification — RF3-BAT-R1-20261105
+
+Local software checks on5November2026:204native,263GUI,26Python tooling tests
+and1platform symlink skip;114resume cases;12NoACK file boundaries; production
+host/RX/cutoff/file-type and diagnostics harnesses. Both ESP profiles built and
+image integrity, partitions, application identity and compiler pin maps were
+checked.18packaged GUI modules matched source;5s hardware-free mock startup and
+battery/warning/RX layout inspection passed. Independent software review found
+no blocking defect; calibration was checked at89,314inputs using the suppliedCSV.
+
+The GitHub publication corrects the on-demand diagnostics version label to agree
+with the application descriptor and adds the missing production checks to CI.
+It carries the same radio/battery behavior as the locally reviewed implementation.
+GitHub independently rebuilds the exact commit for release. No personal logs,
+local-machine paths, generated caches or user files are committed.
+
+No hardware ports were opened or firmware flashed. Loaded analog/ADC accuracy,
+actual switch/rail behavior, warning delivery during power loss and RF performance
+remain unmeasured. The generic6S state-of-charge curve is not measured Soikon data.
+Calibration source and math are in [the calibration guide](../calibration/README.md).
+
+## Historical R2 verification
+
 # Current implementation verification
 
 Implementation: R2, developed 2026-10-22–23. Promotion date: 2026-10-24.

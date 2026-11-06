@@ -7,6 +7,9 @@
 #include "file_transfer_service.hpp"
 #include "hardware_profile.hpp"
 #include "transfer_rate_limiter.hpp"
+#include "runtime_diagnostics.hpp"
+#include "task_timing.hpp"
+#include "host_connection_protocol.hpp"
 
 namespace {
 
@@ -145,6 +148,70 @@ void test_hardware_profiles_preserve_distinct_supported_pinouts(void)
     TEST_ASSERT_EQUAL_INT(pcb.miso, dev.miso);
 }
 
+void test_diagnostic_totals_saturate_and_json_stays_bounded()
+{
+    RuntimeDiagnostics::Counters d;
+    d.tx_ds.add(UINT32_MAX);
+    d.tx_ds.add(9);
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, d.tx_ds.value());
+    d.rx_poll.record(50);
+    d.rx_poll.record(100);
+    TEST_ASSERT_EQUAL_UINT32(2, d.rx_poll.count.value());
+    TEST_ASSERT_EQUAL_UINT32(150, d.rx_poll.sum_us.value());
+    TEST_ASSERT_EQUAL_UINT32(100, d.rx_poll.max_us.value());
+    d.storage_write.record(UINT64_MAX);
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, d.storage_write.max_us.value());
+    const auto json = RuntimeDiagnostics::json(d, "esp32-devboard", 1000);
+    TEST_ASSERT_TRUE(json.size() < RuntimeDiagnostics::kJsonCapacity);
+    TEST_ASSERT_TRUE(json.find("\"build\":\"RX-FIX-R1-20261102\"") != std::string::npos);
+    TEST_ASSERT_TRUE(json.find("\"tx_ds\":4294967295") != std::string::npos);
+    TEST_ASSERT_TRUE(json.find("\"type\":\"diag\"") != std::string::npos);
+    const auto hello = HostConnectionProtocol::hello("rf3-pcb", "custom-pcb", 2, true, RuntimeDiagnostics::kBuild);
+    TEST_ASSERT_TRUE(hello.find("\"diagnostics\":true") != std::string::npos);
+    TEST_ASSERT_TRUE(hello.find(RuntimeDiagnostics::kBuild) != std::string::npos);
+}
+void test_sender_diagnostics_count_only_rejected_responses_and_expired_data_ack()
+{
+    const std::array<uint8_t, 40> bytes{};
+    FileTransfer::BoundedMemoryDataSource source(bytes.data(), bytes.size());
+    FileTransfer::Service service(&fixedTransferId);
+    TEST_ASSERT_TRUE(static_cast<bool>(service.startTransfer(source, {}, 0)));
+    auto& sender = service.transportSender();
+    auto& d = RuntimeDiagnostics::global();
+    const auto timeouts = d.ack_timeouts.value();
+    const auto rejected = d.rejected_responses.value();
+    ProtocolV2::Frame frame{};
+    TEST_ASSERT_TRUE(sender.outboundFrame(frame));
+    TEST_ASSERT_TRUE(sender.noteFrameSent(0));
+    ProtocolV2::Packet ready{};
+    ready.type = ProtocolV2::PacketType::Ready;
+    ready.transfer_id = sender.transferId();
+    ready.accepted = true;
+    TEST_ASSERT_TRUE(ProtocolV2::encode(ready, frame));
+    TEST_ASSERT_EQUAL(static_cast<int>(ReliableTransferV2::SenderEvent::OutboundReady),
+                      static_cast<int>(sender.onFrame(frame.data(), frame.size(), 1)));
+    TEST_ASSERT_TRUE(sender.outboundFrame(frame));
+    TEST_ASSERT_TRUE(sender.noteFrameSent(2));
+    frame[0] = 0;
+    TEST_ASSERT_EQUAL(static_cast<int>(ReliableTransferV2::SenderEvent::Ignored),
+                      static_cast<int>(sender.onFrame(frame.data(), frame.size(), 3)));
+    TEST_ASSERT_EQUAL_UINT32(rejected + 1, d.rejected_responses.value());
+    TEST_ASSERT_EQUAL(static_cast<int>(ReliableTransferV2::SenderEvent::NoChange),
+                      static_cast<int>(sender.tick(1001)));
+    TEST_ASSERT_EQUAL_UINT32(timeouts, d.ack_timeouts.value());
+    TEST_ASSERT_EQUAL(static_cast<int>(ReliableTransferV2::SenderEvent::OutboundReady),
+                      static_cast<int>(sender.tick(1002)));
+    TEST_ASSERT_EQUAL_UINT32(timeouts + 1, d.ack_timeouts.value());
+}
+
+void test_service_wait_conversions_represent_two_ms_at_configured_tick_rate()
+{
+    TEST_ASSERT_EQUAL_UINT32(2, TaskTiming::nonzeroTicks(2, 1000));
+    TEST_ASSERT_EQUAL_UINT32(1, TaskTiming::nonzeroTicks(2, 100));
+    TEST_ASSERT_EQUAL_UINT32(1, TaskTiming::nonzeroTicks(0, 1000));
+    TEST_ASSERT_EQUAL_UINT32(10, TaskTiming::nonzeroTicks(10, 1000));
+}
+
 }  // namespace
 
 void runIntegrationReadinessTests()
@@ -157,4 +224,7 @@ void runIntegrationReadinessTests()
     RUN_TEST(test_fileTransfer_receive_handler_runs_after_verified_publication);
     RUN_TEST(test_generic_transfer_default_rate_limit_is_disabled);
     RUN_TEST(test_hardware_profiles_preserve_distinct_supported_pinouts);
+    RUN_TEST(test_diagnostic_totals_saturate_and_json_stays_bounded);
+    RUN_TEST(test_service_wait_conversions_represent_two_ms_at_configured_tick_rate);
+    RUN_TEST(test_sender_diagnostics_count_only_rejected_responses_and_expired_data_ack);
 }

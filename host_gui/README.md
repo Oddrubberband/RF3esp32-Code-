@@ -28,3 +28,9 @@ Each GUI instance uses a separate diagnostic log, whose location is displayed.
 File payloads and live-message contents are omitted from saved diagnostics.
 A debug RX arrow means the PC received text, not proof of RF peer delivery.
 Both boards need current firmware for suffix metadata; see docs/protocol_v2.md.
+
+The devboard battery update reports separate sensed and corrected pack voltages,
+firmware charge estimates and GPIO15/21 output requests. Five completed quiet4s
+means below20.4V sensed latch cutoff; explicit recovery needs a fresh quiet21V
+reading. The nonmodal shutdown warning survives a disconnect. STATUS confirms
+output levels. See the root README and calibration guide for timing and limits.

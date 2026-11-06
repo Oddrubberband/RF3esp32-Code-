@@ -38,6 +38,7 @@ class MockDeviceBackend(DeviceBackend):
         )
         self._capabilities = RadioCapabilities(
             supports_stored_file_tx=True,
+            supports_no_ack_files=True,
             supports_host_storage=True,
             supports_host_file_upload=True,
             supports_host_file_download=True,
@@ -445,10 +446,10 @@ class MockDeviceBackend(DeviceBackend):
             )
             self.transfer_changed.emit(
                 TransferProgress(
-                    state=TransferState.COMPLETED,
+                    state=TransferState.SENT_UNCONFIRMED if self._no_ack_selected else TransferState.COMPLETED,
                     sent_bytes=self._transfer_total,
                     total_bytes=self._transfer_total,
-                    message="Mock transfer complete",
+                    message="Sent locally; delivery unconfirmed" if self._no_ack_selected else "Mock transfer complete",
                     source_path=self._transfer_path,
                 )
             )

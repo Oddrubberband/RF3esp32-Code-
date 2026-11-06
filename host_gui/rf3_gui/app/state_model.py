@@ -9,6 +9,8 @@ PROTOCOL_V2_MAX_FILE_SIZE = 1_310_720
 CONSOLE_COMMAND_MAX_CHARS = 159
 REMOTE_COMMAND_MAX_BYTES = 26
 TEXT_MESSAGE_MAX_BYTES = 154
+BATTERY_CUTOFF_MV = 20_400
+BATTERY_RESET_MV = 21_000
 DEFAULT_CHANNEL = 76
 MIN_CHANNEL = 0
 MAX_CHANNEL = 125
@@ -44,6 +46,7 @@ class TransferState(str, Enum):
     TRANSFERRING = "Transferring"
     VERIFYING = "Verifying"
     COMPLETED = "Completed"
+    SENT_UNCONFIRMED = "Sent (unconfirmed)"
     CANCELLING = "Cancelling"
     CANCELLED = "Cancelled"
     FAILED = "Failed"
@@ -63,6 +66,7 @@ class DeviceInfo:
 
 @dataclass(frozen=True)
 class RadioCapabilities:
+    supports_no_ack_files: bool = False
     supports_test_mode: bool = False
     supports_stored_file_tx: bool = False
     host_chunk_max: int = 64
@@ -79,6 +83,7 @@ class RadioCapabilities:
     modulation_modes: tuple[str, ...] = ("nRF24 packet mode (fixed)",)
     supports_cw_test: bool = True
     supports_battery_percent: bool = False
+    supports_board_power: bool = False
     supports_host_file_upload: bool = False
     supports_host_file_download: bool = False
     supports_host_chunk_retry: bool = False
@@ -90,6 +95,21 @@ class RadioCapabilities:
 @dataclass(frozen=True)
 class Telemetry:
     battery_percent: int | None = None
+    sense_mv: int | None = None
+    sense_raw: int | None = None
+    sense_calibrated: bool = False
+    sense_saturated: bool = False
+    sense_noisy: bool = False
+    battery_mv: int | None = None
+    battery_estimated_mv: int | None = None
+    battery_remaining_mah: int | None = None
+    battery_age_ms: int | None = None
+    battery_state: str = ""
+    battery_cutoff: bool = False
+    battery_shutdown_pending: bool = False
+    battery_persisted: bool = False
+    power_good: bool | None = None
+    nrf_rail: bool | None = None
     last_fault: int = 0
     last_tx_ok: bool = False
     tx_timeout: bool = False
@@ -103,6 +123,7 @@ class Telemetry:
 
 @dataclass(frozen=True)
 class DeviceSnapshot:
+    rx_no_ack: bool = False
     rx_transfer_state: str = ""
     rx_transfer_id: str = ""
     rx_received_bytes: int = 0
@@ -149,5 +170,5 @@ class TransferProgress:
     @property
     def ratio(self) -> float:
         if self.total_bytes <= 0:
-            return 0.0 if self.state != TransferState.COMPLETED else 1.0
+            return 0.0 if self.state not in {TransferState.COMPLETED, TransferState.SENT_UNCONFIRMED} else 1.0
         return max(0.0, min(1.0, self.sent_bytes / self.total_bytes))

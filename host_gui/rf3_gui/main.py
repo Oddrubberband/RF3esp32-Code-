@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import logging
 from argparse import ArgumentParser
 
 from PySide6.QtWidgets import QApplication
@@ -10,6 +11,7 @@ from rf3_gui.device.mock_device import MockDeviceBackend
 from rf3_gui.device.serial_device import SerialDeviceBackend
 from rf3_gui.logging_config import configure_logging
 from rf3_gui.ui.main_window import MainWindow
+from rf3_gui.build_info import BUILD_ID
 
 
 def _parse_args(argv: list[str]) -> tuple[str, str | None, list[str]]:
@@ -31,6 +33,7 @@ def _parse_args(argv: list[str]) -> tuple[str, str | None, list[str]]:
 def main() -> int:
     backend_name, port, qt_argv = _parse_args(sys.argv)
     log_path = configure_logging()
+    logging.getLogger(__name__).info("GUI build=%s executable=%s source=%s", BUILD_ID, sys.executable, __file__)
     app = QApplication(qt_argv)
     app.setApplicationName("RF3 Desktop")
 

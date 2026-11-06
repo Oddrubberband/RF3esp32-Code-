@@ -23,6 +23,7 @@ idf_component_register(
         esp_timer
         esp_rom
     PRIV_REQUIRES
+        esp_adc
         # Serial Peripheral Interface Flash File System (SPIFFS) is only used
         # internally by main.cpp, so it remains private.
         spiffs

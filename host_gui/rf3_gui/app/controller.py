@@ -29,6 +29,7 @@ class AppController(QObject):
     command_finished = Signal(str, bool, str)
     text_message_received = Signal(str, str)
     storage_changed = Signal(object)
+    diagnostics_received = Signal(object)
 
     def __init__(self, backend: DeviceBackend) -> None:
         super().__init__()
@@ -46,6 +47,7 @@ class AppController(QObject):
         backend.log_event.connect(self.log_event)
         backend.text_message_received.connect(self.text_message_received)
         backend.storage_changed.connect(self._on_storage_changed)
+        backend.diagnostics_received.connect(self.diagnostics_received)
 
     @property
     def storage(self) -> StorageListing:
@@ -130,6 +132,9 @@ class AppController(QObject):
     def refresh_status(self) -> None:
         self._backend.request_status()
 
+    def request_diagnostics(self) -> None:
+        self._backend.request_diagnostics()
+
     def set_test_mode(self, enabled: bool) -> None:
         self._backend.set_test_mode(enabled)
 
@@ -157,6 +162,12 @@ class AppController(QObject):
     def set_channel(self, channel: int) -> None:
         self._backend.set_channel(channel)
 
+    def reset_battery_cutoff(self) -> None:
+        self._backend.reset_battery_cutoff()
+
+    def set_nrf_rail(self, enabled: bool) -> None:
+        self._backend.set_nrf_rail(enabled)
+
     def set_power(self, level: int) -> None:
         self._backend.set_power(level)
 
@@ -177,6 +188,9 @@ class AppController(QObject):
 
     def stop(self) -> None:
         self._backend.stop()
+
+    def set_no_ack_mode(self, enabled: bool) -> bool:
+        return self._backend.set_no_ack_mode(enabled)
 
     def start_tx(self) -> None:
         if self._selected_file is None:
@@ -265,7 +279,7 @@ class AppController(QObject):
 
     def _on_transfer_changed(self, progress: TransferProgress) -> None:
         self.transfer_changed.emit(progress)
-        if progress.state in {TransferState.COMPLETED, TransferState.CANCELLED, TransferState.FAILED}:
+        if progress.state in {TransferState.COMPLETED, TransferState.SENT_UNCONFIRMED, TransferState.CANCELLED, TransferState.FAILED}:
             self.log_event.emit("info", progress.message)
 
     def _on_command_finished(self, command: str, accepted: bool, message: str) -> None:

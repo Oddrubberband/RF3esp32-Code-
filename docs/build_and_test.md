@@ -1,46 +1,55 @@
-# Build and verify the current implementation
+# Build and verify RF3
 
-Run commands from the repository root. Firmware uses ESP-IDF through PlatformIO; the desktop GUI requires Windows for its Bluetooth SPP backend. Python 3.11 is used by release CI.
+Run from the source repository root. Firmware uses ESP-IDF through PlatformIO.
+GUI dependencies include PySide6, pyserial and PyInstaller. Native tests require
+g++ in PATH. CI uses Python3.11 and the pinned requirements files.
 
 ```powershell
 py -3.11 -m venv .venv-host
-.\.venv-host\Scripts\python.exe -m pip install -r host_gui\requirements.txt -r requirements.txt
-$env:PYTHONPATH = "$PWD\host_gui"
+.\.venv-host\Scripts\python.exe -m pip install -r requirements.txt -r host_gui/requirements.txt
+$env:PYTHONPATH = "$PWD/host_gui"
 $env:QT_QPA_PLATFORM = 'offscreen'
+New-Item -ItemType Directory -Force '.test-output' | Out-Null
+$env:TEMP = "$PWD/.test-output"
+$env:TMP = $env:TEMP
 .\.venv-host\Scripts\python.exe -m unittest discover -s host_gui/tests -v
 .\.venv-host\Scripts\python.exe -m unittest discover -s test -p 'test_*.py' -v
 .\.venv-host\Scripts\python.exe -m platformio test -e native
+.\.venv-host\Scripts\python.exe tools/tests/test_host_runtime_contract.py --compiler g++ --output .test-output/runtime
+.\.venv-host\Scripts\python.exe tools/tests/test_rx_command_guard.py --compiler g++ --output .test-output/rx
+.\.venv-host\Scripts\python.exe tools/tests/test_file_type_metadata.py --compiler g++ --output .test-output/extensions
+.\.venv-host\Scripts\python.exe tools/tests/test_no_ack_runtime.py --compiler g++ --output .test-output/noack
+.\.venv-host\Scripts\python.exe tools/tests/test_resume_runtime.py --compiler g++ --output .test-output/resume
+.\.venv-host\Scripts\python.exe tools/tests/test_diagnostics_runtime.py --compiler g++ --output .test-output/diagnostics
 .\.venv-host\Scripts\python.exe -m platformio run -e rf3_custom_pcb -e rf3_esp32_devboard
 .\.venv-host\Scripts\python.exe -m PyInstaller --noconfirm RF3Desktop.spec
 ```
 
-Native tests require a C++ compiler available as `g++`. The production-method harnesses below compile the selected production methods with controlled platform adapters. They supplement the native suite; they are not RF hardware tests.
+On Linux, use the corresponding virtual-environment Python executable and shell
+syntax. CI also runs each tools/tests/host_*.cpp helper with strict compiler
+warnings. The production-method harnesses use controlled clocks/platform adapters;
+they are not RF or battery hardware tests. Inspect each command's exit status.
+
+Clear QT_QPA_PLATFORM before interactive use. Launch_GUI.cmd in a built source
+checkout starts dist/RF3Desktop/RF3Desktop.exe; a release ZIP has its own launcher.
+
+## Portable releases
+
+After checks/builds succeed, package from this exact Git checkout:
 
 ```powershell
-python tools/tests/test_host_runtime_contract.py --output .test-output/runtime
-python tools/tests/test_rx_command_guard.py --output .test-output/rx
-python tools/tests/test_file_type_metadata.py --output .test-output/extensions
-python tools/check_repository_hygiene.py
+.\.venv-host\Scripts\python.exe tools/package_current_release.py --kind all
 ```
 
-Use `--help` on a harness to select its compiler or retain evidence. The old flag-zero codec used for compatibility checks is bundled under `test/fixtures/legacy_v2`; no previous private checkout is needed.
+Use a new empty --output-dir if an earlier package exists. A source export needs
+--commit with its exact source commit; do not use a different commit for modified
+code. The packager generates matching Firmware_Images.json inside the firmware
+ZIP from actual build bytes. The repository's placeholder image manifest does
+not authorize flashing locally rebuilt images without packaging/verification.
 
-## Portable packages
+GitHub builds the firmware on Linux and the GUI on Windows. The existing trusted
+main release workflow publishes only after both jobs pass and release is explicitly
+selected. Publication checks both bundles' commit/tag identity and every hash.
 
-After building, use the packaging tool. In a Git checkout it records the exact HEAD; an extracted source tree requires `--commit` with its exact source commit. Do not label locally modified code with an unrelated commit.
-
-```powershell
-python tools/package_current_release.py --help
-```
-
-GitHub validation builds both firmware profiles on Linux and tests/packages the GUI on Windows. A release runs only after successful validation on an explicitly marked main push or manual dispatch. The release contains a portable Windows GUI, both sets of firmware images, exact-source manifests and SHA-256 checksums. Generated packages are not committed to source control.
-
-## Manual programming
-
-The Windows manual helper expects the VS Code PlatformIO extension and its default user-profile Python/esptool installation. Install that extension before using the helper; the virtual environment above is for builds and tests. Clear `$env:QT_QPA_PLATFORM` after offscreen tests before launching the GUI interactively.
-
-Use the complete firmware release package and its `Flash_Manual.ps1`; its image hash manifest must match the three selected images. Select the correct board and its USB programming port, not its Bluetooth port. BOOT and EN remain manual before and after flashing. See the root README for the sequence. A normal application update does not erase or upload SPIFFS.
-
-For rollback, extract a previous complete release to a separate directory. Launch its GUI directly or pass that directory explicitly with `-Version Previous -PreviousRoot`. Preserve local files separately: changing firmware does not undo SPIFFS mutations.
-
-The current verification record is [current_verification.md](verification/current_verification.md), with each change and its evidence in [CHANGELOG.md](../CHANGELOG.md).
+Manual flashing remains separate: use the complete firmware ZIP's helper, USB
+port selection and BOOT/EN prompts. No test/build command above opens hardware.

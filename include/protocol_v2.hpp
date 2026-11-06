@@ -22,10 +22,15 @@ constexpr uint32_t kMaxPacketCount = 65536u;
 constexpr uint32_t kMaxFileSize = kMaxPacketCount * kDataPayloadCapacity;
 
 constexpr uint32_t kControlResponseTimeoutMs = 500;
-constexpr uint32_t kDataAckTimeoutMs = 250;
-constexpr uint8_t kMaximumRetries = 5;
-constexpr uint32_t kReceiverInactivityTimeoutMs = 10000;
-constexpr uint32_t kSenderInactivityTimeoutMs = 10000;
+constexpr uint32_t kDataAckTimeoutMs = 1000;
+constexpr uint8_t kMaximumRetries = 10;
+constexpr uint32_t kReceiverInactivityTimeoutMs = 20000;
+constexpr uint32_t kSenderInactivityTimeoutMs = 20000;
+
+static_assert((kMaximumRetries + 1u) * kDataAckTimeoutMs < kSenderInactivityTimeoutMs,
+              "Sender inactivity must allow the full default DATA retry budget");
+static_assert((kMaximumRetries + 1u) * kDataAckTimeoutMs < kReceiverInactivityTimeoutMs,
+              "Receiver inactivity must allow the full default DATA retry budget");
 
 static_assert(kFrameSize == 32, "Protocol v2 must use fixed 32-byte frames");
 static_assert(kDataPayloadCapacity == 20, "Protocol v2 DATA capacity changed");

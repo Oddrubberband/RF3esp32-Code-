@@ -18,8 +18,11 @@
 #include "tx_helpers.hpp"
 #include "validation.hpp"
 #include "stream_sync.hpp"
+#include "runtime_diagnostics.hpp"
 
 void runReceiverSafetyTests();
+void runDevboardPowerTests();
+void runBatteryMonitorTests();
 void runProtocolV2Tests();
 void runIntegrationReadinessTests();
 
@@ -1451,6 +1454,66 @@ void test_transmitOnce_timeout_without_irq_returns_false_and_sets_timeout(void)
     TEST_ASSERT_TRUE(hal.tx_fifo.empty());
 }
 
+void test_radioManager_rx_counter_survives_ack_turnaround_until_boot()
+{
+    FakeHal hal;
+    Nrf24 radio(hal);
+    RadioManager manager(radio);
+    TEST_ASSERT_TRUE(manager.boot(76));
+    TEST_ASSERT_TRUE(manager.enterRx());
+    std::array<uint8_t, 32> payload{};
+    size_t length = 0;
+    for (uint32_t count = 1; count <= 3; ++count) {
+        hal.queueRxPayload({1, 2, 3});
+        TEST_ASSERT_TRUE(manager.receivePayload(payload.data(), payload.size(), length));
+        TEST_ASSERT_EQUAL_UINT32(count, manager.status().rx_packets);
+        TEST_ASSERT_TRUE(manager.leaveRx());
+        TEST_ASSERT_TRUE(manager.sendPayload(payload.data(), payload.size()));
+        TEST_ASSERT_TRUE(manager.enterRx());
+        TEST_ASSERT_EQUAL_UINT32(count, manager.status().rx_packets);
+    }
+    TEST_ASSERT_TRUE(manager.boot(76));
+    TEST_ASSERT_EQUAL_UINT32(0, manager.status().rx_packets);
+}
+
+class FifoOnlyHal : public FakeHal {
+public:
+    void ce(bool level) override {
+        FakeHal::ce(level);
+        regs[0x07] &= static_cast<uint8_t>(~(1 << 5));
+    }
+};
+void test_driver_diagnostics_distinguish_completion_and_timeout_paths()
+{
+    auto& d = RuntimeDiagnostics::global();
+    const auto ds = d.tx_ds.value();
+    const auto fifo = d.tx_fifo_only.value();
+    const auto recovery = d.tx_recoveries.value();
+    const auto timeout = d.tx_attempt_timeouts.value();
+    const auto max_rt = d.tx_max_rt.value();
+    const std::array<uint8_t, 32> payload{};
+    FakeHal normal;
+    Nrf24 radio(normal);
+    TEST_ASSERT_TRUE(radio.transmitOnce(payload.data(), payload.size()));
+    TEST_ASSERT_EQUAL_UINT32(ds + 1, d.tx_ds.value());
+    TEST_ASSERT_EQUAL_UINT32(fifo, d.tx_fifo_only.value());
+    FifoOnlyHal fallback;
+    Nrf24 fallback_radio(fallback);
+    TEST_ASSERT_TRUE(fallback_radio.transmitOnce(payload.data(), payload.size()));
+    TEST_ASSERT_EQUAL_UINT32(fifo + 1, d.tx_fifo_only.value());
+    TimeoutHal stalled;
+    stalled.irq_connected = false;
+    Nrf24 stalled_radio(stalled);
+    TEST_ASSERT_FALSE(stalled_radio.transmitOnce(payload.data(), payload.size(), 1000));
+    TEST_ASSERT_EQUAL_UINT32(recovery + 1, d.tx_recoveries.value());
+    TEST_ASSERT_EQUAL_UINT32(timeout + 2, d.tx_attempt_timeouts.value());
+    FakeHal rejected;
+    rejected.next_tx_success = false;
+    Nrf24 failed_radio(rejected);
+    TEST_ASSERT_FALSE(failed_radio.transmitOnce(payload.data(), payload.size(), 1000, false));
+    TEST_ASSERT_EQUAL_UINT32(max_rt + 1, d.tx_max_rt.value());
+}
+
 void test_radioManager_boot_probe_failure_sets_fault_code_1(void)
 {
     ProbeFailHal hal;
@@ -1861,6 +1924,8 @@ int main(void)
     runReceiverSafetyTests();
     runProtocolV2Tests();
     runIntegrationReadinessTests();
+    RUN_TEST(test_radioManager_rx_counter_survives_ack_turnaround_until_boot);
+    RUN_TEST(test_driver_diagnostics_distinguish_completion_and_timeout_paths);
     RUN_TEST(test_readReg_reads_value_and_formats_spi_command);
     RUN_TEST(test_readRfPowerLevel_decodes_rf_setup_bits);
     RUN_TEST(test_setRfPowerLevel_updates_packet_setup_and_register);
@@ -1940,5 +2005,7 @@ int main(void)
     RUN_TEST(test_streamSync_gate_ignores_duplicate_seq0_after_stream_starts);
     RUN_TEST(test_streamSync_gate_new_start_resets_current_stream);
     RUN_TEST(test_streamSync_gate_stop_returns_to_waiting_for_start);
+    runDevboardPowerTests();
+    runBatteryMonitorTests();
     return UNITY_END();
 }

@@ -202,7 +202,7 @@ def select_stored_command(name: str) -> str:
     return "SELECTHEX " + name.encode("utf-8").hex().upper()
 
 
-def stored_tx_command(name: str) -> str:
+def stored_tx_command(name: str, *, no_ack: bool = False) -> str:
     if not valid_storage_name(name):
         raise ValueError("Invalid SPIFFS file name")
-    return "TXHEX " + name.encode("utf-8").hex().upper()
+    return ("TXNOACKHEX " if no_ack else "TXHEX ") + name.encode("utf-8").hex().upper()

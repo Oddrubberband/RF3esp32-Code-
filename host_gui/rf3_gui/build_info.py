@@ -1,0 +1,2 @@
+BUILD_ID = "RF3-BAT-R1-20261105"
+DISPLAY_NAME = "RF3 Desktop — Battery Update"

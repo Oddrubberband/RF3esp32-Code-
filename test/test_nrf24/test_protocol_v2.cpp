@@ -909,6 +909,96 @@ void test_protocol_v2_sender_retry_timeout_and_exhaustion_are_bounded()
     TEST_ASSERT_EQUAL_UINT32(2, sender.totalRetries());
 }
 
+void test_protocol_v2_default_data_ack_wait_and_retry_limit()
+{
+    FakeSource source;
+    source.bytes = {1};
+    SenderSession sender(&source, sourceCallbacks());
+    TEST_ASSERT_TRUE(sender.begin(94, inspect(source), 0));
+    TEST_ASSERT_TRUE(sender.noteFrameSent(0));
+
+    Packet ready{};
+    ready.type = PacketType::Ready;
+    ready.transfer_id = 94;
+    ready.accepted = true;
+    ready.error = ErrorCode::None;
+    const Frame response = encoded(ready);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(SenderEvent::OutboundReady),
+                          static_cast<int>(sender.onFrame(
+                              response.data(), response.size(), 10)));
+
+    // The default must wait a full second for each DATA attempt. Retries must
+    // remain bounded and finish before either peer's twenty-second inactivity limit.
+    for (uint32_t attempt = 0; attempt <= ProtocolV2::kMaximumRetries; ++attempt) {
+        const uint64_t sent_at = 100 + attempt * 1000;
+        Frame data{};
+        TEST_ASSERT_TRUE(sender.outboundFrame(data));
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(PacketType::Data),
+                              static_cast<int>(decoded(data).type));
+        TEST_ASSERT_EQUAL_UINT16(0, decoded(data).sequence);
+        TEST_ASSERT_TRUE(sender.noteFrameSent(sent_at));
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(SenderEvent::NoChange),
+                              static_cast<int>(sender.tick(sent_at + 250)));
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(SenderEvent::NoChange),
+                              static_cast<int>(sender.tick(sent_at + 999)));
+        TEST_ASSERT_EQUAL_INT(
+            static_cast<int>(attempt < ProtocolV2::kMaximumRetries
+                                 ? SenderEvent::OutboundReady : SenderEvent::Failed),
+            static_cast<int>(sender.tick(sent_at + 1000)));
+    }
+    TEST_ASSERT_EQUAL_UINT32(10, sender.totalRetries());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ErrorCode::RetryExhausted),
+                          static_cast<int>(sender.error()));
+}
+
+void test_protocol_v2_ack_after_old_deadline_advances_without_retry()
+{
+    FakeSource source;
+    source.bytes = {1, 2, 3};
+    FakeSink sink;
+    Harness harness(source, sink);
+    FaultRule delay{};
+    delay.destination = Destination::Sender;
+    delay.kind = FaultKind::Delay;
+    delay.type = PacketType::Ack;
+    delay.any_sequence = false;
+    delay.sequence = 0;
+    delay.delay_ms = 700;
+    TEST_ASSERT_TRUE(harness.transport.addRule(delay));
+    TEST_ASSERT_TRUE(harness.begin());
+    assertSuccessfulTransfer(harness);
+    TEST_ASSERT_EQUAL_UINT32(0, harness.sender.totalRetries());
+    // A valid ACK advances immediately instead of imposing a one-second pause.
+    TEST_ASSERT_TRUE(harness.now_ms >= 700);
+    TEST_ASSERT_TRUE(harness.now_ms < 1000);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(source.bytes.data(), sink.bytes.data(), source.bytes.size());
+}
+
+void test_protocol_v2_default_cancel_retry_budget_is_bounded()
+{
+    FakeSource source;
+    source.bytes = {1};
+    SenderSession sender(&source, sourceCallbacks());
+    TEST_ASSERT_TRUE(sender.begin(95, inspect(source), 0));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(SenderEvent::OutboundReady),
+                          static_cast<int>(sender.cancel(1)));
+    for (uint32_t attempt = 0; attempt <= 10; ++attempt) {
+        Frame frame{};
+        TEST_ASSERT_TRUE(sender.outboundFrame(frame));
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(PacketType::Cancel),
+                              static_cast<int>(decoded(frame).type));
+        const uint64_t sent_at = 1 + attempt * 500;
+        TEST_ASSERT_TRUE(sender.noteFrameSent(sent_at));
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(SenderEvent::NoChange),
+                              static_cast<int>(sender.tick(sent_at + 499)));
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(attempt < 10 ? SenderEvent::OutboundReady
+                                                           : SenderEvent::Cancelled),
+                              static_cast<int>(sender.tick(sent_at + 500)));
+    }
+    TEST_ASSERT_EQUAL_UINT32(10, sender.totalRetries());
+    TEST_ASSERT_FALSE(sender.peerComplete());
+}
+
 void test_protocol_v2_sender_overall_timeout_during_start()
 {
     FakeSource source;
@@ -1107,6 +1197,24 @@ void test_protocol_v2_lost_start_ready_data_ack_end_and_complete_recover()
     }
 }
 
+void test_protocol_v2_recovers_after_six_lost_acks_without_duplicate_writes()
+{
+    FakeSource source;
+    source.generated = true;
+    source.generated_size = 43;
+    FakeSink sink;
+    Harness harness(source, sink);
+    TEST_ASSERT_TRUE(harness.transport.addRule(dropRule(
+        Destination::Sender, PacketType::Ack, 0, false, 6)));
+    TEST_ASSERT_TRUE(harness.begin());
+    assertSuccessfulTransfer(harness);
+    TEST_ASSERT_EQUAL_UINT32(6, harness.sender.totalRetries());
+    TEST_ASSERT_EQUAL_UINT32(43, sink.received_size);
+    TEST_ASSERT_EQUAL_UINT32(3, sink.write_count);
+    TEST_ASSERT_EQUAL_UINT32(1, sink.publish_count);
+    TEST_ASSERT_TRUE(harness.sender.peerComplete());
+}
+
 void test_protocol_v2_duplicate_start_data_ack_and_end_are_idempotent()
 {
     struct Scenario { Destination destination; PacketType type; uint32_t sequence; bool any; };
@@ -1300,6 +1408,9 @@ void runProtocolV2Tests()
     RUN_TEST(test_protocol_v2_sender_rejects_invalid_start_and_ready_rejection);
     RUN_TEST(test_protocol_v2_sender_ignores_wrong_transfer_and_requires_complete);
     RUN_TEST(test_protocol_v2_sender_retry_timeout_and_exhaustion_are_bounded);
+    RUN_TEST(test_protocol_v2_default_data_ack_wait_and_retry_limit);
+    RUN_TEST(test_protocol_v2_ack_after_old_deadline_advances_without_retry);
+    RUN_TEST(test_protocol_v2_default_cancel_retry_budget_is_bounded);
     RUN_TEST(test_protocol_v2_sender_overall_timeout_during_start);
     RUN_TEST(test_protocol_v2_sender_overall_timeout_during_data);
     RUN_TEST(test_protocol_v2_sender_overall_timeout_waiting_for_complete);
@@ -1307,6 +1418,7 @@ void runProtocolV2Tests()
     RUN_TEST(test_protocol_v2_end_to_end_zero_one_exact_full_and_binary_files);
     RUN_TEST(test_protocol_v2_end_to_end_all_byte_values_and_seeded_random_data);
     RUN_TEST(test_protocol_v2_lost_start_ready_data_ack_end_and_complete_recover);
+    RUN_TEST(test_protocol_v2_recovers_after_six_lost_acks_without_duplicate_writes);
     RUN_TEST(test_protocol_v2_duplicate_start_data_ack_and_end_are_idempotent);
     RUN_TEST(test_protocol_v2_corrupted_data_is_detected_by_end_to_end_crc);
     RUN_TEST(test_protocol_v2_retry_exhaustion_fails_without_publication);

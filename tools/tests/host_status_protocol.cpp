@@ -53,6 +53,12 @@ int main(int argc, char**)
     if (argc > 1) std::cout << json_line << '\n';
     // Maximum legal filename escaping, all counters at UINT32_MAX, and the
     // longest actual state/error names. This must fit one SPP message + CRLF.
+    s.board_power = true;
+    s.sense = {4095, 3300, false, true};
+    s.battery={35000,34900,100,3300,2147483647,"sensor_error",false,false};
+    s.sense.noisy=true;
+    s.power_good = true;
+    s.nrf_rail = false;
     s.selected_name = std::string(30, '"');
     s.tx.file_name = s.selected_name;
     s.rx_last_name = s.selected_name;
@@ -71,6 +77,8 @@ int main(int argc, char**)
     s.rx.bytes = s.rx.total = s.rx.sequence = s.rx.packets = UINT32_MAX;
     s.last_fault = std::numeric_limits<int>::min();
     json_line = json(s);
+    assert(json_line.find("\"battery_mv\":35000") != std::string::npos);
+    assert(json_line.find("\"battery_estimated_mv\":34900") != std::string::npos);
     std::cerr << "Worst-case JSON bytes: " << json_line.size() << '\n';
     assert(json_line.find("response_too_large") == std::string::npos);
     assert(json_line.size() <= kMaxResponseBytes);

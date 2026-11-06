@@ -1,3 +1,17 @@
+## Battery update RF3-BAT-R1-20261105
+
+Devboard STATUS adds `battery_estimated_mv` beside `battery_mv`. Both are integer
+millivolts: `battery_mv` is the sensed protection value, and the estimate is
+100 mV lower, floored at zero. Missing values remain unavailable. Battery states
+include startup, averaging, settling, fresh, held, stale, low_pending,
+sensor_error and cutoff. Existing status is cached; requests do not sample ADC.
+
+USB text and Classic Bluetooth SPP may emit this asynchronous event:
+`BATTERY SHUTOFF turn_physical_power_boot_switch_OFF_connect_charged_replacement_source`
+It means shutdown has started. STATUS confirms persisted latch and output levels.
+No host acknowledgement is required. Message delivery is not guaranteed if device
+or connection power disappears. The event does not change RF Protocol v2.
+
 # Bluetooth SPP control
 
 Both ESP32 profiles enable Classic Bluetooth Serial Port Profile. Pair in Windows, then choose the correct paired device in the GUI:

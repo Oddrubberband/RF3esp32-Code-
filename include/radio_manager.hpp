@@ -43,6 +43,7 @@ struct RadioStatus {
 // console user interface (UI) does not need to reason about raw register state.
 class RadioManager {
 public:
+    bool disableAutoAck() { return radio_.disableAutoAck(); }
     explicit RadioManager(Nrf24& radio);
 
     // Boot/probe the radio and enter the default standby configuration.
@@ -58,7 +59,7 @@ public:
     bool hasPendingRx();
 
     // Data plane operations.
-    bool sendPayload(const uint8_t* payload, size_t len);
+    bool sendPayload(const uint8_t* payload, size_t len, bool allowRecovery = true);
     bool receivePayload(uint8_t* out, size_t capacity, size_t& outLen);
 
     // Power controls.

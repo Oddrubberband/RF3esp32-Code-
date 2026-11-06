@@ -28,8 +28,6 @@ def harness(root: Path) -> str:
 std::vector<std::string> splitWords(const std::string& line){std::istringstream stream(line);std::vector<std::string> out;std::string word;while(stream>>word)out.push_back(word);return out;}
 constexpr const char* kHostUploadPartialName=".host_upload.part";
 constexpr int64_t kHostSessionTimeoutUs=60000000;
-int64_t fake_time_us=0;
-int64_t esp_timer_get_time(){return fake_time_us;}
 struct TestSink {
     std::FILE* file=nullptr;
     std::string partial, final;
@@ -55,8 +53,16 @@ struct TestSink {
     uint32_t bluetooth_dispatch_epoch_=1;
     std::atomic_bool bluetooth_client_connected_{true};
     std::atomic<uint32_t> bluetooth_epoch_{1};
+    std::vector<std::string> cutoff_events;
+    bool sendBluetoothText(std::string_view text) {
+        assert(radio_held && power_.powerGood() && power_.nrfRail() && hal_.enabled);
+        assert(power_.battery(monotonicMilliseconds()).cutoff);
+        cutoff_events.emplace_back(text);
+        return true;
+    }
     unsigned stop_loop_calls_=0, side_effects_=0;
     bool stopLoopAndWait(){++stop_loop_calls_;loop_config_={};loop_owns_radio_=false;return true;}
+    bool isLoopActive(){return loop_config_.active;}
     bool isRemoteCommandAllowed(const std::vector<std::string>&){return true;}''')
     cpp=cpp.replace('    struct HostSession {bool active=false;} host_upload_, host_download_;','    struct HostSession {bool active=false;std::FILE* file=nullptr;CommandOrigin owner=CommandOrigin::Local;uint32_t epoch=0;int64_t last_activity_us=0;} host_upload_, host_download_;\n    using HostUploadStorage=HostSession;\n    using HostDownloadStorage=HostSession;')
     cpp=cpp.replace('struct Incoming {std::FILE* file=nullptr;}', 'struct Incoming {std::FILE* file=nullptr;std::string partial_name;}')
@@ -64,6 +70,7 @@ struct TestSink {
     old='    bool ensureStandbyLocked(){assert(radio_held);if(manager_.value.state==RadioState::Fault)return false;manager_.value.state=RadioState::Standby;return true;}\n'
     cpp=cpp.replace(old,'')
     methods=''
+    methods+=main[main.index('    static bool txBatteryCheckEntry('):main.index('    void rxTask()')]
     methods+=main[main.index('    void discardIncomingFileTransfer('):main.index('    bool isLoopActive()')]
     methods+=main[main.index('    bool ensureStandbyLocked()'):main.index('    bool isRemoteCommandAllowed(')]
     methods+=main[main.index('    bool commandStop()'):main.index('    bool commandStandby()')]
@@ -107,6 +114,10 @@ int main(int argc,char** argv){
     const std::vector<std::string> refused={"CHANNEL 83","POWER 3","STANDBY","SLEEP","WAKE","POWERDOWN","TESTMODE ON","TESTMODE OFF","TX file.bin","TXHEX 612e62696e","SELECT file.bin","SELECTHEX 612e62696e","TEXT hi","REMOTE STATUS","MORSE hi","CW START","CW LOOP 10 10","STORAGE DELETE 612e62696e","UPLOAD BEGIN x 1 00000000","UPLOAD DATA 0 00","DOWNLOAD BEGIN x","TESTTX 43"};
     for(const auto& line:refused){assert(!app.guardedAttempt(line,CommandOrigin::Bluetooth));assert(app.side_effects_==0);assert(!app.receive_mutation_reserved_);assert(app.receiver_.transferId()==id&&app.receiver_.acceptedBytes()==accepted&&app.sink_.file==sink);}
     for(const auto& line:{"STATUS","HELLO","FILES","HELP","STORAGE LIST 0","RX","STOP","CW STOP","UPLOAD CANCEL","DOWNLOAD CANCEL"})assert(app.guardedAttempt(line,CommandOrigin::Local));
+    const auto saved_clock=runtime_test_clock_ms;
+    runtime_test_clock_ms=24001;
+    assert(app.commandRx()); // Repeated Receive remains harmless even with a stale cached gauge.
+    runtime_test_clock_ms=saved_clock;
     assert(app.receiver_.active());app.printStatus();std::cout<<app.buildStatusJson()<<'\n';
     finish(app,id);assert(app.receiver_.state()==ReliableTransferV2::ReceiverState::Completed);
     assert(app.commandRx());assert(app.receiver_.state()==ReliableTransferV2::ReceiverState::Completed);
@@ -138,6 +149,124 @@ int main(int argc,char** argv){
     DemoConsoleApp cleanup;cleanup.manager_.value.state=RadioState::RxListening;cleanup.manager_.value.power_level=2;beginPartial(cleanup,0xabcdef01);cleanup.sink_.fail_remove=true;
     assert(!cleanup.commandStop());assert(cleanup.receiver_.state()==ReliableTransferV2::ReceiverState::Cancelled&&cleanup.receiver_.error()==ProtocolV2::ErrorCode::CleanupFailed);
     assert(std::filesystem::exists(cleanup.sink_.partial));cleanup.sink_.fail_remove=false;assert(cleanup.receiver_.reset());assert(!std::filesystem::exists(cleanup.sink_.partial));
+    // Exercise the extracted production rail handler and receive guard.
+    DemoConsoleApp power_app;
+    power_app.manager_.value.state=RadioState::Standby;
+    if (HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard) {
+        assert(power_app.guardedAttempt("NRFRAIL OFF",CommandOrigin::Local));
+        assert(!power_app.power_.nrfRail() && !power_app.hal_.enabled);
+        assert(power_app.power_.powerGood() && power_app.power_.sample().millivolts==2400);
+        assert(power_app.manager_.value.state==RadioState::PowerDown);
+        assert(!power_app.guardedAttempt("RX",CommandOrigin::Local));
+        assert(!power_app.guardedAttempt("TXNOACKHEX 66696c652e62696e",CommandOrigin::Local));
+        assert(power_app.guardedAttempt("NRFRAIL ON",CommandOrigin::Bluetooth));
+        assert(power_app.power_.nrfRail() && power_app.hal_.enabled);
+        assert(!power_app.guardedAttempt("NRFRAIL OFF",CommandOrigin::Remote));
+        assert(power_app.power_.nrfRail());
+        power_app.manager_.value.state=RadioState::RxListening;
+        assert(!power_app.guardedAttempt("NRFRAIL OFF",CommandOrigin::Local));
+        assert(power_app.power_.nrfRail());
+    } else {
+        assert(!power_app.guardedAttempt("NRFRAIL OFF",CommandOrigin::Local));
+        assert(power_app.power_io_.outputs.empty());
+    }
+    if (HardwareProfile::kSelectedId==HardwareProfile::Id::Esp32Devboard) {
+        DemoConsoleApp gauge;
+        const auto service_at = [](DemoConsoleApp& target, uint64_t time) {
+            runtime_test_clock_ms = time;
+            target.serviceBatteryOnce();
+            assert(!target.radio_held);
+        };
+        const auto initial_reads = gauge.power_io_.reads;
+        gauge.manager_.value.state=RadioState::TxBusy;
+        service_at(gauge, 15000);
+        gauge.manager_.value.state=RadioState::CwTest;
+        service_at(gauge, 16000);
+        gauge.manager_.value.state=RadioState::RxListening;
+        service_at(gauge, 17000);
+        gauge.manager_.value.state=RadioState::Standby;
+        gauge.loop_owns_radio_=true;
+        service_at(gauge, 17500);
+        gauge.loop_owns_radio_=false;
+        gauge.hal_.ce=true;
+        service_at(gauge, 18000);
+        gauge.hal_.ce=false;
+        gauge.hal_.activity=18100;
+        service_at(gauge, 19000);
+        assert(gauge.power_io_.reads==initial_reads);
+        service_at(gauge, 20100);
+        assert(gauge.power_io_.reads==initial_reads+1);
+
+        // Healthy listening pauses preserve the active receiver and its file.
+        DemoConsoleApp listening;
+        listening.manager_.value.state=RadioState::RxListening;
+        beginPartial(listening, 0x1331);
+        auto* partial_file = listening.sink_.file;
+        service_at(listening, 313999);
+        assert(listening.manager_.leave_count == 0);
+        service_at(listening, 314000);
+        assert(runtime_test_clock_ms == 320000);
+        assert(listening.manager_.leave_count == 1 && listening.manager_.enter_count == 1);
+        assert(listening.manager_.value.state == RadioState::RxListening);
+        assert(listening.receiver_.active() && listening.sink_.file == partial_file);
+        assert(listening.receiver_.acceptedBytes() == 20);
+        assert(listening.power_.battery(320000).age_ms == 0);
+        assert(listening.commandStop());
+
+        // A noisy ADC cannot extend a listening pause past its deadline.
+        DemoConsoleApp noisy;
+        noisy.manager_.value.state=RadioState::RxListening;
+        noisy.power_io_.reading.noisy=true;
+        service_at(noisy, 314000);
+        assert(runtime_test_clock_ms == 321500);
+        assert(noisy.manager_.leave_count == 1 && noisy.manager_.enter_count == 1);
+        assert(noisy.power_.battery(321500).state == std::string("sensor_error"));
+        service_at(noisy, 321501);
+        assert(noisy.manager_.leave_count == 1);
+
+        constexpr char event[] =
+            "BATTERY SHUTOFF turn_physical_power_boot_switch_OFF_connect_charged_replacement_source\r\n";
+        // The fifth full low window occurs inside the real locked callback
+        // between outbound attempts. Neither sender may transmit afterwards.
+        const std::string name = "battery-tx.bin";
+        std::ofstream(buildFilePath(name), std::ios::binary).write("battery", 7);
+        for (bool no_ack : {false, true}) {
+            DemoConsoleApp tx;
+            tx.manager_.value.state=RadioState::Standby;
+            tx.manager_.send_success=true;
+            tx.power_io_.reading.millivolts=2200;
+            for (uint64_t t = 14250; t <= 31000; t += 250) service_at(tx, t);
+            assert(!tx.power_.battery(31000).cutoff);
+            assert(tx.takeRadio());
+            runtime_test_clock_ms = 33000;
+            struct Callback {
+                DemoConsoleApp* app;
+                unsigned calls = 0;
+            } context{&tx};
+            const auto after_first_frame = [](void* raw) {
+                auto& callback = *static_cast<Callback*>(raw);
+                return ++callback.calls == 1 || DemoConsoleApp::txBatteryCheckEntry(callback.app);
+            };
+            ProtocolTransferReport report;
+            prepareTransferReport(report, FileInfo{name, 7}, tx.manager_.status(), nextTransferId());
+            const auto path = buildFilePath(name);
+            const bool sent = no_ack
+                ? sendDataFileNoAck(tx.manager_, path.c_str(), &tx.loop_stop_requested_,
+                                    &report, after_first_frame, &context)
+                : sendDataFile(tx.manager_, tx.transfer_service_, path.c_str(), &tx.loop_stop_requested_,
+                               &report, after_first_frame, &context);
+            assert(!sent && context.calls == 2 && tx.manager_.send_attempts == 1);
+            assert(report.state == ReliableTransferV2::SenderState::Cancelled);
+            assert(!report.peer_complete && report.error == ProtocolV2::ErrorCode::Cancelled);
+            assert(tx.power_.battery(runtime_test_clock_ms).cutoff);
+            assert(!tx.power_.powerGood() && !tx.power_.nrfRail() && !tx.hal_.enabled);
+            assert(tx.manager_.value.state == RadioState::PowerDown);
+            assert(tx.cutoff_events == std::vector<std::string>{event});
+            tx.giveRadio();
+            service_at(tx, runtime_test_clock_ms + 250);
+            assert(tx.cutoff_events.size() == 1);
+        }
+    }
     std::cerr<<"Real receiver repeat-RX/partial-sink/CRC completion/command guard/STOP cancellation checks passed for "<<HardwareProfile::kSelectedName<<'\n';
 }
 """

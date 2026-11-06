@@ -8,8 +8,8 @@ namespace HostRxCommandGuard {
 // receive path. All other operator commands are serialized against RF START.
 inline bool needsReservation(std::string_view command, std::string_view action)
 {
-    if (command == "RX" || command == "STOP" || command == "STATUS" || command == "HELLO" ||
-        command == "HELP" || command == "?" || command == "FILES" || command == "LS" || command == "ECHO")
+    if (command == "RX" || command == "RXNOACK" || command == "STOP" || command == "STATUS" || command == "HELLO" ||
+        command == "DIAG" || command == "HELP" || command == "?" || command == "FILES" || command == "LS" || command == "ECHO")
         return false;
     if (command == "STORAGE" && action == "LIST") return false;
     if ((command == "UPLOAD" || command == "DOWNLOAD") && action == "CANCEL") return false;

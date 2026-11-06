@@ -1,3 +1,11 @@
+## Battery update RF3-BAT-R1-20261105
+
+The RF frame format, CRC, retry and resume rules remain unchanged. A long-running
+devboard file TX or listening RX can pause for a battery measurement, bounded to
+7.5 seconds per attempt. Reliable mode retains existing retry/resume handling.
+Cutoff cancels the local sender without attempting another radio message and
+discards unfinished receive work. Matching updated peers are recommended.
+
 # RF3 Reliable File-Transfer Protocol v2
 
 Status: local R2 implementation, including optional START file-extension metadata.
@@ -281,10 +289,18 @@ Named defaults are:
 | Setting | Default |
 | --- | ---: |
 | Control response timeout | 500 ms |
-| DATA ACK timeout | 250 ms |
-| Maximum retransmissions per frame | 5 |
-| Receiver inactivity timeout | 10,000 ms |
-| Sender overall inactivity timeout | 10,000 ms |
+| DATA ACK timeout | 1,000 ms |
+| Maximum retransmissions per frame | 10 |
+| Receiver inactivity timeout | 20,000 ms |
+| Sender overall inactivity timeout | 20,000 ms |
+
+The sender advances immediately when a matching ACK arrives. The DATA ACK
+timeout is the maximum wait before retrying, not a delay added to every packet.
+Ten retransmissions allow eleven total attempts. With a 1,000 ms DATA ACK
+deadline, the 20-second inactivity limits leave room for the full retry budget.
+This software timeout does not configure nRF24 hardware auto-ACK. Install the
+updated firmware on each board that will send files to use the longer wait in
+both directions; the wire format is unchanged by this timeout update.
 
 All times use monotonic milliseconds supplied to the state machines. Timeout
 and retry constants are centralized in `protocol_v2.hpp`.
@@ -358,3 +374,32 @@ change.
   required after host and firmware-build validation.
 - Hardware-profile pin correction, stable toolchain pinning, and Wi-Fi/HTTP
   security cleanup are separate tasks.
+# Local Reliable resume behavior (RESUME-R1)
+
+Wire frames and the existing READY expected_sequence field are unchanged. New
+Reliable receivers retain size/count/CRC/suffix, rolling prefix CRC and next
+sequence in RAM, closing but retaining the partial after idle timeout. START
+with matching identity may adopt a fresh transfer ID before or after timeout.
+The sink verifies exact stored length and prefix CRC before reopening at the
+frontier. READY advertises that sequence; the sender validates the bound,
+rewinds its source, reads past min(sequence*20,total_size), and sends remaining
+DATA or END. The prior attempt's frames cannot update the new transfer ID.
+
+A matching completed receive rechecks the published file before READY advertises
+the full offset; the next END repeats COMPLETE without republishing. Missing or
+corrupt storage falls back to a fresh receive. Different metadata while active
+returns Busy; after timeout it replaces the one retained partial. CRC32 is the
+existing accidental-corruption identity check, not authentication. Full filename
+is not RF metadata; equal content/size/suffix is treated as the same file.
+
+Explicit Cancel/Stop and normal receive teardown delete retained partials.
+Resume metadata is not persisted across reset. RFN/no-ACK disables retention and
+resume; legacy receiver callbacks without the optional resume callback keep
+their prior delete-on-timeout behavior. Old senders reject nonzero READY offsets;
+update both boards together. GUI commands and report fields remain compatible.
+
+
+Session replay protection remembers up to 32 retired attempt IDs per checkpoint.
+If that limit is reached, a fresh ID is rejected Busy without evicting history.
+Use Stop, then Receive to start fresh in that unusual case. Old START packets
+cannot reclaim a resumed checkpoint, including after damaged-file fallback.

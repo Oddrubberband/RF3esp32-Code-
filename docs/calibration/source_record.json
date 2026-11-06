@@ -1,0 +1,14 @@
+{
+  "source": "User-supplied bench power supply versus unconnected analog output measurements",
+  "original_filename": "Voltage_sensing_unconnected_output.xlsx - Voltage_sensing_unconnected_out.csv",
+  "original_sha256": "9b79c66d36c086808ee664832e081633ff19b4425b970b5cf7fb38446dd802ad",
+  "repository_sha256": "517eb6f2469d04b482540610aa7d4eaf3ea092434961c97ea6dcaa2c2a766036",
+  "normalization": "CRLF converted to LF only; all cell text and measurement precision preserved",
+  "columns": {
+    "A": "bench pack voltage, V",
+    "B": "unconnected sense output, V"
+  },
+  "valid_pairs": 41,
+  "skipped_blank_sense_pack_v": "24.25",
+  "extra_columns": "not used"
+}

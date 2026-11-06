@@ -24,6 +24,7 @@ public:
     uint8_t readReg(uint8_t reg);
     uint8_t readRfPowerLevel();
     bool setRfPowerLevel(uint8_t level);
+    bool disableAutoAck();
     uint8_t readRpd();
     void readRegs(uint8_t reg, uint8_t* out, size_t len);
     void writeReg(uint8_t reg, uint8_t value);
@@ -41,7 +42,7 @@ public:
     bool stopRx();
 
     // One-shot payload send/receive helpers used by the console demo.
-    bool transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs = 60000);
+    bool transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs = 60000, bool allowRecovery = true);
     bool readOnePacket(uint8_t* out, size_t capacity, size_t& outLen);
 
     // Minimal continuous-wave test helpers.

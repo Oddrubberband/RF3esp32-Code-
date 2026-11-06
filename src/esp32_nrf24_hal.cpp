@@ -1,4 +1,6 @@
 #include "esp32_nrf24_hal.hpp"
+#include <cstring>
+#include <initializer_list>
 
 #include "esp_err.h"
 #include "esp_rom_sys.h"
@@ -58,6 +60,10 @@ Esp32Nrf24Hal::Esp32Nrf24Hal(const Esp32Nrf24Config& config)
 
 void Esp32Nrf24Hal::spiTxRx(const uint8_t* tx, uint8_t* rx, size_t n)
 {
+    if (!signal_outputs_enabled_) {
+        if (rx) std::memset(rx, 0xFF, n);
+        return;
+    }
     if (n == 0) {
         return;
     }
@@ -74,7 +80,27 @@ void Esp32Nrf24Hal::spiTxRx(const uint8_t* tx, uint8_t* rx, size_t n)
 
 void Esp32Nrf24Hal::ce(bool level)
 {
-    gpio_set_level(config_.ce_pin, level ? 1 : 0);
+    const bool requested=level && signal_outputs_enabled_;
+    if (gpio_set_level(config_.ce_pin,requested ? 1 : 0)==ESP_OK && requested!=ce_asserted_) {
+        ce_asserted_=requested;
+        last_ce_activity_ms_=static_cast<uint64_t>(esp_timer_get_time())/1000u;
+    }
+}
+
+bool Esp32Nrf24Hal::setSignalOutputsEnabled(bool enabled)
+{
+    // ESP-IDF GPIO direction control preserves SPI matrix routing. Release
+    // outputs before rail OFF to avoid driving an unpowered nRF via its inputs.
+    // RF Protocol v2 remains unchanged; caller owns the radio mutex.
+    ce(false);
+    signal_outputs_enabled_ = false;
+    const gpio_mode_t mode = enabled ? GPIO_MODE_OUTPUT : GPIO_MODE_INPUT;
+    bool ok = true;
+    for (gpio_num_t pin : {config_.csn_pin, config_.sck_pin, config_.mosi_pin}) {
+        if (gpio_set_direction(pin, mode) != ESP_OK) ok = false;
+    }
+    signal_outputs_enabled_ = enabled && ok;
+    return ok;
 }
 
 bool Esp32Nrf24Hal::irqConnected() const

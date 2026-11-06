@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include "protocol_v2.hpp"
+#include "runtime_diagnostics.hpp"
 
 // ReliableTransferV2 contains the hardware-independent streaming sender and
 // receiver state machines. Callers supply explicit source/sink callbacks and
@@ -233,10 +234,10 @@ public:
 
         ProtocolV2::Packet packet{};
         if (ProtocolV2::decode(frame, length, packet) != ProtocolV2::DecodeStatus::Ok) {
-            return SenderEvent::Ignored;
+            return ignoredResponse();
         }
         if (packet.transfer_id != transfer_id_) {
-            return SenderEvent::Ignored;
+            return ignoredResponse();
         }
 
         if (packet.type == ProtocolV2::PacketType::Error) {
@@ -255,7 +256,7 @@ public:
         switch (state_) {
             case SenderState::WaitingForReady:
                 if (packet.type != ProtocolV2::PacketType::Ready) {
-                    return SenderEvent::Ignored;
+                    return ignoredResponse();
                 }
                 last_activity_ms_ = now_ms;
                 waiting_for_response_ = false;
@@ -263,10 +264,36 @@ public:
                     fail(packet.error);
                     return SenderEvent::Failed;
                 }
-                if (packet.expected_sequence != 0) {
+                if (packet.expected_sequence > metadata_.total_packets) {
                     fail(ProtocolV2::ErrorCode::UnexpectedSequence);
                     return SenderEvent::Failed;
                 }
+                // READY describes bytes accepted by this receiver, including an
+                // ACK lost before the previous attempt ended. Rewind even on a
+                // retried START, then consume precisely that confirmed prefix.
+                if (!source_.reset(source_context_)) {
+                    fail(ProtocolV2::ErrorCode::SourceRead);
+                    return SenderEvent::Failed;
+                }
+                acknowledged_bytes_ = packet.expected_sequence == metadata_.total_packets
+                    ? metadata_.total_size
+                    : packet.expected_sequence * ProtocolV2::kDataPayloadCapacity;
+                {
+                    std::array<uint8_t, 128> prefix{};
+                    uint32_t remaining = acknowledged_bytes_;
+                    while (remaining) {
+                        const size_t count = remaining < prefix.size() ? remaining : prefix.size();
+                        const auto result = source_.read(source_context_, prefix.data(), count);
+                        if (!result.bytes_read || result.bytes_read > count ||
+                            result.state == ReadState::Error ||
+                            (result.state == ReadState::EndOfFile && result.bytes_read < remaining)) {
+                            fail(ProtocolV2::ErrorCode::SourceRead);
+                            return SenderEvent::Failed;
+                        }
+                        remaining -= static_cast<uint32_t>(result.bytes_read);
+                    }
+                }
+                current_sequence_ = acknowledged_packets_ = packet.expected_sequence;
                 retry_count_ = 0;
                 return prepareNextDataOrEnd() ? SenderEvent::OutboundReady
                                               : SenderEvent::Failed;
@@ -282,10 +309,10 @@ public:
                     return scheduleRetry();
                 }
                 if (packet.type != ProtocolV2::PacketType::Ack) {
-                    return SenderEvent::Ignored;
+                    return ignoredResponse();
                 }
                 if (packet.sequence < current_sequence_) {
-                    return SenderEvent::Ignored;
+                    return ignoredResponse();
                 }
                 if (packet.sequence != current_sequence_) {
                     fail(ProtocolV2::ErrorCode::UnexpectedSequence);
@@ -302,7 +329,7 @@ public:
 
             case SenderState::WaitingForComplete:
                 if (packet.type != ProtocolV2::PacketType::Complete) {
-                    return SenderEvent::Ignored;
+                    return ignoredResponse();
                 }
                 last_activity_ms_ = now_ms;
                 if (packet.total_size != metadata_.total_size ||
@@ -318,7 +345,7 @@ public:
                 return SenderEvent::Completed;
 
             case SenderState::Cancelling:
-                return SenderEvent::Ignored;
+                return ignoredResponse();
 
             default:
                 fail(ProtocolV2::ErrorCode::StateViolation);
@@ -344,6 +371,8 @@ public:
         if (!waiting_for_response_ || now_ms < response_deadline_ms_) {
             return SenderEvent::NoChange;
         }
+        if (state_ == SenderState::WaitingForDataAck)
+            RuntimeDiagnostics::global().ack_timeouts.add();
         waiting_for_response_ = false;
         return scheduleRetry();
     }
@@ -372,6 +401,17 @@ public:
         waiting_for_response_ = false;
         last_activity_ms_ = now_ms;
         return SenderEvent::OutboundReady;
+    }
+
+    // A local hardware shutdown cannot send or await an RF CANCEL.
+    void cancelLocally()
+    {
+        if (terminal()) return;
+        state_ = SenderState::Cancelled;
+        error_ = ProtocolV2::ErrorCode::Cancelled;
+        outbound_ready_ = false;
+        waiting_for_response_ = false;
+        response_deadline_ms_ = 0;
     }
 
     SenderState state() const { return state_; }
@@ -474,6 +514,12 @@ private:
         return SenderEvent::OutboundReady;
     }
 
+    static SenderEvent ignoredResponse()
+    {
+        RuntimeDiagnostics::global().rejected_responses.add();
+        return SenderEvent::Ignored;
+    }
+
     uint32_t responseTimeoutMs() const
     {
         return state_ == SenderState::WaitingForDataAck
@@ -539,6 +585,9 @@ struct SinkCallbacks {
     bool (*close)(void* context) = nullptr;
     bool (*publish)(void* context) = nullptr;
     bool (*remove_partial)(void* context) = nullptr;
+    // Reopen only after checking the retained length and prefix CRC on disk.
+    bool (*resume)(void* context, uint32_t transfer_id,
+                   uint32_t bytes, uint32_t crc32) = nullptr;
 };
 
 enum class ReceiverState {
@@ -565,6 +614,8 @@ enum class ReceiverEvent {
 
 class ReceiverSession {
 public:
+    void setResumeEnabled(bool enabled) { resume_enabled_ = enabled; }
+    bool resumable() const { return resume_enabled_ && storage_present_ && !cleanup_failed_; }
     ReceiverSession(void* sink_context,
                     SinkCallbacks sink,
                     uint32_t inactivity_timeout_ms = ProtocolV2::kReceiverInactivityTimeoutMs)
@@ -618,7 +669,7 @@ public:
                                  expected_sequence_, response)
                            ? ReceiverEvent::Cancelled : ReceiverEvent::Failed;
             }
-            if (!active()) {
+            if (!active() && !resumable()) {
                 return ReceiverEvent::Ignored;
             }
             last_activity_ms_ = now_ms;
@@ -657,7 +708,17 @@ public:
             return ReceiverEvent::Ignored;
         }
         const uint32_t id = transfer_id_;
-        (void)abortStorage(ProtocolV2::ErrorCode::Timeout, ReceiverState::Failed);
+        if (resume_enabled_ && sink_.resume && storage_open_) {
+            storage_open_ = false;
+            if (sink_.close && sink_.close(sink_context_)) {
+                state_ = ReceiverState::Failed;
+                error_ = ProtocolV2::ErrorCode::Timeout;
+            } else {
+                (void)abortStorage(ProtocolV2::ErrorCode::SinkWrite, ReceiverState::Failed);
+            }
+        } else {
+            (void)abortStorage(ProtocolV2::ErrorCode::Timeout, ReceiverState::Failed);
+        }
         if (!makeError(id, ProtocolV2::ErrorCode::Timeout,
                        expected_sequence_, response)) {
             return ReceiverEvent::Failed;
@@ -722,6 +783,9 @@ private:
                               uint64_t now_ms,
                               ProtocolV2::Frame& response)
     {
+        for (size_t i = 0; i < retired_id_count_; ++i) {
+            if (packet.transfer_id == retired_ids_[i]) return ReceiverEvent::Ignored;
+        }
         if (!FileTypeMetadata::startMetadataValid(packet.flags, packet.extension))
             return makeReady(packet.transfer_id, false, 0, ProtocolV2::ErrorCode::InvalidMetadata, response)
                 ? ReceiverEvent::ResponseReady : ReceiverEvent::Failed;
@@ -742,6 +806,49 @@ private:
             !metadataEqual(incoming, metadata_))
             return makeReady(packet.transfer_id, false, 0, ProtocolV2::ErrorCode::Busy, response)
                 ? ReceiverEvent::ResponseReady : ReceiverEvent::Failed;
+        // COMPLETE may have been lost after publication. Recheck the saved file
+        // before confirming its full offset; END will repeat COMPLETE without
+        // writing a duplicate file. A removed/changed file starts fresh below.
+        if (resume_enabled_ && packet.transfer_id != transfer_id_ &&
+            retired_id_count_ == retired_ids_.size() && metadataEqual(incoming, metadata_))
+            return makeReady(packet.transfer_id, false, 0, ProtocolV2::ErrorCode::Busy, response)
+                ? ReceiverEvent::ResponseReady : ReceiverEvent::Failed;
+        if (resume_enabled_ && state_ == ReceiverState::Completed &&
+            metadataEqual(incoming, metadata_) && sink_.resume &&
+            sink_.resume(sink_context_, packet.transfer_id, accepted_bytes_, crc_.value())) {
+            adoptTransferId(packet.transfer_id);
+            last_activity_ms_ = now_ms;
+            return makeReady(transfer_id_, true, expected_sequence_, ProtocolV2::ErrorCode::None, response)
+                ? ReceiverEvent::ResponseReady : ReceiverEvent::Failed;
+        }
+        // A fresh GUI transmission has a fresh ID. Match the complete file
+        // identity before adopting it; stale frames retain their old ID.
+        if (resumable() && sink_.resume && metadataEqual(incoming, metadata_) &&
+            (active() || (state_ == ReceiverState::Failed && error_ == ProtocolV2::ErrorCode::Timeout)) &&
+            !(active() && packet.transfer_id == transfer_id_)) {
+            const bool closed = !storage_open_ || (sink_.close && sink_.close(sink_context_));
+            storage_open_ = false;
+            if (closed && sink_.resume(sink_context_, packet.transfer_id, accepted_bytes_, crc_.value())) {
+                storage_open_ = true;
+                adoptTransferId(packet.transfer_id);
+                last_activity_ms_ = now_ms;
+                state_ = expected_sequence_ == metadata_.total_packets
+                    ? ReceiverState::WaitingForEnd : ReceiverState::Receiving;
+                error_ = ProtocolV2::ErrorCode::None;
+                return makeReady(transfer_id_, true, expected_sequence_, error_, response)
+                    ? ReceiverEvent::ResponseReady : ReceiverEvent::Failed;
+            }
+            // A missing, truncated or corrupt checkpoint is never appended to.
+            // Clean it and let the ordinary fresh START below select offset 0.
+            if (!cleanupStorage()) {
+                state_ = ReceiverState::Failed;
+                error_ = ProtocolV2::ErrorCode::CleanupFailed;
+                return makeReady(packet.transfer_id, false, 0, error_, response)
+                    ? ReceiverEvent::Failed : ReceiverEvent::Failed;
+            }
+            state_ = ReceiverState::Failed;
+            error_ = ProtocolV2::ErrorCode::SinkOpen;
+        }
         if (active()) {
             if (packet.transfer_id == transfer_id_ && metadataEqual(incoming, metadata_)) {
                 last_activity_ms_ = now_ms;
@@ -769,7 +876,10 @@ private:
                        ? ReceiverEvent::Failed : ReceiverEvent::Failed;
         }
 
-        clearSession();
+        const bool same_checkpoint = resume_enabled_ && transfer_id_ != 0 &&
+            metadataEqual(incoming, metadata_);
+        if (same_checkpoint) adoptTransferId(packet.transfer_id);
+        clearSession(same_checkpoint);
         transfer_id_ = packet.transfer_id;
         metadata_ = incoming;
         const SinkPrepareResult prepared =
@@ -949,7 +1059,7 @@ private:
         return ok;
     }
 
-    void clearSession()
+    void clearSession(bool preserve_retired = false)
     {
         state_ = ReceiverState::Idle;
         error_ = ProtocolV2::ErrorCode::None;
@@ -963,6 +1073,16 @@ private:
         cleanup_failed_ = false;
         storage_open_ = false;
         storage_present_ = false;
+        if (!preserve_retired) retired_id_count_ = 0;
+    }
+
+    void adoptTransferId(uint32_t id)
+    {
+        if (id == transfer_id_) return;
+        // Capacity is checked before opening/rebinding storage. Fail closed
+        // rather than evicting an ID that could still replay an old START.
+        retired_ids_[retired_id_count_++] = transfer_id_;
+        transfer_id_ = id;
     }
 
     bool makeReady(uint32_t transfer_id,
@@ -1048,6 +1168,9 @@ private:
     bool storage_open_ = false;
     bool storage_present_ = false;
     bool cleanup_failed_ = false;
+    bool resume_enabled_ = false;
+    std::array<uint32_t, 32> retired_ids_{};
+    size_t retired_id_count_ = 0;
 };
 
 inline const char* senderStateName(SenderState state)

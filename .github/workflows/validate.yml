@@ -55,6 +55,12 @@ jobs:
         run: python tools/tests/test_rx_command_guard.py --output .ci-native/rx
       - name: Actual production extension codec and receive publication, both profiles
         run: python tools/tests/test_file_type_metadata.py --output .ci-native/extensions
+      - name: Actual No ACK sender and receiver, both profiles
+        run: python tools/tests/test_no_ack_runtime.py --compiler g++ --output .ci-native/noack
+      - name: Actual Reliable resume and integrity, both profiles
+        run: python tools/tests/test_resume_runtime.py --compiler g++ --output .ci-native/resume
+      - name: Actual diagnostics dispatch and framing
+        run: python tools/tests/test_diagnostics_runtime.py --compiler g++ --output .ci-native/diagnostics
       - name: Build both matching firmware profiles
         run: python -m platformio run -e rf3_custom_pcb -e rf3_esp32_devboard
       - name: Package verified firmware images

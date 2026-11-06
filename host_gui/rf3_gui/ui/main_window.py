@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -33,8 +34,11 @@ from PySide6.QtWidgets import (
 
 from rf3_gui.app.controller import AppController
 from rf3_gui.app.receive_rate import ReceiveRateTracker
+from rf3_gui.build_info import BUILD_ID, DISPLAY_NAME
 from rf3_gui.protocol import console_protocol
 from rf3_gui.app.state_model import (
+    BATTERY_CUTOFF_MV,
+    BATTERY_RESET_MV,
     CONSOLE_COMMAND_MAX_CHARS,
     ConnectionState,
     DeviceInfo,
@@ -62,10 +66,12 @@ class MainWindow(QMainWindow):
         self._connection_epoch = 0
         self._was_connected = False
         self._closing = False
+        self._battery_cutoff_notified = False
+        self._battery_cutoff_notice = None
         self._rx_rate_tracker = ReceiveRateTracker()
         self._rx_rate_snapshot = None
 
-        self.setWindowTitle("RF3 Desktop")
+        self.setWindowTitle(DISPLAY_NAME)
         self._build_ui()
         self._connect_signals()
         self._apply_snapshot(controller.snapshot)
@@ -81,7 +87,9 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(8)
 
-        title = QLabel("RF3 Desktop")
+        title = QLabel(DISPLAY_NAME)
+        title.setWordWrap(True)
+        title.setToolTip(f"GUI build: {BUILD_ID}\nApplication: {sys.executable}")
         title.setObjectName("titleLabel")
         title.setStyleSheet("font-size: 22px; font-weight: 600;")
         root.addWidget(title)
@@ -96,14 +104,14 @@ class MainWindow(QMainWindow):
 
         middle = QHBoxLayout()
         middle.setSpacing(10)
-        middle.addWidget(self._build_status_group(), 1)
         middle.addWidget(self._build_controls_group(), 1)
+        middle.addWidget(self._build_received_group(), 1)
         radio_layout.addLayout(middle)
 
         transfer_row = QHBoxLayout()
         transfer_row.setSpacing(10)
         transfer_row.addWidget(self._build_transfer_group(), 3)
-        transfer_row.addWidget(self._build_received_group(), 2)
+        transfer_row.addWidget(self._build_status_group(), 2)
         radio_layout.addLayout(transfer_row)
         radio_layout.addWidget(self._build_log_group(), 1)
 
@@ -326,6 +334,16 @@ class MainWindow(QMainWindow):
         self.channel_value = QLabel("76")
         self.power_value = QLabel("unknown")
         self.battery_value = QLabel("not reported")
+        self.battery_value.setWordWrap(True)
+        self.battery_voltage_value=QLabel("not reported")
+        self.battery_status_value=QLabel("not reported")
+        self.battery_status_value.setWordWrap(True)
+        self.sense_voltage_value = QLabel("not reported")
+        self.sense_voltage_value.setWordWrap(True)
+        self.sense_voltage_value.setToolTip("GPIO34 cached quiet-sample voltage. Pack estimate uses the chart's assumed 9:1 divider; held during RF activity.")
+        self.power_good_value = QLabel("not reported")
+        self.power_good_value.setToolTip("GPIO15 battery-control output: HIGH unless sustained pack undervoltage latches it LOW. Reset only after a fresh quiet reading >=21 V.")
+        self.nrf_rail_value = QLabel("not reported")
         self.selected_file_value = QLabel("")
         self.active_tx_file_value = QLabel("")
         self.fault_value = QLabel("None")
@@ -339,6 +357,11 @@ class MainWindow(QMainWindow):
         layout.addRow("Channel", self.channel_value)
         layout.addRow("TX power", self.power_value)
         layout.addRow("Battery", self.battery_value)
+        layout.addRow("Battery pack (6S)",self.battery_voltage_value)
+        layout.addRow("Battery protection",self.battery_status_value)
+        layout.addRow("Sense input (GPIO34)", self.sense_voltage_value)
+        layout.addRow("Power good (GPIO15)", self.power_good_value)
+        layout.addRow("nRF rail request (GPIO21)", self.nrf_rail_value)
         layout.addRow("Selected SPIFFS file (ESP)", self.selected_file_value)
         layout.addRow("RF file (current/last)", self.active_tx_file_value)
         layout.addRow("Radio fault", self.fault_value)
@@ -367,6 +390,17 @@ class MainWindow(QMainWindow):
         state_row.addWidget(self.power_down_button, 1, 2)
         layout.addLayout(state_row)
 
+        rail_row = QHBoxLayout()
+        self.nrf_rail_on_button = QPushButton("nRF Rail On")
+        self.nrf_rail_off_button = QPushButton("nRF Rail Off")
+        self.nrf_rail_off_button.setToolTip("Deassert GPIO21 after stopping radio activity. Requires an external rail switch.")
+        rail_row.addWidget(self.nrf_rail_on_button)
+        rail_row.addWidget(self.nrf_rail_off_button)
+        layout.addLayout(rail_row)
+        self.battery_reset_button=QPushButton("Reset Battery Cutoff")
+        self.battery_reset_button.setToolTip("After charging/replacing the battery, use USB power and wait for a fresh quiet reading >=21 V. The nRF rail stays OFF.")
+        layout.addWidget(self.battery_reset_button)
+
         channel_row = QHBoxLayout()
         self.channel_spin = QSpinBox()
         self.channel_spin.setRange(MIN_CHANNEL, MAX_CHANNEL)
@@ -387,6 +421,19 @@ class MainWindow(QMainWindow):
         power_row.addWidget(self.power_combo)
         power_row.addWidget(self.apply_power_button)
         layout.addLayout(power_row)
+
+        file_mode_row = QHBoxLayout()
+        self.file_mode_combo = QComboBox()
+        self.file_mode_combo.addItem("Reliable (ACK)", False)
+        self.file_mode_combo.addItem("No ACK (one-way)", True)
+        self.file_mode_combo.setToolTip("Choose the same file-transfer mode on both boards, then press Receive on the receiver.")
+        self.file_mode_combo.currentIndexChanged.connect(self._set_file_mode)
+        file_mode_row.addWidget(QLabel("File transfer mode"))
+        file_mode_row.addWidget(self.file_mode_combo)
+        layout.addLayout(file_mode_row)
+        self.file_mode_hint = QLabel()
+        self.file_mode_hint.setWordWrap(True)
+        layout.addWidget(self.file_mode_hint)
 
         mode_row = QHBoxLayout()
         self.modulation_combo = QComboBox()
@@ -428,6 +475,14 @@ class MainWindow(QMainWindow):
         layout.setColumnStretch(1, 1)
 
         return group
+
+    def _set_file_mode(self, index: int) -> None:
+        enabled = bool(self.file_mode_combo.itemData(index))
+        if not self._controller.set_no_ack_mode(enabled):
+            self.file_mode_combo.blockSignals(True)
+            self.file_mode_combo.setCurrentIndex(0 if enabled else 1)
+            self.file_mode_combo.blockSignals(False)
+        self._apply_snapshot(self._controller.snapshot)
 
     def _build_received_group(self) -> QGroupBox:
         group = QGroupBox("Incoming && Saved Files")
@@ -537,6 +592,10 @@ class MainWindow(QMainWindow):
 
         return group
 
+    def _show_diagnostics(self, values: dict) -> None:
+        self.firmware_build_label.setText(
+            f"Firmware: {values['build']} | {values['profile']} | {values['tick_hz']} Hz scheduler")
+
     def _build_log_group(self) -> QGroupBox:
         group = QGroupBox("Integration Log")
         layout = QVBoxLayout(group)
@@ -549,6 +608,13 @@ class MainWindow(QMainWindow):
         self.log_location_label = QLabel("Diagnostic log: not configured")
         self.log_location_label.setWordWrap(True)
         self.log_location_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.diagnostics_button = QPushButton("Read RF Diagnostics")
+        self.diagnostics_button.setToolTip("Read a one-time firmware diagnostic snapshot; does not transmit RF or reset counters")
+        self.firmware_build_label = QLabel("Firmware build: read diagnostics to identify")
+        self.firmware_build_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.firmware_build_label.setWordWrap(True)
+        layout.addWidget(self.diagnostics_button)
+        layout.addWidget(self.firmware_build_label)
         layout.addWidget(self.show_debug_checkbox)
         layout.addWidget(self.log_location_label)
         layout.addWidget(self.log_output)
@@ -560,6 +626,8 @@ class MainWindow(QMainWindow):
         self.connect_button.clicked.connect(lambda: self._controller.connect_selected_device(int(self.winId())))
         self.disconnect_button.clicked.connect(self._controller.disconnect)
         self.refresh_button.clicked.connect(self._controller.refresh_status)
+        self.diagnostics_button.clicked.connect(self._controller.request_diagnostics)
+        self._controller.diagnostics_received.connect(self._show_diagnostics)
         self.test_mode_checkbox.toggled.connect(self._set_test_mode)
         self.device_combo.currentIndexChanged.connect(self._controller.select_device)
 
@@ -569,6 +637,9 @@ class MainWindow(QMainWindow):
         self.sleep_button.clicked.connect(self._controller.enter_sleep)
         self.wake_button.clicked.connect(self._controller.wake)
         self.power_down_button.clicked.connect(self._controller.power_down)
+        self.battery_reset_button.clicked.connect(self._controller.reset_battery_cutoff)
+        self.nrf_rail_on_button.clicked.connect(lambda: self._controller.set_nrf_rail(True))
+        self.nrf_rail_off_button.clicked.connect(lambda: self._controller.set_nrf_rail(False))
         self.apply_channel_button.clicked.connect(self._set_channel)
         self.apply_power_button.clicked.connect(self._set_power)
         self.channel_spin.valueChanged.connect(lambda: self._mark_draft("channel"))
@@ -665,7 +736,33 @@ class MainWindow(QMainWindow):
             self.device_combo.setCurrentIndex(selected_index)
             self._controller.select_device(selected_index)
 
+    def _update_battery_cutoff_notice(self, snapshot: DeviceSnapshot) -> None:
+        t = snapshot.telemetry
+        if not t.battery_cutoff:
+            # A disconnect clears telemetry; it is not evidence of recovery.
+            if (snapshot.capabilities.supports_battery_percent and
+                    t.battery_state == "fresh" and t.power_good is True):
+                self._battery_cutoff_notified = False
+                if self._battery_cutoff_notice is not None:
+                    self._battery_cutoff_notice.close()
+                    self._battery_cutoff_notice = None
+            return
+        if self._battery_cutoff_notified:
+            return
+        self._battery_cutoff_notified = True
+        message = ("Battery cutoff has started. Turn the physical power switch OFF "
+                   "and connect a charged replacement battery or suitable power source. "
+                   "A voltage rebound or reboot does not reset the saved cutoff.")
+        self._append_log("warning", message)
+        notice = QMessageBox(QMessageBox.Icon.Warning, "Battery cutoff", message,
+                             QMessageBox.StandardButton.Ok, self)
+        notice.setModal(False)
+        notice.setWindowModality(Qt.WindowModality.NonModal)
+        self._battery_cutoff_notice = notice
+        notice.show()
+
     def _apply_snapshot(self, snapshot: DeviceSnapshot) -> None:
+        self._update_battery_cutoff_notice(snapshot)
         connected = snapshot.connection_state in {
             ConnectionState.CONNECTED,
             ConnectionState.BUSY,
@@ -691,16 +788,31 @@ class MainWindow(QMainWindow):
             and self._controller.selected_device is not None
             and self._controller.selected_device.transport in {"serial", "bluetooth"}
         )
-        controls_enabled = (connected and not busy and not snapshot.test_mode
+        rail_off = snapshot.telemetry.nrf_rail is False
+        controls_enabled = (connected and not busy and not snapshot.test_mode and not rail_off
                             and snapshot.confirmed_radio_state != RadioState.UNKNOWN
                             and self._pending_test_mode is None)
-        rf_ready = controls_enabled and snapshot.confirmed_radio_state in {RadioState.STANDBY, RadioState.RX_LISTENING}
+        bt=snapshot.telemetry
+        battery_ready=not snapshot.capabilities.supports_battery_percent or (
+            not bt.battery_cutoff and bt.battery_mv is not None and bt.battery_mv>=BATTERY_CUTOFF_MV
+            and bt.battery_age_ms is not None and bt.battery_age_ms<=10000
+            and bt.battery_state in {"fresh","held"})
+        rf_ready = controls_enabled and battery_ready and snapshot.confirmed_radio_state in {RadioState.STANDBY, RadioState.RX_LISTENING}
+
+        rail_controls = (connected and not busy and self._pending_test_mode is None
+                         and snapshot.capabilities.supports_board_power
+                         and snapshot.confirmed_radio_state != RadioState.RX_LISTENING)
+        self.nrf_rail_on_button.setEnabled(rail_controls and snapshot.telemetry.nrf_rail is False and not snapshot.telemetry.battery_cutoff)
+        self.nrf_rail_off_button.setEnabled(rail_controls and snapshot.telemetry.nrf_rail is True)
 
         self.connection_state_label.setText(snapshot.connection_state.value)
         self.connection_detail_label.setText(snapshot.connection_detail)
         selected_device = self._controller.selected_device
         identity = (f"{selected_device.name} [{selected_device.address}]" if selected_device else snapshot.profile)
-        self.setWindowTitle("RF3 Desktop" + (f" — {identity}" if identity else ""))
+        self.setWindowTitle(DISPLAY_NAME + (f" — {identity}" if identity else ""))
+        self.diagnostics_button.setEnabled(connected)
+        if not connected:
+            self.firmware_build_label.setText("Firmware build: read diagnostics to identify")
         self.requested_state_value.setText(snapshot.requested_radio_state.value)
         self.confirmed_state_value.setText(snapshot.confirmed_radio_state.value)
         self.channel_value.setText(str(snapshot.channel))
@@ -712,7 +824,53 @@ class MainWindow(QMainWindow):
         self.fault_value.setText(f"{fault}: {faults.get(fault, 'Radio error')}" if fault else "None")
 
         battery = snapshot.telemetry.battery_percent
-        self.battery_value.setText("not reported" if battery is None else f"{battery}%")
+        t=snapshot.telemetry
+        if battery is None:
+            self.battery_value.setText("waiting for quiet reading" if t.battery_state else "not reported")
+        elif t.battery_state:
+            self.battery_value.setText(f"~{battery}% (~{t.battery_remaining_mah or 0} mAh; voltage estimate)")
+        else:
+            self.battery_value.setText(f"{battery}%")
+        display_mv = t.battery_estimated_mv if t.battery_estimated_mv is not None else t.battery_mv
+        self.battery_voltage_value.setText("unavailable" if display_mv is None else f"{display_mv/1000:.2f} V (estimate)")
+        sensed = "unavailable" if t.battery_mv is None else f"{t.battery_mv/1000:.3f} V"
+        self.battery_voltage_value.setToolTip(
+            f"Sensed protection voltage: {sensed}. Cutoff: below {BATTERY_CUTOFF_MV/1000:.2f} V; "
+            f"explicit recovery: at least {BATTERY_RESET_MV/1000:.2f} V sensed. "
+            "The corrected display and charge gauge use the firmware estimate when provided.")
+        states={"unavailable":"Waiting for a valid sample", "settling":"Waiting for 2 s of radio quiet",
+                "startup":"Waiting through 10 s startup exclusion",
+                "averaging":"Collecting a 4 s quiet mean",
+                "fresh":"Quiet mean; monitoring 20.4 V sensed cutoff", "held":"Held during radio activity / settling",
+                "stale":"Stale reading; wait in Standby", "low_pending":"Below 20.4 V sensed; confirming five complete low means",
+                "sensor_error":"ADC unavailable/noisy; last pack reading shown", "cutoff":"CUTOFF LATCHED: shutdown requested"}
+        detail=states.get(t.battery_state,"not reported")
+        if t.battery_age_ms is not None:
+            detail+=f"; age {t.battery_age_ms/1000:.1f} s"
+        if t.battery_shutdown_pending:
+            detail+="; shutdown in progress, awaiting output confirmation"
+        if t.battery_cutoff and not t.battery_shutdown_pending and not t.battery_persisted:
+            detail+="; persistence write failed"
+        if t.battery_cutoff and not t.battery_shutdown_pending and t.power_good:
+            detail+="; ENABLE OUTPUT ERROR"
+        self.battery_status_value.setText(detail)
+        self.battery_reset_button.setEnabled(rail_controls and t.battery_cutoff and
+            t.battery_mv is not None and t.battery_mv>=BATTERY_RESET_MV and
+            t.battery_age_ms is not None and t.battery_age_ms<=10000)
+        telemetry = snapshot.telemetry
+        if telemetry.sense_mv is None:
+            self.sense_voltage_value.setText("unavailable" if snapshot.capabilities.supports_board_power else "not reported")
+        else:
+            quality = "calibrated" if telemetry.sense_calibrated else "estimated"
+            if telemetry.sense_noisy:
+                quality+=", noisy sample rejected"
+            if telemetry.sense_saturated:
+                quality += ", ADC saturated"
+            elif telemetry.sense_mv > 2450 or telemetry.sense_mv < 150:
+                quality += ", outside characterized range"
+            self.sense_voltage_value.setText(f"{telemetry.sense_mv / 1000:.3f} V ({quality})")
+        self.power_good_value.setText("not reported" if telemetry.power_good is None else "HIGH" if telemetry.power_good else "LOW")
+        self.nrf_rail_value.setText("not reported" if telemetry.nrf_rail is None else "ON (HIGH)" if telemetry.nrf_rail else "OFF (LOW)")
         self.selected_file_value.setText(snapshot.selected_file or "")
         self.active_tx_file_value.setText(snapshot.active_tx_file or "None reported")
         self.last_tx_value.setText("true" if snapshot.telemetry.last_tx_ok else "false")
@@ -760,9 +918,13 @@ class MainWindow(QMainWindow):
             for label in (self.channel_value, self.power_value, self.fault_value,
                           self.last_tx_value, self.test_tx_value, self.rx_value,
                           self.rx_saved_detail_value, self.rx_last_file_value,
-                          self.selected_file_value, self.active_tx_file_value,
-                          self.rx_transfer_value):
+                          self.selected_file_value, self.active_tx_file_value):
                 label.setText("Unavailable")
+        # Keep valid transfer metadata even while the radio register lock is busy.
+        # Unknown radio state continues to guard all disruptive RF controls.
+        incoming_available = connected and (telemetry_available or bool(snapshot.rx_transfer_id))
+        if not incoming_available:
+            self.rx_transfer_value.setText("Unavailable")
             self.rx_progress.setValue(0)
             self.rx_rate_value.setText("Unavailable")
             self._rx_rate_tracker.reset()
@@ -777,6 +939,12 @@ class MainWindow(QMainWindow):
         self.discover_button.setEnabled(not (connected or busy or connecting or searching))
         self.bluetooth_scan_button.setEnabled(not (connected or busy or connecting or searching))
         self.device_combo.setEnabled(not (connected or busy or connecting or searching))
+        self.file_mode_combo.setEnabled(connected and not busy and not snapshot.test_mode and snapshot.rx_transfer_state not in {"Receiving", "WaitingForEnd", "Verifying", "Publishing"})
+        no_ack = bool(self.file_mode_combo.currentData())
+        self.file_mode_hint.setText(
+            "Select No ACK on both boards. The receiver sends no replies; delivery is unconfirmed."
+            if no_ack else "ACK confirms delivery and retries missing packets."
+        )
         self.refresh_button.setEnabled(connected and not busy)
         self.stop_button.setEnabled((connected or busy) and not snapshot.test_mode and self._pending_test_mode is None)
         receiving = snapshot.rx_transfer_state in {"Receiving", "WaitingForEnd", "Verifying", "Publishing"}
@@ -784,12 +952,14 @@ class MainWindow(QMainWindow):
         self.stop_button.setToolTip("Cancel the incoming RF file" if receiving else "Stop the current RF operation")
         self.standby_button.setEnabled(controls_enabled)
         self.rx_button.setEnabled(rf_ready)
+        self.rx_button.setText("Receive (No ACK)" if no_ack else "Receive")
         self.sleep_button.setEnabled(rf_ready)
         self.wake_button.setEnabled(controls_enabled)
         self.power_down_button.setEnabled(controls_enabled)
         self.apply_channel_button.setEnabled(controls_enabled)
         self.apply_power_button.setEnabled(rf_ready)
-        self.transmit_button.setText("Upload && Verify" if snapshot.test_mode else "Transmit")
+        self.transmit_button.setText("Upload && Verify" if snapshot.test_mode else "Transmit (No ACK)" if no_ack else "Transmit")
+        self.storage_transmit_button.setText("Transmit Stored File (No ACK)" if no_ack else "Transmit Stored File")
         self.transmit_button.setToolTip(
             "Upload the actual file, read it back from ESP SPIFFS, and compare every byte. No nRF24 TX."
             if snapshot.test_mode else "Upload the file to ESP storage, then transmit it over nRF24."
@@ -801,6 +971,7 @@ class MainWindow(QMainWindow):
             and self._pending_test_mode is None
             and snapshot.capabilities.supports_host_file_upload
             and (not snapshot.test_mode or snapshot.capabilities.supports_host_file_download)
+            and (snapshot.test_mode or (not rail_off and battery_ready))
         )
         self.copy_rx_path_button.setEnabled(telemetry_available and bool(rx_path or rx_file))
         self.save_received_button.setEnabled(
@@ -819,7 +990,7 @@ class MainWindow(QMainWindow):
         text_enabled = connected and not busy and self._pending_test_mode is None and (
             snapshot.capabilities.supports_host_echo if snapshot.test_mode
             else snapshot.capabilities.supports_text_messages
-        ) and (snapshot.test_mode or snapshot.confirmed_radio_state in {RadioState.STANDBY, RadioState.RX_LISTENING})
+        ) and (snapshot.test_mode or (not rail_off and battery_ready and snapshot.confirmed_radio_state in {RadioState.STANDBY, RadioState.RX_LISTENING}))
         self.send_text_button.setText("Send to ESP" if snapshot.test_mode else "Send to Peer")
         if snapshot.test_mode:
             description = (

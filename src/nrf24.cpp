@@ -1,4 +1,5 @@
 #include "nrf24.hpp"
+#include "runtime_diagnostics.hpp"
 
 #include <array>
 
@@ -129,6 +130,13 @@ uint8_t Nrf24::readRpd()
     // The nRF24 Received Power Detector (RPD) latches when in RX mode and the
     // input exceeds the chip's coarse sensitivity threshold.
     return static_cast<uint8_t>(readReg(0x09) & 0x01);
+}
+
+bool Nrf24::disableAutoAck()
+{
+    writeReg(0x01, 0);
+    writeReg(0x04, 0);
+    return readReg(0x01) == 0 && readReg(0x04) == 0;
 }
 
 void Nrf24::readRegs(uint8_t reg, uint8_t* out, size_t len)
@@ -277,7 +285,7 @@ bool Nrf24::stopRx()
     return true;
 }
 
-bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
+bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs, bool allowRecovery)
 {
     if (!payload || len == 0 || len > 32) {
         return false;
@@ -285,6 +293,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
 
     auto attempt_transmit = [&](bool rearm_radio, bool hold_ce_until_done) {
         if (rearm_radio) {
+            RuntimeDiagnostics::global().tx_recoveries.add();
             const uint8_t channel = readReg(0x05);
 
             hal_.ce(false);
@@ -368,6 +377,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
             const uint8_t fifo_status = readReg(0x17);
 
             if (status & (1 << 5)) {
+                RuntimeDiagnostics::global().tx_ds.add();
                 last_tx_status_ = status;
                 last_tx_fifo_status_ = fifo_status;
                 last_tx_observe_ = readReg(0x08);
@@ -378,6 +388,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
             }
 
             if (status & (1 << 4)) {
+                RuntimeDiagnostics::global().tx_max_rt.add();
                 last_tx_status_ = status;
                 last_tx_fifo_status_ = fifo_status;
                 last_tx_observe_ = readReg(0x08);
@@ -395,6 +406,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
             if (!auto_ack_enabled &&
                 (hal_.nowUs() - start) >= 300 &&
                 (fifo_status & (1 << 4)) != 0) {
+                RuntimeDiagnostics::global().tx_fifo_only.add();
                 last_tx_status_ = status;
                 last_tx_fifo_status_ = fifo_status;
                 last_tx_observe_ = readReg(0x08);
@@ -413,6 +425,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
         last_tx_status_ = getStatus();
         last_tx_fifo_status_ = readReg(0x17);
         last_tx_observe_ = readReg(0x08);
+        RuntimeDiagnostics::global().tx_attempt_timeouts.add();
         last_tx_timed_out_ = true;
         hal_.ce(false);
         flushTx();
@@ -428,7 +441,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs)
     // Some clone modules and long-wire bench setups need a stronger re-prime
     // after cold start or a stalled first transmit. Re-apply the known packet
     // configuration and try once more before reporting failure to the app.
-    return attempt_transmit(true, true);
+    return allowRecovery && attempt_transmit(true, true);
 }
 
 bool Nrf24::readOnePacket(uint8_t* out, size_t capacity, size_t& outLen)

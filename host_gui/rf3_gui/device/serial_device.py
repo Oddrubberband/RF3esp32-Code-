@@ -12,13 +12,15 @@ import threading
 import tempfile
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO
 
 from PySide6.QtCore import QTimer, Signal
 
 from rf3_gui.app.state_model import (
+    BATTERY_CUTOFF_MV,
+    BATTERY_RESET_MV,
     ConnectionState,
     DEFAULT_CHANNEL,
     DeviceInfo,
@@ -97,6 +99,7 @@ class _UploadSession:
     remote_name: str
     data: bytes
     crc32: int
+    no_ack: bool = False
     verify_only: bool = False
     store_only: bool = False
     chunk_bytes: int = HOST_TRANSFER_CHUNK_BYTES
@@ -153,6 +156,7 @@ class SerialDeviceBackend(DeviceBackend):
         self._pending_commands: deque[str] = deque()
         self._command_deadlines: dict[str, float] = {}
         self._last_tx_id = ""
+        self._rf_tx_no_ack = False
         self._rf_tx_name: str | None = None
         self._rf_tx_baseline_id = ""
         self._rf_tx_id = ""
@@ -162,12 +166,15 @@ class SerialDeviceBackend(DeviceBackend):
         self._rx_cancel_requested = False
         self._handshake_ok = False
         self._identity_ok = False
+        self._diagnostics_supported = False
         self._hello_sent = False
         self._handshake_write_pending = False
         self._handshake_write_warning_shown = False
         self._last_test_tx_count = 0
         self._awaiting_test_tx_count: int | None = None
         self._awaiting_test_mode: bool | None = None
+        self._awaiting_nrf_rail: bool | None = None
+        self._awaiting_battery_reset = False
         self._awaiting_echo: str | None = None
         self._upload_session: _UploadSession | None = None
         self._download_session: _DownloadSession | None = None
@@ -224,6 +231,15 @@ class SerialDeviceBackend(DeviceBackend):
         self._test_mode_timer = QTimer(self)
         self._test_mode_timer.setSingleShot(True)
         self._test_mode_timer.timeout.connect(self._on_test_mode_timeout)
+        self._nrf_rail_timer = QTimer(self)
+        self._nrf_rail_timer.setSingleShot(True)
+        self._nrf_rail_timer.timeout.connect(lambda: self._on_read_failed(
+            "ESP did not confirm the nRF rail output; reconnect before retrying"))
+
+        self._battery_reset_timer = QTimer(self)
+        self._battery_reset_timer.setSingleShot(True)
+        self._battery_reset_timer.timeout.connect(lambda: self._on_read_failed(
+            "ESP did not confirm the battery cutoff reset; reconnect before retrying"))
 
         self._text_echo_timer = QTimer(self)
         self._text_echo_timer.setSingleShot(True)
@@ -366,6 +382,17 @@ class SerialDeviceBackend(DeviceBackend):
     def request_status(self) -> None:
         self._send_command(console_protocol.status_command())
 
+    def request_diagnostics(self) -> None:
+        # Read-only and useful during RF transfers, but never interleave with
+        # a host file/storage transaction or send an unknown command to old firmware.
+        if self._serial is None or not self._identity_ok or not self._diagnostics_supported:
+            self.command_finished.emit("DIAG", False, "Diagnostics require the RX Fix firmware on a connected board")
+            return
+        if self._upload_session is not None or self._download_session is not None or self._storage_kind is not None:
+            self.command_finished.emit("DIAG", False, "Wait for the PC file operation to finish")
+            return
+        self._send_command("DIAG")
+
     def _storage_allowed(self, command: str) -> bool:
         if not self._operation_allowed(command):
             return False
@@ -506,6 +533,16 @@ class SerialDeviceBackend(DeviceBackend):
         if any(not item.startswith("STATUS") for item in self._pending_commands):
             self.command_finished.emit(command, False, "Wait for the previous command acknowledgement")
             return False
+        t=self._snapshot.telemetry
+        if radio and self._snapshot.capabilities.supports_battery_percent and (
+                t.battery_cutoff or t.battery_mv is None or t.battery_mv<BATTERY_CUTOFF_MV
+                or t.battery_age_ms is None or t.battery_age_ms>10000
+                or t.battery_state not in {"fresh","held"}):
+            self.command_finished.emit(command,False,"Battery reading is not ready; use Standby and wait for a valid quiet sample or reset the cutoff")
+            return False
+        if radio and self._snapshot.telemetry.nrf_rail is False:
+            self.command_finished.emit(command, False, "Enable the nRF rail before RF operations")
+            return False
         if radio and self._snapshot.confirmed_radio_state not in {RadioState.STANDBY, RadioState.RX_LISTENING}:
             self.command_finished.emit(command, False,
                                        "Radio is not ready; check power/wiring and reinitialize the channel")
@@ -514,6 +551,9 @@ class SerialDeviceBackend(DeviceBackend):
 
     def _radio_command(self, command: str, requested: RadioState | None = None,
                        *, ready: bool = False) -> None:
+        if self._snapshot.telemetry.nrf_rail is False:
+            self.command_finished.emit(command, False, "Enable the nRF rail before RF operations")
+            return
         if not self._operation_allowed(command, radio=ready):
             return
         if requested is not None:
@@ -537,13 +577,60 @@ class SerialDeviceBackend(DeviceBackend):
             return
         self._radio_command(console_protocol.channel_command(channel), RadioState.STANDBY)
 
+    def reset_battery_cutoff(self) -> None:
+        if not self._operation_allowed("BATTERY RESET"):
+            return
+        t=self._snapshot.telemetry
+        if (not self._snapshot.capabilities.supports_battery_percent or not t.battery_cutoff
+                or t.battery_mv is None or t.battery_mv<BATTERY_RESET_MV
+                or t.battery_age_ms is None or t.battery_age_ms>10000):
+            self.command_finished.emit("BATTERY RESET",False,"A fresh quiet reading of at least 21 V is required")
+            return
+        self._awaiting_battery_reset=True
+        self._battery_reset_timer.start(STATUS_RESPONSE_TIMEOUT_MS)
+        self._snapshot=self._replace_snapshot(connection_state=ConnectionState.BUSY)
+        self.status_changed.emit(self._snapshot)
+        self._send_command("BATTERY RESET")
+        self.request_status()
+
+    def set_nrf_rail(self, enabled: bool) -> None:
+        # Additive RF3 UART/SPP output request; only STATUS confirms the level.
+        command = "NRFRAIL " + ("ON" if enabled else "OFF")
+        if not self._operation_allowed(command):
+            return
+        if (not self._snapshot.capabilities.supports_board_power
+                or self._snapshot.confirmed_radio_state == RadioState.RX_LISTENING):
+            self.command_finished.emit(command, False, "Use updated devboard firmware and stop radio activity first")
+            return
+        self._awaiting_nrf_rail = enabled
+        self._nrf_rail_timer.start(STATUS_RESPONSE_TIMEOUT_MS)
+        self._snapshot = self._replace_snapshot(connection_state=ConnectionState.BUSY)
+        self.status_changed.emit(self._snapshot)
+        self._send_command(command)
+        self.request_status()
+
     def set_power(self, level: int) -> None:
         if type(level) is not int or level not in (0, 1, 2, 3):
             self.command_finished.emit("POWER", False, "Power must be 0-3")
             return
         self._radio_command(console_protocol.power_command(level), ready=True)
 
+    def set_no_ack_mode(self, enabled: bool) -> bool:
+        if (self._snapshot.connection_state == ConnectionState.BUSY or self._incoming_rx_active()
+                or self._upload_session is not None or self._download_session is not None
+                or self._storage_kind is not None or self._rf_tx_name is not None):
+            self.command_finished.emit("MODE", False, "Stop the active operation before changing file mode")
+            return False
+        if enabled and not self._snapshot.capabilities.supports_no_ack_files:
+            self.command_finished.emit("MODE", False, "Flash matching firmware for no-ACK file mode")
+            return False
+        self._no_ack_selected = bool(enabled)
+        return True
+
     def enter_rx(self) -> None:
+        if self._no_ack_selected and not self._snapshot.capabilities.supports_no_ack_files:
+            self.command_finished.emit("RXNOACK", False, "Flash matching no-ACK firmware")
+            return
         # Receiving is already armed. Repeating this action must never reset an
         # in-progress file or its CRC/counters, even if a stale UI still offers it.
         other_operation = (self._upload_session is not None or self._download_session is not None
@@ -553,9 +640,9 @@ class SerialDeviceBackend(DeviceBackend):
         if (self._serial is not None and self._handshake_ok
                 and self._snapshot.confirmed_radio_state == RadioState.RX_LISTENING
                 and self._snapshot.connection_state in {ConnectionState.CONNECTED, ConnectionState.BUSY}
-                and not other_operation):
+                and not other_operation and self._snapshot.rx_no_ack == self._no_ack_selected):
             return
-        self._radio_command(console_protocol.rx_command(), RadioState.RX_LISTENING, ready=True)
+        self._radio_command("RXNOACK" if self._no_ack_selected else console_protocol.rx_command(), RadioState.RX_LISTENING, ready=True)
 
     def enter_standby(self) -> None:
         self._radio_command(console_protocol.standby_command(), RadioState.STANDBY)
@@ -597,8 +684,11 @@ class SerialDeviceBackend(DeviceBackend):
         if self._snapshot.test_mode:
             self.command_finished.emit("TXHEX", False, "Disable test mode before RF transmission")
             return
-        self._begin_rf_transfer(name)
-        self._send_command(console_protocol.stored_tx_command(name))
+        if self._no_ack_selected and not self._snapshot.capabilities.supports_no_ack_files:
+            self.command_finished.emit("TXNOACKHEX", False, "Flash matching no-ACK firmware")
+            return
+        self._begin_rf_transfer(name, no_ack=self._no_ack_selected)
+        self._send_command(console_protocol.stored_tx_command(name, no_ack=self._no_ack_selected))
 
     def _stored_action_allowed(self, command: str, name: str, *, radio: bool) -> bool:
         if not console_protocol.valid_storage_name(name):
@@ -618,7 +708,8 @@ class SerialDeviceBackend(DeviceBackend):
         return True
 
     def _begin_rf_transfer(self, name: str, *, source_path: Path | None = None,
-                           total_bytes: int = 0) -> None:
+                           total_bytes: int = 0, no_ack: bool = False) -> None:
+        self._rf_tx_no_ack = no_ack
         self._rf_tx_name = name
         self._rf_tx_baseline_id = self._last_tx_id
         self._rf_tx_id = ""
@@ -628,8 +719,9 @@ class SerialDeviceBackend(DeviceBackend):
                                                 requested_radio_state=RadioState.TX_BUSY)
         self.status_changed.emit(self._snapshot)
         self.transfer_changed.emit(TransferProgress(
-            state=TransferState.HANDSHAKING, total_bytes=total_bytes,
-            message=f"Starting RF transfer of SPIFFS file {name}; awaiting peer handshake",
+            state=TransferState.TRANSFERRING if no_ack else TransferState.HANDSHAKING, total_bytes=total_bytes,
+            message=(f"Sending {name} without ACK; delivery will be unconfirmed" if no_ack else
+                     f"Starting RF transfer of SPIFFS file {name}; awaiting peer handshake"),
             source_path=source_path))
         self._status_poll_timer.start()
 
@@ -660,6 +752,11 @@ class SerialDeviceBackend(DeviceBackend):
             self._start_upload(source_path, store_only=True)
 
     def _start_upload(self, source_path: Path, *, store_only: bool = False) -> None:
+        if self._no_ack_selected and not store_only and not self._snapshot.test_mode and not (
+                self._snapshot.capabilities.supports_no_ack_files
+                and self._snapshot.capabilities.supports_stored_file_tx):
+            self.command_finished.emit("UPLOAD", False, "Flash matching no-ACK firmware")
+            return
         if not self._operation_allowed("UPLOAD", radio=not (store_only or self._snapshot.test_mode)):
             return
         if self._awaiting_test_mode is not None or self._awaiting_echo is not None:
@@ -704,6 +801,7 @@ class SerialDeviceBackend(DeviceBackend):
             return
 
         self._upload_session = _UploadSession(
+            no_ack=self._no_ack_selected,
             source_path=source_path,
             remote_name=remote_name,
             data=data,
@@ -1284,12 +1382,16 @@ class SerialDeviceBackend(DeviceBackend):
                 ))
                 self._send_host_command(console_protocol.download_begin_command(session.remote_name, session.chunk_bytes))
                 return
+            if session.no_ack and not (self._snapshot.capabilities.supports_no_ack_files
+                                       and self._snapshot.capabilities.supports_stored_file_tx):
+                self._fail_host_transfer("No-ACK capability unavailable; no RF command sent", "UPLOAD")
+                return
             remote_name = session.remote_name
             source_path = session.source_path
             total = len(session.data)
             self._upload_session = None
             if self._snapshot.capabilities.supports_stored_file_tx:
-                command = console_protocol.stored_tx_command(remote_name)
+                command = console_protocol.stored_tx_command(remote_name, no_ack=session.no_ack)
             elif remote_name.upper() in {"LOOP", "STOP"}:
                 self._snapshot = self._replace_snapshot(connection_state=ConnectionState.CONNECTED,
                                                         requested_radio_state=self._snapshot.confirmed_radio_state)
@@ -1301,7 +1403,7 @@ class SerialDeviceBackend(DeviceBackend):
                 return
             else:
                 command = console_protocol.tx_command(remote_name)
-            self._begin_rf_transfer(remote_name, source_path=source_path, total_bytes=total)
+            self._begin_rf_transfer(remote_name, source_path=source_path, total_bytes=total, no_ack=session.no_ack)
             self._send_command(command)
             self._status_poll_timer.start()
 
@@ -1538,11 +1640,16 @@ class SerialDeviceBackend(DeviceBackend):
         had_test_tx = self._awaiting_test_tx_count is not None
         had_rf = self._rf_tx_name is not None
         had_host = self._upload_session is not None or self._download_session is not None
+        self._nrf_rail_timer.stop()
+        self._awaiting_nrf_rail = None
+        self._battery_reset_timer.stop()
+        self._awaiting_battery_reset = False
         self._setup_cancel.set()
         self._connection_generation += 1
         self._serial = None
         self._handshake_ok = False
         self._identity_ok = False
+        self._diagnostics_supported = False
         self._handshake_write_pending = False
         stop_event.set()
         for timer in (self._handshake_timer, self._setup_timer, self._handshake_status_timer,
@@ -1622,6 +1729,16 @@ class SerialDeviceBackend(DeviceBackend):
 
         self.log_event.emit("debug", f"RX <- {line}")
 
+        if line == "BATTERY SHUTOFF turn_physical_power_boot_switch_OFF_connect_charged_replacement_source":
+            # Shutdown has begun; only STATUS can confirm actual output levels.
+            self._snapshot = replace(self._snapshot,
+                capabilities=replace(self._snapshot.capabilities, supports_battery_percent=True),
+                telemetry=replace(self._snapshot.telemetry, battery_cutoff=True,
+                    battery_state="cutoff", battery_shutdown_pending=True,
+                    battery_percent=0, battery_remaining_mah=0))
+            self.status_changed.emit(self._snapshot)
+            return
+
         if self._handle_host_transfer_line(line):
             return
 
@@ -1632,6 +1749,9 @@ class SerialDeviceBackend(DeviceBackend):
                 self.log_event.emit("warning", f"Ignored malformed JSON status: {exc}")
                 return
             if isinstance(values, dict):
+                if values.get("type") == "diag":
+                    self._handle_diagnostics(values)
+                    return
                 if "storage" in values:
                     self._handle_storage_response(values["storage"])
                     return
@@ -1668,6 +1788,24 @@ class SerialDeviceBackend(DeviceBackend):
                 self._finish_pending(False, line, expected)
             else:
                 self._on_read_failed("Unscoped firmware error: " + line)
+
+    def _handle_diagnostics(self, values: dict[str, Any]) -> None:
+        if not self._identity_ok or "DIAG" not in self._pending_commands:
+            return
+        required_counts = ("tick_hz", "tx_ds", "tx_fifo_only", "tx_recoveries", "tx_attempt_timeouts",
+                           "ack_timeouts", "rejected_responses")
+        valid = (type(values.get("v")) is int and values["v"] == 1
+                 and isinstance(values.get("build"), str) and 0 < len(values["build"]) <= 64
+                 and isinstance(values.get("profile"), str)
+                 and values["profile"] in {"custom-pcb", "esp32-devboard"}
+                 and all(type(values.get(k)) is int and 0 <= values[k] <= 0xFFFFFFFF
+                         for k in required_counts))
+        if not valid:
+            self._finish_pending(False, "Invalid diagnostics response", "DIAG")
+            return
+        self.log_event.emit("info", "RF diagnostics: " + json.dumps(values, sort_keys=True))
+        self.diagnostics_received.emit(values)
+        self._finish_pending(True, "Diagnostics received", "DIAG")
 
     def _handle_host_transfer_line(self, line: str) -> bool:
         if line.startswith("UPLOAD ERROR"):
@@ -1813,11 +1951,74 @@ class SerialDeviceBackend(DeviceBackend):
 
         return line.startswith(("UPLOAD ", "DOWNLOAD "))
 
+    @staticmethod
+    def _board_power_fields(values: dict[str, Any]):
+        board_power = _status_enabled(values.get("board_power"))
+        def optional_output(key):
+            value = values.get(key)
+            if not board_power or value is None:
+                return None
+            if not isinstance(value, (bool, str)) or str(value).lower() not in {"true", "false"}:
+                raise ValueError(f"Invalid {key}")
+            return str(value).lower() == "true"
+
+        def optional_adc(key, maximum):
+            value = values.get(key)
+            if not board_power or value is None or value == -1:
+                return None
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+                raise ValueError(f"Invalid {key}")
+            return value
+
+        nrf_rail = optional_output("nrf_rail")
+        power_good = optional_output("power_good")
+        sense_mv = optional_adc("sense_mv", 5000)
+        sense_raw = optional_adc("sense_raw", 4095)
+        if sense_mv is None or sense_raw is None:
+            sense_mv = sense_raw = None
+        profile=board_power and values.get("battery_profile")=="soikon_6s_3300"
+        state=values.get("battery_state","") if profile else ""
+        if state not in {"","unavailable","startup","averaging","settling","fresh","held","stale","low_pending","sensor_error","cutoff"}:
+            raise ValueError("Invalid battery_state")
+        # Optional additive field: bad/missing values clear the estimate without
+        # discarding valid protection telemetry from older or newer firmware.
+        try:
+            estimated_mv = optional_adc("battery_estimated_mv", 35000) if profile else None
+        except ValueError:
+            estimated_mv = None
+        return board_power, dict(sense_mv=sense_mv, sense_raw=sense_raw,
+            battery_estimated_mv=estimated_mv,
+            battery_shutdown_pending=False,
+            battery_percent=optional_adc("battery_percent",100) if profile else None,
+            battery_mv=optional_adc("battery_mv",35000) if profile else None,
+            battery_remaining_mah=optional_adc("battery_remaining_mah",3300) if profile else None,
+            battery_age_ms=optional_adc("battery_age_ms",2147483647) if profile else None,
+            battery_state=state,
+            battery_cutoff=_status_enabled(values.get("battery_cutoff")) if profile else False,
+            battery_persisted=_status_enabled(values.get("battery_persisted")) if profile else False,
+            sense_noisy=board_power and _status_enabled(values.get("sense_noisy")),
+            sense_calibrated=board_power and _status_enabled(values.get("sense_calibrated")),
+            sense_saturated=board_power and _status_enabled(values.get("sense_saturated")),
+            power_good=power_good, nrf_rail=nrf_rail)
+
+    def _confirm_nrf_rail(self, fields):
+        if (self._awaiting_battery_reset and fields["battery_state"]=="fresh"
+                and not fields["battery_cutoff"] and fields["power_good"] is True):
+            self._awaiting_battery_reset=False
+            self._battery_reset_timer.stop()
+            self._finish_pending(True,"Battery cutoff reset confirmed by STATUS","BATTERY")
+        if self._awaiting_nrf_rail is not None and fields["nrf_rail"] == self._awaiting_nrf_rail:
+            self._awaiting_nrf_rail = None
+            self._nrf_rail_timer.stop()
+            self._finish_pending(True, "nRF rail output confirmed by STATUS", "NRFRAIL")
+
     def _apply_status(self, values: dict[str, Any]) -> None:
         state = _radio_state_from_text(str(values.get("State") or values.get("state") or "Unknown"))
         if self._serial is not None and self._identity_ok and values.get("state") == "Unavailable":
             # A verified RF3 host response can remain usable while another
             # operation holds the radio mutex. Never present a stale radio state.
+            board_power, board_fields = self._board_power_fields(values)
+            self._confirm_nrf_rail(board_fields)
             rx_fields = self._rx_status_fields(values)
             self._status_response_timer.stop()
             self._finish_pending(True, "RF3 connected; radio status unavailable", "STATUS")
@@ -1826,6 +2027,9 @@ class SerialDeviceBackend(DeviceBackend):
                 power_level=None,
                 connection_state=(ConnectionState.BUSY if self._local_operation_active(include_rx=False)
                                   or rx_fields["rx_transfer_state"] in RX_ACTIVE_STATES else ConnectionState.CONNECTED),
+                telemetry=replace(self._snapshot.telemetry, **board_fields),
+                capabilities=replace(self._snapshot.capabilities, supports_board_power=board_power,
+                                     supports_battery_percent=bool(board_fields["battery_state"])),
                 connection_detail="RF3 connected; radio status temporarily unavailable. Other readings are last reported.",
                 **rx_fields,
             )
@@ -1844,6 +2048,8 @@ class SerialDeviceBackend(DeviceBackend):
                 if isinstance(raw, bool) or not isinstance(raw, (int, str)):
                     raise ValueError(f"Invalid {key}")
                 int(raw)
+        board_power, board_fields = self._board_power_fields(values)
+        self._confirm_nrf_rail(board_fields)
         rx_fields = self._rx_status_fields(values)
         confirmed_test_request = (self._awaiting_test_mode is not None and "test_mode" in values
                                   and self._awaiting_test_mode == _status_enabled(values["test_mode"]))
@@ -1864,7 +2070,7 @@ class SerialDeviceBackend(DeviceBackend):
         if self._local_operation_active(include_rx=False):
             connection_state = ConnectionState.BUSY
         telemetry = Telemetry(
-            battery_percent=None,
+            **board_fields,
             last_fault=int(values.get("fault", values.get("last_fault", 0)) or 0),
             last_tx_ok=_status_enabled(values.get("tx_ok")),
             tx_timeout=_status_enabled(values.get("tx_timeout")),
@@ -1878,7 +2084,8 @@ class SerialDeviceBackend(DeviceBackend):
         capabilities = RadioCapabilities(
             host_chunk_max=_negotiated_host_chunk(values.get("host_chunk_max")),
             supports_host_storage=_status_enabled(values.get("host_storage")),
-            supports_battery_percent=False,
+            supports_battery_percent=bool(board_fields["battery_state"]),
+            supports_board_power=board_power,
             supports_host_file_upload=_status_enabled(values.get("host_upload")),
             supports_host_file_download=_status_enabled(values.get("host_download")),
             supports_host_chunk_retry=_status_enabled(values.get("host_retry")),
@@ -1887,6 +2094,7 @@ class SerialDeviceBackend(DeviceBackend):
             supports_host_echo=_status_enabled(values.get("host_echo")),
             supports_test_mode=_status_enabled(values.get("test_mode_supported")),
             supports_stored_file_tx=_status_enabled(values.get("host_stored_tx")),
+            supports_no_ack_files=_status_enabled(values.get("no_ack_files")),
         )
         power = values.get("power")
         power_level = power if type(power) is int and power in (0, 1, 2, 3) else None
@@ -1907,6 +2115,7 @@ class SerialDeviceBackend(DeviceBackend):
             test_tx_count=int(values.get("test_tx_count", 0) or 0),
             test_tx_bytes=int(values.get("test_tx_bytes", 0) or 0),
             confirmed_radio_state=state,
+            rx_no_ack=_status_enabled(values.get("rx_no_ack", self._snapshot.rx_no_ack)),
             channel=channel if type(channel) is int and 0 <= channel <= 125 else self._snapshot.channel,
             power_level=power_level,
             selected_file=values.get("selected", self._snapshot.selected_file),
@@ -1950,6 +2159,7 @@ class SerialDeviceBackend(DeviceBackend):
             self.log_event.emit("warning", "Ignored unsupported or incomplete RF3 identity")
             return
         self._identity_ok = True
+        self._diagnostics_supported = values.get("diagnostics") is True
         if self._handshake_ok:
             return
         self._handshake_ok = True
@@ -1992,6 +2202,7 @@ class SerialDeviceBackend(DeviceBackend):
         return bool(self._upload_session is not None or self._download_session is not None
                     or self._storage_kind is not None or self._awaiting_echo is not None
                     or self._awaiting_test_mode is not None or self._rf_tx_name is not None
+                    or self._awaiting_nrf_rail is not None or self._awaiting_battery_reset
                     or (include_rx and self._incoming_rx_active()))
 
     def _rx_status_fields(self, values: dict[str, Any]) -> dict[str, Any]:
@@ -2091,7 +2302,7 @@ class SerialDeviceBackend(DeviceBackend):
                 # STATUS queued before TX may describe the previous transfer.
                 if tx_id == self._rf_tx_baseline_id or tx_state == "Idle":
                     return
-                if tx_file != self._rf_tx_name and tx_state in {"Completed", "Failed", "Cancelled"}:
+                if tx_file != self._rf_tx_name and tx_state in {"Completed", "SentUnconfirmed", "Failed", "Cancelled"}:
                     return  # Delayed previous-transfer terminal snapshot.
                 if tx_file != self._rf_tx_name:
                     self._finish_rf_transfer(TransferState.FAILED,
@@ -2110,6 +2321,11 @@ class SerialDeviceBackend(DeviceBackend):
                 self._finish_rf_transfer(TransferState.FAILED, "Invalid RF progress metadata; delivery is unconfirmed")
             return
         sent, total = parsed
+        if (self._rf_tx_name is not None
+                and (values.get("tx_no_ack") is True) != self._rf_tx_no_ack):
+            self._finish_rf_transfer(TransferState.FAILED,
+                                     "ESP transfer mode differs from the requested file mode")
+            return
         transfer_state = {
             "Preparing": TransferState.PREPARING,
             "WaitingForReady": TransferState.HANDSHAKING,
@@ -2117,6 +2333,7 @@ class SerialDeviceBackend(DeviceBackend):
             "WaitingForDataAck": TransferState.TRANSFERRING,
             "WaitingForComplete": TransferState.VERIFYING,
             "Completed": TransferState.COMPLETED,
+            "SentUnconfirmed": TransferState.SENT_UNCONFIRMED,
             "Cancelling": TransferState.CANCELLING,
             "Cancelled": TransferState.CANCELLED,
             "Failed": TransferState.FAILED,
@@ -2126,8 +2343,17 @@ class SerialDeviceBackend(DeviceBackend):
                 self._finish_rf_transfer(TransferState.FAILED, "Unknown RF state; delivery is unconfirmed")
             return
         error = _status_text(values.get("tx_error"))
+        if tx_state == "SentUnconfirmed":
+            if (values.get("tx_no_ack") is not True or values.get("peer_complete") is not False
+                    or sent != total or (error and error.lower() not in {"none", "0"})
+                    or (self._rf_tx_name is not None and not self._rf_tx_no_ack)):
+                transfer_state = TransferState.FAILED
+                error = "Invalid no-ACK terminal metadata; delivery is unconfirmed"
         if tx_state == "Completed":
-            if values.get("peer_complete") is not True:
+            if values.get("tx_no_ack") is True:
+                transfer_state = TransferState.FAILED
+                error = "No-ACK transfer cannot claim peer-confirmed completion"
+            elif values.get("peer_complete") is not True:
                 transfer_state = TransferState.FAILED
                 error = "ESP completed locally but peer delivery was not confirmed"
             elif sent != total or (error and error.lower() not in {"none", "0"}):
@@ -2138,7 +2364,9 @@ class SerialDeviceBackend(DeviceBackend):
             message += ": " + error
         if transfer_state == TransferState.COMPLETED:
             message += "; peer confirmed CRC/complete"
-        if transfer_state in {TransferState.COMPLETED, TransferState.FAILED, TransferState.CANCELLED}:
+        elif transfer_state == TransferState.SENT_UNCONFIRMED:
+            message += "; sent locally without ACK; receiver delivery is unconfirmed"
+        if transfer_state in {TransferState.COMPLETED, TransferState.SENT_UNCONFIRMED, TransferState.FAILED, TransferState.CANCELLED}:
             if self._rf_tx_name is not None:
                 self._finish_rf_transfer(transfer_state, message, sent, total)
             elif tx_id and tx_id == self._observed_rf_id:
@@ -2155,6 +2383,24 @@ class SerialDeviceBackend(DeviceBackend):
                                                     total_bytes=total, message=message))
 
     def _apply_known_response(self, line: str) -> bool:
+        if line.startswith("BATTERY OK "):
+            self.request_status()
+            return True
+        if line.startswith("BATTERY ERROR"):
+            self._awaiting_battery_reset=False
+            self._battery_reset_timer.stop()
+            self._finish_pending(False,line,"BATTERY")
+            self.request_status()
+            return True
+        if line.startswith("NRFRAIL OK "):
+            self.request_status()
+            return True # Acceptance alone does not confirm the output level.
+        if line.startswith("NRFRAIL ERROR"):
+            self._awaiting_nrf_rail = None
+            self._nrf_rail_timer.stop()
+            self._finish_pending(False, line, "NRFRAIL")
+            self.request_status()
+            return True
         if line.startswith("ECHO TEXT: "):
             if self._awaiting_echo is not None:
                 if line[len("ECHO TEXT: "):] != self._awaiting_echo:
@@ -2177,7 +2423,7 @@ class SerialDeviceBackend(DeviceBackend):
             self._finish_pending(True, line, "TESTTX")
             self.request_status()
             return True
-        if line == "OK STATUS":
+        if line in {"OK STATUS", "OK DIAG"}:
             return True  # Acceptance is not usable telemetry; keep the original deadline.
         if line.startswith("OK "):
             command = line[3:]
@@ -2316,7 +2562,7 @@ class SerialDeviceBackend(DeviceBackend):
             if accepted and name is not None:
                 self._snapshot = self._replace_snapshot(selected_file=name)
                 self.status_changed.emit(self._snapshot)
-        if command.startswith(("TX ", "TXHEX ")) and not accepted and self._rf_tx_name is not None:
+        if command.startswith(("TX ", "TXHEX ", "TXNOACKHEX ")) and not accepted and self._rf_tx_name is not None:
             self._finish_rf_transfer(TransferState.FAILED, message)
         is_host_command = command.startswith(("UPLOAD ", "DOWNLOAD "))
         if is_host_command:
@@ -2324,6 +2570,12 @@ class SerialDeviceBackend(DeviceBackend):
         self._host_command_finished(command, accepted, message)
         if not is_host_command:
             self.command_finished.emit(command, accepted, message)
+        if command.startswith("BATTERY") and not accepted:
+            self._awaiting_battery_reset=False
+            self._battery_reset_timer.stop()
+        if command.startswith("NRFRAIL") and not accepted:
+            self._awaiting_nrf_rail = None
+            self._nrf_rail_timer.stop()
         if command.startswith("TESTMODE") and not accepted:
             self._awaiting_test_mode = None
             self._test_mode_timer.stop()
@@ -2337,6 +2589,7 @@ class SerialDeviceBackend(DeviceBackend):
 
     def _replace_snapshot(self, **changes) -> DeviceSnapshot:
         values = {
+            "rx_no_ack": self._snapshot.rx_no_ack,
             "connection_state": self._snapshot.connection_state,
             "connection_detail": self._snapshot.connection_detail,
             "test_mode": self._snapshot.test_mode,

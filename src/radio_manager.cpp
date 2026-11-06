@@ -76,7 +76,6 @@ void RadioManager::refreshSnapshot()
 bool RadioManager::enterRx()
 {
     status_.last_rx_len = 0;
-    status_.rx_packets = 0;
     status_.carrier_detected = false;
 
     if (radio_.startRx()) {
@@ -113,13 +112,13 @@ bool RadioManager::hasPendingRx()
            (status_.last_fifo_status & 0x01) == 0;
 }
 
-bool RadioManager::sendPayload(const uint8_t* payload, size_t len)
+bool RadioManager::sendPayload(const uint8_t* payload, size_t len, bool allowRecovery)
 {
     // Expose one-shot transmit (TX) as a simple state change plus the last
     // success/failure snapshot.
     status_.state = RadioState::TxBusy;
 
-    if (radio_.transmitOnce(payload, len)) {
+    if (radio_.transmitOnce(payload, len, 60000, allowRecovery)) {
         status_.last_tx_ok = true;
         status_.last_tx_timed_out = false;
         status_.last_tx_saw_irq = radio_.lastTxSawIrq();

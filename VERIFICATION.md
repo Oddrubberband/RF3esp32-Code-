@@ -1,3 +1,3 @@
 # Verification
 
-See [current verification](docs/verification/current_verification.md) and the comprehensive [change and verification note](CHANGELOG.md).
+See [current verification](docs/verification/current_verification.md) for the current software checks, release CI and physical limits.

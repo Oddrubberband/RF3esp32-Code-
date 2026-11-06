@@ -48,7 +48,16 @@ public:
     // Return a microsecond timer suitable for timeout loops.
     uint64_t nowUs() override;
 
+    // External rail sequencing: quiesce CE/SPI outputs before removing power.
+    bool setSignalOutputsEnabled(bool enabled);
+    // Caller holds radio mutex; CE transitions cover TX/RX/CW settling.
+    bool ceAsserted() const { return ce_asserted_; }
+    uint64_t lastRadioActivityMs() const { return last_ce_activity_ms_; }
+
 private:
     Esp32Nrf24Config config_{};
+    bool signal_outputs_enabled_ = true;
+    bool ce_asserted_ = false;
+    uint64_t last_ce_activity_ms_ = 0;
     spi_device_handle_t spi_ = nullptr;  // ESP-IDF handle for the attached radio device.
 };

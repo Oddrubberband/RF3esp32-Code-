@@ -16,6 +16,13 @@ class DeviceBackend(QObject):
     log_event = Signal(str, str)
     text_message_received = Signal(str, str)
     storage_changed = Signal(object)
+    diagnostics_received = Signal(object)
+
+    _no_ack_selected = False
+
+    def set_no_ack_mode(self, enabled: bool) -> bool:
+        self._no_ack_selected = bool(enabled)
+        return True
 
     def discover(self) -> None:
         raise NotImplementedError
@@ -34,6 +41,9 @@ class DeviceBackend(QObject):
 
     def request_status(self) -> None:
         raise NotImplementedError
+
+    def request_diagnostics(self) -> None:
+        self.command_finished.emit("DIAG", False, "Diagnostics require the RX Fix firmware on a connected board")
 
     def refresh_storage(self) -> None:
         raise NotImplementedError
@@ -58,6 +68,12 @@ class DeviceBackend(QObject):
 
     def set_channel(self, channel: int) -> None:
         raise NotImplementedError
+
+    def reset_battery_cutoff(self) -> None:
+        self.command_finished.emit("BATTERY RESET",False,"Battery cutoff control is not supported")
+
+    def set_nrf_rail(self, enabled: bool) -> None:
+        self.command_finished.emit("NRFRAIL", False, "Board rail control is not supported")
 
     def set_power(self, level: int) -> None:
         raise NotImplementedError

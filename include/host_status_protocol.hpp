@@ -7,11 +7,12 @@
 #include <string_view>
 
 #include "host_connection_protocol.hpp"
+#include "devboard_power.hpp"
 
 // The same complete status contract is serialized for USB and Classic SPP.
 // No live hardware or task primitives are used by this wire-format helper.
 namespace HostStatusProtocol {
-constexpr size_t kMaxResponseBytes = 1534;  // CRLF occupies the other two bytes.
+constexpr size_t kMaxResponseBytes = 2046;  // CRLF occupies the other two bytes.
 struct Transfer {
     const char* state_name = "Idle";
     const char* error_name = "none";
@@ -24,6 +25,7 @@ struct Transfer {
     uint32_t retries = 0;
     uint32_t crc32 = 0;
     bool peer_complete = false;
+    bool no_ack = false;
 };
 struct Snapshot {
     const char* node_name = "";
@@ -42,6 +44,7 @@ struct Snapshot {
     uint32_t test_tx_bytes = 0;
     bool tx_timeout = false;
     bool rx_pending = false;
+    bool rx_no_ack = false;
     bool rpd = false;
     uint32_t rx_packets = 0;
     uint32_t rx_stream = 0;
@@ -56,6 +59,13 @@ struct Snapshot {
     bool filesystem_ready = false;
     bool test_mode_supported = false;
     unsigned host_chunk_max = 64;
+    // Additive RF3 UART / Bluetooth SIG SPP board telemetry. Millivolts are
+    // measured at the ADC pin plus estimated 6S capacity; RF Protocol v2 is unchanged.
+    bool board_power = false;
+    DevboardPower::Reading sense;
+    BatteryMonitor::Snapshot battery;
+    bool power_good = false;
+    bool nrf_rail = false;
     Transfer tx;
     Transfer rx;
 };
@@ -68,7 +78,7 @@ inline std::string hex32(uint32_t value)
 inline std::string json(const Snapshot& s)
 {
     std::string out;
-    out.reserve(1400);
+    out.reserve(kMaxResponseBytes);
     out.push_back('{');
     bool first = true;
     const auto key = [&](std::string_view name) {
@@ -140,7 +150,29 @@ inline std::string json(const Snapshot& s)
     text("tx_file", s.tx.file_name);
     number("tx_retries", s.tx.retries);
     boolean("peer_complete", s.tx.peer_complete);
+    boolean("tx_no_ack", s.tx.no_ack);
+    boolean("rx_no_ack", s.rx_no_ack);
+    boolean("no_ack_files", true);
     transfer("rx", s.rx);
+    if (s.board_power) {
+        enabled("board_power", true);
+        number("sense_raw", s.sense.raw);
+        number("sense_mv", s.sense.millivolts);
+        boolean("sense_calibrated", s.sense.calibrated);
+        boolean("sense_saturated", s.sense.saturated);
+        boolean("sense_noisy", s.sense.noisy);
+        boolean("power_good", s.power_good);
+        boolean("nrf_rail", s.nrf_rail);
+        text("battery_profile","soikon_6s_3300");
+        number("battery_mv",s.battery.pack_mv);
+        number("battery_estimated_mv",s.battery.estimated_mv);
+        number("battery_percent",s.battery.percent);
+        number("battery_remaining_mah",s.battery.remaining_mah);
+        number("battery_age_ms",s.battery.age_ms);
+        text("battery_state",s.battery.state);
+        boolean("battery_cutoff",s.battery.cutoff);
+        boolean("battery_persisted",s.battery.persisted);
+    }
     out.push_back('}');
     // Overflow is a failed snapshot, never a truncated JSON success. The native
     // worst-case contract test must continue to fit before new fields are added.
