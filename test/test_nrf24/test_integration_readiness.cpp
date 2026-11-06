@@ -163,7 +163,7 @@ void test_diagnostic_totals_saturate_and_json_stays_bounded()
     TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, d.storage_write.max_us.value());
     const auto json = RuntimeDiagnostics::json(d, "esp32-devboard", 1000);
     TEST_ASSERT_TRUE(json.size() < RuntimeDiagnostics::kJsonCapacity);
-    TEST_ASSERT_TRUE(json.find("\"build\":\"RX-FIX-R1-20261102\"") != std::string::npos);
+    TEST_ASSERT_TRUE(json.find("\"build\":\"RF3-BAT-R1-20261105\"") != std::string::npos);
     TEST_ASSERT_TRUE(json.find("\"tx_ds\":4294967295") != std::string::npos);
     TEST_ASSERT_TRUE(json.find("\"type\":\"diag\"") != std::string::npos);
     const auto hello = HostConnectionProtocol::hello("rf3-pcb", "custom-pcb", 2, true, RuntimeDiagnostics::kBuild);
