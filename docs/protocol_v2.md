@@ -1,7 +1,7 @@
-## Battery update RF3-BAT-R1-20261105
+## Battery checks during file transfer
 
-The RF frame format, CRC, retry and resume rules remain unchanged. A long-running
-devboard file TX or listening RX can pause for a battery measurement, bounded to
+The RF frame format, CRC, retry and resume rules remain unchanged. On either
+battery-enabled profile, file TX or listening RX can pause for a measurement, bounded to
 7.5 seconds per attempt. Reliable mode retains existing retry/resume handling.
 Cutoff cancels the local sender without attempting another radio message and
 discards unfinished receive work. Matching updated peers are recommended.

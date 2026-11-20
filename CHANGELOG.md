@@ -1,5 +1,10 @@
 # Changes in RF3-BAT-R1-20261105
 
+## 20 November 2026 — custom PCB R4 and USB devboard R3
+
+[Read all 11 fixes in plain language](FIRMWARE_FIXES.md). This release also brings the stable desktop’s Bluetooth connection and Stop-reporting improvements, automatic front-end control on both board profiles and battery protection on the old custom PCB. The USB devboard uses independently powered radio hardware. [Board guide](START_HERE.md)
+
+
 - Merge the supplied devboard GPIO34 sensing, GPIO15 battery enable and GPIO21
   radio rail controls with the local RX Fix R1 code. Preserve separate board
   profiles, diagnostics, 1 kHz scheduler, nonzero Bluetooth waits and RX counts.

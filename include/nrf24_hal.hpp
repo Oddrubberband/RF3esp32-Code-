@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+enum class FrontEndMode { Off, Rx, Tx };
+
 // Nrf24Hal is the portability seam between the driver and the host platform.
 //
 // The nRF24 driver only needs four services: Serial Peripheral Interface (SPI)
@@ -24,4 +26,6 @@ struct Nrf24Hal {
     virtual void delayUs(uint32_t us) = 0;
     // Return a microsecond-resolution timer for timeout loops.
     virtual uint64_t nowUs() = 0;
+    // Optional external FEM. The driver selects direction before asserting CE.
+    virtual void frontEnd(FrontEndMode) {}
 };

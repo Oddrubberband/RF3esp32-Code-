@@ -32,6 +32,13 @@ int main(int argc,char** argv){
         assert(std::string(transferReportStateName(report))=="SentUnconfirmed");
         assert(tx.manager_.enter_count==0 && tx.manager_.ack_disable_calls==1);
         assert(tx.manager_.sent_frames.size()==ProtocolV2::packetCountForSize(length)+2);
+        // A Stop arriving before the first packet still retains No ACK in
+        // the terminal report consumed by STATUS.
+        DemoConsoleApp cancelled;cancelled.manager_.value.state=RadioState::Standby;
+        auto cancelled_report=report;std::atomic_bool cancel_now{true};
+        assert(!sendDataFileNoAck(cancelled.manager_,buildFilePath(name).c_str(),&cancel_now,&cancelled_report));
+        assert(cancelled_report.no_ack && cancelled_report.state==ReliableTransferV2::SenderState::Cancelled);
+
         DemoConsoleApp rx;rx.rx_no_ack_mode_=true;rx.manager_.send_success=true;rx.manager_.value.state=RadioState::RxListening;
         for(const auto& frame:tx.manager_.sent_frames)rx.processRxPayload(frame.data(),frame.size());
         assert(rx.manager_.send_attempts==0 && rx.receiver_.complete() && rx.saved_rx_file_count_==1);

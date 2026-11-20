@@ -5,7 +5,7 @@
 # firmware project.
 cmake_minimum_required(VERSION 3.16.0)
 # Identify this local candidate rather than inheriting a parent checkout tag.
-set(PROJECT_VER "RF3-BAT-R1-20261105")
+set(PROJECT_VER "RF3-CBT-R4-20261119")
 # Treat src/ as an extra component directory so its own CMake build list
 # (CMakeLists) can register the firmware sources and dependencies.
 set(EXTRA_COMPONENT_DIRS src)

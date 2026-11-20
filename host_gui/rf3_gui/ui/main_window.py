@@ -340,7 +340,9 @@ class MainWindow(QMainWindow):
         self.battery_status_value.setWordWrap(True)
         self.sense_voltage_value = QLabel("not reported")
         self.sense_voltage_value.setWordWrap(True)
-        self.sense_voltage_value.setToolTip("GPIO34 cached quiet-sample voltage. Pack estimate uses the chart's assumed 9:1 divider; held during RF activity.")
+        self.sense_voltage_value.setToolTip(
+            "GPIO34 voltage from the most recent quiet reading. Firmware converts it to pack voltage using "
+            "the measured calibration table. The reading is held during RF activity.")
         self.power_good_value = QLabel("not reported")
         self.power_good_value.setToolTip("GPIO15 battery-control output: HIGH unless sustained pack undervoltage latches it LOW. Reset only after a fresh quiet reading >=21 V.")
         self.nrf_rail_value = QLabel("not reported")
@@ -398,7 +400,9 @@ class MainWindow(QMainWindow):
         rail_row.addWidget(self.nrf_rail_off_button)
         layout.addLayout(rail_row)
         self.battery_reset_button=QPushButton("Reset Battery Cutoff")
-        self.battery_reset_button.setToolTip("After charging/replacing the battery, use USB power and wait for a fresh quiet reading >=21 V. The nRF rail stays OFF.")
+        self.battery_reset_button.setToolTip(
+            "After charging or replacing the battery, use USB power and wait for a fresh quiet reading of at least 21 V. "
+            "Devboards require a separate nRF rail enable after reset. The old custom PCB restores radio access during reset.")
         layout.addWidget(self.battery_reset_button)
 
         channel_row = QHBoxLayout()
@@ -421,6 +425,15 @@ class MainWindow(QMainWindow):
         power_row.addWidget(self.power_combo)
         power_row.addWidget(self.apply_power_button)
         layout.addLayout(power_row)
+
+        self.fem_antenna_row = QWidget()
+        antenna_row = QHBoxLayout(self.fem_antenna_row)
+        antenna_row.setContentsMargins(0, 0, 0, 0)
+        self.fem_antenna_label = QLabel()
+        self.fem_antenna_button = QPushButton()
+        antenna_row.addWidget(self.fem_antenna_label)
+        antenna_row.addWidget(self.fem_antenna_button)
+        layout.addWidget(self.fem_antenna_row)
 
         file_mode_row = QHBoxLayout()
         self.file_mode_combo = QComboBox()
@@ -642,6 +655,8 @@ class MainWindow(QMainWindow):
         self.nrf_rail_off_button.clicked.connect(lambda: self._controller.set_nrf_rail(False))
         self.apply_channel_button.clicked.connect(self._set_channel)
         self.apply_power_button.clicked.connect(self._set_power)
+        self.fem_antenna_button.clicked.connect(
+            lambda: self._controller.set_fem_antenna(self.fem_antenna_button.property("antenna")))
         self.channel_spin.valueChanged.connect(lambda: self._mark_draft("channel"))
         self.cw_channel_spin.valueChanged.connect(lambda: self._mark_draft("cw_channel"))
         self.power_combo.currentIndexChanged.connect(lambda: self._mark_draft("power"))
@@ -768,6 +783,8 @@ class MainWindow(QMainWindow):
             ConnectionState.BUSY,
         }
         busy = snapshot.connection_state == ConnectionState.BUSY
+        self.channel_spin.setMaximum(snapshot.capabilities.max_channel)
+        self.cw_channel_spin.setMaximum(snapshot.capabilities.max_channel)
         if connected != self._was_connected:
             self._connection_epoch += 1
             self._was_connected = connected
@@ -788,7 +805,7 @@ class MainWindow(QMainWindow):
             and self._controller.selected_device is not None
             and self._controller.selected_device.transport in {"serial", "bluetooth"}
         )
-        rail_off = snapshot.telemetry.nrf_rail is False
+        rail_off = snapshot.telemetry.nrf_rail is False or snapshot.telemetry.battery_cutoff
         controls_enabled = (connected and not busy and not snapshot.test_mode and not rail_off
                             and snapshot.confirmed_radio_state != RadioState.UNKNOWN
                             and self._pending_test_mode is None)
@@ -798,12 +815,21 @@ class MainWindow(QMainWindow):
             and bt.battery_age_ms is not None and bt.battery_age_ms<=10000
             and bt.battery_state in {"fresh","held"})
         rf_ready = controls_enabled and battery_ready and snapshot.confirmed_radio_state in {RadioState.STANDBY, RadioState.RX_LISTENING}
+        antenna = snapshot.fem_antenna
+        self.fem_antenna_row.setVisible(connected and antenna in (1, 2))
+        if antenna in (1, 2):
+            other = 3 - antenna
+            ports = {1: "J1", 2: "J5"}
+            self.fem_antenna_label.setText(f"FEM antenna: ANT{antenna} ({ports[antenna]})")
+            self.fem_antenna_button.setText(f"Select ANT{other} ({ports[other]})")
+            self.fem_antenna_button.setProperty("antenna", other)
+            self.fem_antenna_button.setEnabled(controls_enabled and snapshot.confirmed_radio_state == RadioState.STANDBY)
 
-        rail_controls = (connected and not busy and self._pending_test_mode is None
-                         and snapshot.capabilities.supports_board_power
-                         and snapshot.confirmed_radio_state != RadioState.RX_LISTENING)
-        self.nrf_rail_on_button.setEnabled(rail_controls and snapshot.telemetry.nrf_rail is False and not snapshot.telemetry.battery_cutoff)
-        self.nrf_rail_off_button.setEnabled(rail_controls and snapshot.telemetry.nrf_rail is True)
+        board_power_controls = (connected and not busy and self._pending_test_mode is None
+                                and snapshot.capabilities.supports_board_power
+                                and snapshot.confirmed_radio_state != RadioState.RX_LISTENING)
+        self.nrf_rail_on_button.setEnabled(board_power_controls and bt.nrf_rail is False and not bt.battery_cutoff)
+        self.nrf_rail_off_button.setEnabled(board_power_controls and bt.nrf_rail is True)
 
         self.connection_state_label.setText(snapshot.connection_state.value)
         self.connection_detail_label.setText(snapshot.connection_detail)
@@ -854,7 +880,7 @@ class MainWindow(QMainWindow):
         if t.battery_cutoff and not t.battery_shutdown_pending and t.power_good:
             detail+="; ENABLE OUTPUT ERROR"
         self.battery_status_value.setText(detail)
-        self.battery_reset_button.setEnabled(rail_controls and t.battery_cutoff and
+        self.battery_reset_button.setEnabled(board_power_controls and t.battery_cutoff and
             t.battery_mv is not None and t.battery_mv>=BATTERY_RESET_MV and
             t.battery_age_ms is not None and t.battery_age_ms<=10000)
         telemetry = snapshot.telemetry
@@ -870,7 +896,10 @@ class MainWindow(QMainWindow):
                 quality += ", outside characterized range"
             self.sense_voltage_value.setText(f"{telemetry.sense_mv / 1000:.3f} V ({quality})")
         self.power_good_value.setText("not reported" if telemetry.power_good is None else "HIGH" if telemetry.power_good else "LOW")
-        self.nrf_rail_value.setText("not reported" if telemetry.nrf_rail is None else "ON (HIGH)" if telemetry.nrf_rail else "OFF (LOW)")
+        if telemetry.nrf_rail is None:
+            self.nrf_rail_value.setText("not available" if snapshot.capabilities.supports_board_power else "not reported")
+        else:
+            self.nrf_rail_value.setText("ON (HIGH)" if telemetry.nrf_rail else "OFF (LOW)")
         self.selected_file_value.setText(snapshot.selected_file or "")
         self.active_tx_file_value.setText(snapshot.active_tx_file or "None reported")
         self.last_tx_value.setText("true" if snapshot.telemetry.last_tx_ok else "false")

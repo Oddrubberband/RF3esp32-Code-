@@ -1,14 +1,18 @@
 {
-  "implementation": "RF3 battery monitoring, resume and RX diagnostics",
-  "release_tag": "v2026.11.05-battery-r1",
-  "implementation_verified_date": "2026-11-05",
+  "implementation": "RF3 audited custom PCB and USB devboard firmware with the stable desktop",
+  "release_tag": "v2026.11.20-firmware-audit",
+  "implementation_verified_date": "2026-11-19",
   "release_notes": "CHANGELOG.md",
-  "firmware_build_id": "RF3-BAT-R1-20261105",
-  "firmware_source_main_sha256": "8b7448bf38328d9ae8cdea570d95f21a3dc4e89dac9fce195d305d90ecb73da0",
-  "baseline_gui_tests": 263,
-  "baseline_native_tests": 204,
+  "firmware_build_id": "RF3-CBT-R4-20261119",
+  "firmware_source_main_sha256": "5b320adeec2f1e9dfa2ca7c97685d764531b6bda55e8c7a623ec504f38bb8f52",
+  "baseline_gui_tests": 273,
+  "baseline_native_tests": 208,
   "hardware_observation": {
     "scope": "No new physical hardware testing; software validation only"
   },
-  "requires_matching_peer_firmware": true
+  "requires_matching_peer_firmware": true,
+  "peer_firmware_build_id": "RF3-NFEM-R3",
+  "peer_firmware_source_main_sha256": "155daeaddf64934b312ff6cd1db79c2e7fa2a18ea5b80acc73dc46451968ceaa",
+  "desktop_build_id": "RF3-CBT-R1-20261119",
+  "devboard_native_tests": 207
 }

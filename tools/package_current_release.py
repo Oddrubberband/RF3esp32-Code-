@@ -13,7 +13,7 @@ import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-ENVIRONMENTS = ("rf3_custom_pcb", "rf3_esp32_devboard")
+ENVIRONMENTS = ("rf3_custom_pcb", "rf3_usb_fem")
 IMAGE_NAMES = ("bootloader.bin", "partitions.bin", "firmware.bin")
 GUI_ARCHIVE = "RF3-Desktop-Windows.zip"
 FIRMWARE_ARCHIVE = "RF3-Firmware.zip"
@@ -129,10 +129,11 @@ def package(root: Path, output: Path, kind: str, *, commit: str | None = None,
         members["BUILD_INFO.json"] = build_info
         plans.append(("gui", GUI_ARCHIVE, members))
     if kind in {"firmware", "all"}:
-        builds = firmware_root or root / ".pio" / "build"
         members = {}
         images = {}
         for environment in ENVIRONMENTS:
+            project = root / "profiles" / "usb-devboard" if environment == "rf3_usb_fem" else root
+            builds = firmware_root or project / ".pio" / "build"
             images[environment] = {}
             for name in IMAGE_NAMES:
                 path = checked_file(builds / environment / name)
@@ -145,7 +146,7 @@ def package(root: Path, output: Path, kind: str, *, commit: str | None = None,
                                                        "release_tag": tag})
         members["BUILD_INFO.json"] = build_info
         members["README.txt"] = ("RF3 firmware: manual flashing only\n\nExtract this ZIP. Connect the "
-                                  "intended board by USB and close programs using its USB serial port. "
+                                  "intended board by USB with the separate FEM supply off. Close programs using its USB serial port. "
                                   "In PowerShell run:\n  .\\Flash_Manual.ps1 -Board custom -Port COMn\n"
                                   "or choose -Board devboard. Replace COMn with that board's USB port. "
                                   "Use the helper's manual BOOT/EN prompts; reset manually afterward. "

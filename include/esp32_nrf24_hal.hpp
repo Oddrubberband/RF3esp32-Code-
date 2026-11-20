@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "nrf24_hal.hpp"
 #include "hardware_profile.hpp"
 #include "driver/gpio.h"
@@ -47,6 +49,10 @@ public:
     void delayUs(uint32_t us) override;
     // Return a microsecond timer suitable for timeout loops.
     uint64_t nowUs() override;
+    void frontEnd(FrontEndMode mode) override;
+    unsigned femAntenna() const;
+    const char* femMode() const;
+    bool selectFemAntenna(unsigned antenna);
 
     // External rail sequencing: quiesce CE/SPI outputs before removing power.
     bool setSignalOutputsEnabled(bool enabled);
@@ -55,6 +61,9 @@ public:
     uint64_t lastRadioActivityMs() const { return last_ce_activity_ms_; }
 
 private:
+    std::atomic<uint8_t> fem_antenna_{1};
+    std::atomic<int> fem_completed_mode_{-1};
+    FrontEndMode front_end_mode_ = FrontEndMode::Off;
     Esp32Nrf24Config config_{};
     bool signal_outputs_enabled_ = true;
     bool ce_asserted_ = false;

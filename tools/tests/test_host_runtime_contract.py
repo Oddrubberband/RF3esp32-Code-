@@ -91,6 +91,7 @@ public:
     std::vector<ProtocolV2::Frame> sent_frames;
     bool disableAutoAck(){++ack_disable_calls;return ack_disable_success;}
     bool sendPayload(const uint8_t* bytes,size_t length,bool=true){++send_attempts;if(send_success){assert(length==32);ProtocolV2::Frame f{};std::copy(bytes,bytes+length,f.begin());sent_frames.push_back(f);value.state=RadioState::Standby;return true;}value.state=RadioState::Fault;value.last_fault=3;return false;}
+    bool sendPayloadAndListen(const uint8_t* bytes,size_t length,bool recover=true){return sendPayload(bytes,length,recover);}
     bool enterRx(){return true;}
     bool receivePayload(uint8_t*,size_t,size_t&){return false;}
     bool leaveRx(){return true;}
@@ -159,9 +160,9 @@ struct FakePowerIo : DevboardPower::Io {
 class DemoConsoleApp {
 public:
     FakeRadioManager manager_;
-    struct FakeHal {bool enabled=true,ce=false;uint64_t activity=0;bool setSignalOutputsEnabled(bool value){enabled=value;return true;}bool ceAsserted()const{return ce;}uint64_t lastRadioActivityMs()const{return activity;}} hal_;
+    struct FakeHal {const char* fem_mode=nullptr;const char* femMode()const{return fem_mode;}unsigned femAntenna()const{return 0;}bool selectFemAntenna(unsigned){return false;}bool enabled=true,ce=false;uint64_t activity=0;bool setSignalOutputsEnabled(bool value){enabled=value;return true;}bool ceAsserted()const{return ce;}uint64_t lastRadioActivityMs()const{return activity;}} hal_;
     FakePowerIo power_io_;
-    DevboardPower::Controller power_{power_io_, HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard};
+    DevboardPower::Controller power_{power_io_, HardwareProfile::kSelectedBatteryPower};
     DemoConsoleApp() {
         assert(power_.initialize());
         for (uint64_t t = 10000; t <= 14000; t += 250) assert(!power_.poll(t, true));
@@ -276,6 +277,7 @@ int main(int argc,char** argv){
     HttpStatusSnapshot first;
     assert(app.captureHttpStatus(first));
     app.radio_available=false;
+    app.hal_.fem_mode="tx";
     auto progress=queued;
     progress.state=ReliableTransferV2::SenderState::WaitingForDataAck;
     progress.bytes_transferred=2;
@@ -285,9 +287,23 @@ int main(int argc,char** argv){
     assert(app.captureHttpStatus(live));
     assert(app.manager_.refresh_count==refresh_before);
     assert(std::string(live.state_name)=="TxBusy" && live.tx.id==queued.transfer_id && live.tx.bytes==2);
+    assert(std::string(live.fem_mode)=="tx");
+    assert(app.buildStatusJson().find("\"fem_mode\":\"tx\"")!=std::string::npos);
+    app.status_mutex_=0;app.hal_.fem_mode="off";
+    const auto unavailable=app.buildStatusJson();
+    assert(unavailable.find("\"state\":\"Unavailable\"")!=std::string::npos);
+    assert(unavailable.find("\"fem_mode\":\"off\"")!=std::string::npos);
+    app.status_mutex_=1;app.hal_.fem_mode=nullptr;
+    assert(app.buildStatusJson().find("\"fem_mode\"")==std::string::npos);
     assert(live.channel==83 && live.power_level==2 && live.rx_saved==9 && live.rx_last_name==name);
     assert(std::string(live.loop_name)=="TxLoop");
-    if(argc==2){app.printStatus();std::cout << app.buildStatusJson() << '\n';}
+    const std::string status_json = app.buildStatusJson();
+    const bool rail_supported = HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard;
+    assert(status_json.find("\"board_power\":\"enabled\"") != std::string::npos);
+    assert(status_json.find("\"battery_profile\":\"soikon_6s_3300\"") != std::string::npos);
+    assert((status_json.find("\"nrf_rail\":true") != std::string::npos) == rail_supported);
+    if (!rail_supported) assert(status_json.find("\"nrf_rail\"") == std::string::npos);
+    if(argc==2){app.printStatus();std::cout << status_json << '\n';}
     // Radio/source preparation fails before transport start: same accepted ID,
     // name, and zero peer_complete survive the terminal publication.
     progress.state=ReliableTransferV2::SenderState::Failed;

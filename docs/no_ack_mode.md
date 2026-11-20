@@ -1,6 +1,6 @@
-## Battery update RF3-BAT-R1-20261105
+## Battery monitoring during receive
 
-The devboard may pause listening RX for a battery check. No ACK has no delivery
+Both battery-enabled profiles may pause listening RX for a battery check. No ACK has no delivery
 feedback or retransmission, so packets can be lost during that pause. The existing
 size and CRC checks reject an incomplete received file. Sender completion remains
 unconfirmed delivery. Cutoff cancels the local sender before any further RF attempt.

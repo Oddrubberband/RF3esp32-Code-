@@ -143,6 +143,7 @@ class DeviceSnapshot:
     selected_file: str = ""
     telemetry: Telemetry = field(default_factory=Telemetry)
     capabilities: RadioCapabilities = field(default_factory=RadioCapabilities)
+    fem_antenna: int | None = None
 
 
 @dataclass(frozen=True)

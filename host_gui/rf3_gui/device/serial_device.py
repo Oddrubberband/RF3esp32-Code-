@@ -23,6 +23,7 @@ from rf3_gui.app.state_model import (
     BATTERY_RESET_MV,
     ConnectionState,
     DEFAULT_CHANNEL,
+    MAX_CHANNEL,
     DeviceInfo,
     DeviceSnapshot,
     PROTOCOL_V2_MAX_FILE_SIZE,
@@ -36,7 +37,7 @@ from rf3_gui.app.state_model import (
     StorageListing,
 )
 from rf3_gui.device.base import DeviceBackend
-from rf3_gui.device.windows_bluetooth import WindowsBluetooth
+from rf3_gui.device.windows_bluetooth import WindowsBluetooth, format_address, instance_address
 from rf3_gui.protocol import console_protocol
 from rf3_gui.protocol.status_parser import parse_fraction, parse_status_line
 
@@ -45,6 +46,7 @@ SERIAL_BAUD_RATE = 115200
 SERIAL_READ_TIMEOUT_SECONDS = 0.2
 SERIAL_WRITE_TIMEOUT_SECONDS = 2.0
 BLUETOOTH_WRITE_TIMEOUT_SECONDS = 8.0
+BLUETOOTH_OPEN_RETRY_SECONDS = 1.0
 HANDSHAKE_TIMEOUT_MS = 25000
 BLUETOOTH_SETUP_TIMEOUT_MS = 120000
 SERIAL_SETUP_TIMEOUT_MS = 30000
@@ -167,7 +169,7 @@ class SerialDeviceBackend(DeviceBackend):
         self._handshake_ok = False
         self._identity_ok = False
         self._diagnostics_supported = False
-        self._hello_sent = False
+        self._has_json_transfer_status = False
         self._handshake_write_pending = False
         self._handshake_write_warning_shown = False
         self._last_test_tx_count = 0
@@ -551,6 +553,9 @@ class SerialDeviceBackend(DeviceBackend):
 
     def _radio_command(self, command: str, requested: RadioState | None = None,
                        *, ready: bool = False) -> None:
+        if self._snapshot.telemetry.battery_cutoff:
+            self.command_finished.emit(command, False, "Reset the battery cutoff before RF operations")
+            return
         if self._snapshot.telemetry.nrf_rail is False:
             self.command_finished.emit(command, False, "Enable the nRF rail before RF operations")
             return
@@ -571,9 +576,15 @@ class SerialDeviceBackend(DeviceBackend):
         self._send_command(console_protocol.test_mode_command(enabled))
         self._test_mode_timer.start(TEST_MODE_TIMEOUT_MS)
 
+    def _valid_channel(self, command: str, channel: int) -> bool:
+        maximum = self._snapshot.capabilities.max_channel
+        if type(channel) is int and 0 <= channel <= maximum:
+            return True
+        self.command_finished.emit(command, False, f"Channel must be 0-{maximum}")
+        return False
+
     def set_channel(self, channel: int) -> None:
-        if type(channel) is not int or not 0 <= channel <= 125:
-            self.command_finished.emit("CHANNEL", False, "Channel must be 0-125")
+        if not self._valid_channel("CHANNEL", channel):
             return
         self._radio_command(console_protocol.channel_command(channel), RadioState.STANDBY)
 
@@ -598,9 +609,11 @@ class SerialDeviceBackend(DeviceBackend):
         command = "NRFRAIL " + ("ON" if enabled else "OFF")
         if not self._operation_allowed(command):
             return
-        if (not self._snapshot.capabilities.supports_board_power
-                or self._snapshot.confirmed_radio_state == RadioState.RX_LISTENING):
-            self.command_finished.emit(command, False, "Use updated devboard firmware and stop radio activity first")
+        if self._snapshot.telemetry.nrf_rail is None:
+            self.command_finished.emit(command, False, "This board does not report an independent nRF rail control")
+            return
+        if self._snapshot.confirmed_radio_state == RadioState.RX_LISTENING:
+            self.command_finished.emit(command, False, "Stop radio activity first")
             return
         self._awaiting_nrf_rail = enabled
         self._nrf_rail_timer.start(STATUS_RESPONSE_TIMEOUT_MS)
@@ -614,6 +627,21 @@ class SerialDeviceBackend(DeviceBackend):
             self.command_finished.emit("POWER", False, "Power must be 0-3")
             return
         self._radio_command(console_protocol.power_command(level), ready=True)
+
+    def set_fem_antenna(self, antenna: int) -> None:
+        if type(antenna) is not int or antenna not in (1, 2) or self._snapshot.fem_antenna is None:
+            self.command_finished.emit("FEM ANT", False, "Antenna selection is unavailable")
+            return
+        if not self._operation_allowed("FEM ANT"):
+            return
+        if (self._snapshot.confirmed_radio_state != RadioState.STANDBY or self._snapshot.test_mode
+                or self._snapshot.telemetry.battery_cutoff):
+            self.command_finished.emit("FEM ANT", False, "Return to standby with battery power enabled")
+            return
+        self._send_command(f"FEM ANT {antenna}")
+        self._snapshot = self._replace_snapshot(connection_state=ConnectionState.BUSY)
+        self.status_changed.emit(self._snapshot)
+        self.request_status()
 
     def set_no_ack_mode(self, enabled: bool) -> bool:
         if (self._snapshot.connection_state == ConnectionState.BUSY or self._incoming_rx_active()
@@ -947,9 +975,13 @@ class SerialDeviceBackend(DeviceBackend):
         self._status_poll_timer.start()
 
     def start_cw(self, channel: int, power_level: int) -> None:
+        if not self._valid_channel("CW", channel):
+            return
         self._radio_command(console_protocol.cw_start_command(channel, power_level), RadioState.CW_TEST, ready=True)
 
     def start_cw_loop(self, on_ms: int, off_ms: int, channel: int, power_level: int) -> None:
+        if not self._valid_channel("CW", channel):
+            return
         self._radio_command(console_protocol.cw_loop_command(on_ms, off_ms, channel, power_level),
                             RadioState.CW_TEST, ready=True)
 
@@ -984,17 +1016,21 @@ class SerialDeviceBackend(DeviceBackend):
         for port in ports:
             label = port.description or "Serial port"
             hwid = str(getattr(port, "hwid", ""))
+            peer_address = ""
             if _is_windows_incoming_bluetooth_port(label, hwid):
                 skipped_incoming_bluetooth_ports += 1
                 continue
             if _is_bluetooth_port(label, hwid):
-                label = f"{label} (Bluetooth SPP)"
+                remote = instance_address(hwid)
+                peer_address = format_address(int(remote, 16)) if remote else ""
+                label = f"{label} (Bluetooth SPP {peer_address})" if peer_address else f"{label} (Bluetooth SPP)"
             devices.append(
                 DeviceInfo(
                     name=label,
                     address=port.device,
                     transport="serial",
                     protocol_version="console",
+                    bluetooth_address=peer_address,
                 )
             )
 
@@ -1027,21 +1063,6 @@ class SerialDeviceBackend(DeviceBackend):
         if generation != self._connection_generation:
             return
         cancel = self._setup_cancel if setup_cancel is None else setup_cancel
-        if device.transport == "bluetooth":
-            try:
-                port_name = self._bluetooth.prepare_serial(
-                    device.address, cancel, parent_window=self._pairing_window,
-                    progress=lambda message: self._worker_event.emit(generation, "setup_progress", message),
-                )
-                if cancel.is_set() or generation != self._connection_generation:
-                    return
-                device = DeviceInfo(name=f"{device.name} (Bluetooth SPP)", address=port_name,
-                                    transport="serial", protocol_version="console",
-                                    bluetooth_address=device.address, paired=True)
-                self._worker_event.emit(generation, "resolved", device)
-            except Exception as exc:
-                self._worker_event.emit(generation, "open_error", str(exc))
-                return
         try:
             import serial
         except ImportError:
@@ -1050,28 +1071,46 @@ class SerialDeviceBackend(DeviceBackend):
             )
             return
 
-        serial_port = None
-        try:
-            if generation != self._connection_generation or (device.bluetooth_address and cancel.is_set()):
+        selected = device
+        for attempt in range(2):
+            if cancel.is_set() or generation != self._connection_generation:
                 return
-            serial_port = serial.Serial(
-                port=None,
-                baudrate=SERIAL_BAUD_RATE,
-                timeout=SERIAL_READ_TIMEOUT_SECONDS,
-                write_timeout=_write_timeout_for(device),
-                rtscts=False,
-                dsrdtr=False,
-            )
-            serial_port.port = device.address
-            serial_port.dtr = False
-            serial_port.rts = False
-            self._worker_event.emit(generation, "setup_progress", f"Opening {device.address}")
-            serial_port.open()
-        except Exception as exc:
-            if serial_port is not None:
-                serial_port.close()
-            self._worker_event.emit(generation, "open_error", _format_open_error(device, exc))
-            return
+            if selected.transport == "bluetooth":
+                try:
+                    port_name = self._bluetooth.prepare_serial(
+                        selected.address, cancel, parent_window=self._pairing_window,
+                        progress=lambda message: self._worker_event.emit(generation, "setup_progress", message),
+                    )
+                except Exception as exc:
+                    self._worker_event.emit(generation, "open_error", str(exc))
+                    return
+                if cancel.is_set() or generation != self._connection_generation:
+                    return
+                device = DeviceInfo(name=f"{selected.name} (Bluetooth SPP)", address=port_name,
+                                    transport="serial", protocol_version="console",
+                                    bluetooth_address=selected.address, paired=True)
+                self._worker_event.emit(generation, "resolved", device)
+            serial_port = None
+            try:
+                serial_port = serial.Serial(
+                    port=None, baudrate=SERIAL_BAUD_RATE, timeout=SERIAL_READ_TIMEOUT_SECONDS,
+                    write_timeout=_write_timeout_for(device), rtscts=False, dsrdtr=False,
+                )
+                serial_port.port = device.address
+                serial_port.dtr = False
+                serial_port.rts = False
+                self._worker_event.emit(generation, "setup_progress", f"Opening {device.address}")
+                serial_port.open()
+                break
+            except Exception as exc:
+                if serial_port is not None:
+                    serial_port.close()
+                if attempt or selected.transport != "bluetooth" or not _windows_link_timeout(exc):
+                    self._worker_event.emit(generation, "open_error", _format_open_error(device, exc))
+                    return
+                self._worker_event.emit(generation, "setup_progress",
+                                        "Bluetooth link timed out. Retrying the selected device once.")
+                cancel.wait(BLUETOOTH_OPEN_RETRY_SECONDS)
 
         try:
             serial_port.dtr = False
@@ -1124,7 +1163,7 @@ class SerialDeviceBackend(DeviceBackend):
         self._write_queue = queue.Queue()
         self._handshake_ok = False
         self._identity_ok = False
-        self._hello_sent = False
+        self._has_json_transfer_status = False
         self._handshake_write_pending = False
         self._handshake_write_warning_shown = False
         self._last_test_tx_count = 0
@@ -1187,10 +1226,9 @@ class SerialDeviceBackend(DeviceBackend):
     def _send_handshake_status(self) -> None:
         if self._serial is None or self._handshake_ok or self._handshake_write_pending:
             return
-        if not self._hello_sent:
-            self._hello_sent = True
-            self.log_event.emit("info", "Sending RF3 HELLO and STATUS probes")
-            self._write_queue.put("HELLO")
+        # A driver write can succeed while the remote misses the first HELLO.
+        # Only one pair of probes may be in flight during the handshake.
+        self._write_queue.put("HELLO")
         command = console_protocol.status_command()
         self.log_event.emit("debug", f"TX -> {command} (handshake)")
         self._handshake_write_pending = True
@@ -1614,8 +1652,6 @@ class SerialDeviceBackend(DeviceBackend):
             and not self._handshake_ok
             and self._snapshot.connection_state == ConnectionState.CONNECTING
         ):
-            if command == "HELLO":
-                self._hello_sent = False
             if not self._handshake_write_warning_shown:
                 self.log_event.emit(
                     "warning",
@@ -1762,6 +1798,9 @@ class SerialDeviceBackend(DeviceBackend):
                 if isinstance(status_values, dict):
                     try:
                         self._apply_status(status_values)
+                        if (self._handshake_ok and type(status_values.get("tx_no_ack")) is bool
+                                and type(status_values.get("no_ack_files")) is bool):
+                            self._has_json_transfer_status = True
                     except (ValueError, TypeError, OverflowError):
                         self.log_event.emit("warning", "Ignored invalid numeric fields in RF3 status")
                 if isinstance(values.get("accepted"), bool) and isinstance(values.get("command"), str):
@@ -1770,6 +1809,10 @@ class SerialDeviceBackend(DeviceBackend):
 
         status_start = line.find("profile=")
         if status_start >= 0:
+            # On USB a board can print a shorter console summary immediately
+            # before the full JSON reply. Only the latter carries all fields.
+            if self._has_json_transfer_status:
+                return
             try:
                 self._apply_status(parse_status_line(line[status_start:]))
             except (ValueError, TypeError, OverflowError):
@@ -2056,6 +2099,11 @@ class SerialDeviceBackend(DeviceBackend):
         if confirmed_test_request:
             self._awaiting_test_mode = None
             self._test_mode_timer.stop()
+        antenna = values.get("fem_antenna")
+        if type(antenna) is not int or antenna not in (1, 2):
+            antenna = None
+        if antenna is not None:
+            self._finish_pending(True, f"ESP reports ANT{antenna}", f"FEM ANT {antenna}", confirmed=True)
         tx_state_text = str(values.get("tx_state") or "")
         loop_text = str(values.get("loop") or "")
         connection_state = (
@@ -2082,6 +2130,7 @@ class SerialDeviceBackend(DeviceBackend):
             rpd=_status_enabled(values.get("rpd")),
         )
         capabilities = RadioCapabilities(
+            max_channel=83 if antenna is not None else MAX_CHANNEL,
             host_chunk_max=_negotiated_host_chunk(values.get("host_chunk_max")),
             supports_host_storage=_status_enabled(values.get("host_storage")),
             supports_battery_percent=bool(board_fields["battery_state"]),
@@ -2111,6 +2160,7 @@ class SerialDeviceBackend(DeviceBackend):
         self._snapshot = self._replace_snapshot(
             connection_state=connection_state,
             connection_detail="RF3 connected; radio status received",
+            fem_antenna=antenna,
             test_mode=str(values.get("test_mode", "off")).lower() in {"on", "true"},
             test_tx_count=int(values.get("test_tx_count", 0) or 0),
             test_tx_bytes=int(values.get("test_tx_bytes", 0) or 0),
@@ -2200,6 +2250,7 @@ class SerialDeviceBackend(DeviceBackend):
 
     def _local_operation_active(self, *, include_rx: bool = True) -> bool:
         return bool(self._upload_session is not None or self._download_session is not None
+                    or any(command.startswith("FEM ANT ") for command in self._pending_commands)
                     or self._storage_kind is not None or self._awaiting_echo is not None
                     or self._awaiting_test_mode is not None or self._rf_tx_name is not None
                     or self._awaiting_nrf_rail is not None or self._awaiting_battery_reset
@@ -2321,8 +2372,9 @@ class SerialDeviceBackend(DeviceBackend):
                 self._finish_rf_transfer(TransferState.FAILED, "Invalid RF progress metadata; delivery is unconfirmed")
             return
         sent, total = parsed
-        if (self._rf_tx_name is not None
-                and (values.get("tx_no_ack") is True) != self._rf_tx_no_ack):
+        mode = values.get("tx_no_ack", False)  # Legacy reliable firmware omits it.
+        mode_mismatch = self._rf_tx_name is not None and mode is not self._rf_tx_no_ack
+        if mode_mismatch and tx_state not in {"Cancelled", "Failed"}:
             self._finish_rf_transfer(TransferState.FAILED,
                                      "ESP transfer mode differs from the requested file mode")
             return
@@ -2362,6 +2414,8 @@ class SerialDeviceBackend(DeviceBackend):
         message = f"RF {tx_id or 'legacy'} | {tx_file or self._snapshot.active_tx_file} | {tx_state}"
         if error and error.lower() not in {"none", "0"}:
             message += ": " + error
+        if mode_mismatch:
+            message += " (ESP did not confirm the requested file mode)"
         if transfer_state == TransferState.COMPLETED:
             message += "; peer confirmed CRC/complete"
         elif transfer_state == TransferState.SENT_UNCONFIRMED:
@@ -2383,6 +2437,12 @@ class SerialDeviceBackend(DeviceBackend):
                                                     total_bytes=total, message=message))
 
     def _apply_known_response(self, line: str) -> bool:
+        if line.startswith(("FEM ERROR", "ERR FEM ")):
+            self._finish_pending(False, line, "FEM ANT")
+            self.request_status()
+            return True
+        if line.startswith("FEM OK ANT "):
+            return True  # Wait for the independent STATUS readback.
         if line.startswith("BATTERY OK "):
             self.request_status()
             return True
@@ -2545,7 +2605,8 @@ class SerialDeviceBackend(DeviceBackend):
         self._finish_pending(True, line, expected)
         return True
 
-    def _finish_pending(self, accepted: bool, message: str, expected_prefix: str | None = None) -> None:
+    def _finish_pending(self, accepted: bool, message: str, expected_prefix: str | None = None,
+                        *, confirmed: bool = False) -> None:
         if not self._pending_commands:
             return
         if expected_prefix is None:
@@ -2554,6 +2615,8 @@ class SerialDeviceBackend(DeviceBackend):
                         if item == expected_prefix or item.startswith(expected_prefix + " ")), None)
         if command is None:
             return
+        if command.startswith("FEM ANT ") and accepted and not confirmed:
+            return  # The matching antenna in STATUS confirms the switch.
         self._pending_commands.remove(command)
         self._command_deadlines.pop(command, None)
         if command.startswith("SELECTHEX"):
@@ -2590,6 +2653,7 @@ class SerialDeviceBackend(DeviceBackend):
     def _replace_snapshot(self, **changes) -> DeviceSnapshot:
         values = {
             "rx_no_ack": self._snapshot.rx_no_ack,
+            "fem_antenna": self._snapshot.fem_antenna,
             "connection_state": self._snapshot.connection_state,
             "connection_detail": self._snapshot.connection_detail,
             "test_mode": self._snapshot.test_mode,
@@ -2648,13 +2712,18 @@ def _write_timeout_for(device: DeviceInfo) -> float:
     return SERIAL_WRITE_TIMEOUT_SECONDS
 
 
+def _windows_link_timeout(exc: Exception) -> bool:
+    # pyserial 3.5 wraps ctypes.WinError() in a string when CreateFile fails.
+    return (getattr(exc, "winerror", None) == 121 or
+            re.search(r"(?:\[WinError 121\]|,\s*121\)\s*$)", str(exc)) is not None)
+
+
 def _format_open_error(device: DeviceInfo, exc: Exception) -> str:
     message = f"Could not open {device.address}: {exc}"
     if _is_bluetooth_serial(device):
         message += (
-            ". Windows often creates two Bluetooth serial ports; one may be an incoming "
-            "listener or a stale link. Try the other Bluetooth COM port, and confirm the "
-            "ESP is paired and powered on."
+            ". Use Scan Bluetooth to select the powered ESP by its current Bluetooth address. "
+            "If selecting a COM port directly, use that device's outgoing SPP port."
         )
     return message
 

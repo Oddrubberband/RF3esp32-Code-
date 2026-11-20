@@ -7,7 +7,7 @@
 #include <string>
 
 namespace RuntimeDiagnostics {
-inline constexpr const char* kBuild = "RF3-BAT-R1-20261105";
+inline constexpr const char* kBuild = "RF3-CBT-R4-20261119";
 inline constexpr size_t kJsonCapacity = 1280;
 
 // All lifetime totals saturate at UINT32_MAX rather than wrapping. Snapshots

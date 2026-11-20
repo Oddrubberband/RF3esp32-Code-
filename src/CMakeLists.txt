@@ -18,6 +18,7 @@ idf_component_register(
         "../include"
     REQUIRES
         # Public dependencies used directly by the implementation.
+        esp_driver_uart
         esp_driver_gpio
         esp_driver_spi
         esp_timer

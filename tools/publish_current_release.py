@@ -193,6 +193,7 @@ def publish_release(client: GitHubReleaseClient, directory: Path, plan: dict) ->
             raise RuntimeError("Created tag did not resolve to the selected source commit")
     if release is None:
         body = (f"RF3 current implementation, source commit `{commit}`.\n\n"
+                f"[Firmware fixes explained](https://github.com/{client.repository}/blob/{commit}/FIRMWARE_FIXES.md)\n\n"
                 f"[Complete change log](https://github.com/{client.repository}/blob/{commit}/CHANGELOG.md)\n\n"
                 "Download both ZIP packages and SHA256SUMS. Extract the complete desktop ZIP and open "
                 "Launch_GUI.cmd. The firmware ZIP includes separate board images and a manual BOOT/EN "

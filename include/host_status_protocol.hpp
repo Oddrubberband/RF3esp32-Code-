@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -59,13 +60,15 @@ struct Snapshot {
     bool filesystem_ready = false;
     bool test_mode_supported = false;
     unsigned host_chunk_max = 64;
+    unsigned fem_antenna = 0;
+    const char* fem_mode = nullptr;
     // Additive RF3 UART / Bluetooth SIG SPP board telemetry. Millivolts are
     // measured at the ADC pin plus estimated 6S capacity; RF Protocol v2 is unchanged.
     bool board_power = false;
     DevboardPower::Reading sense;
     BatteryMonitor::Snapshot battery;
     bool power_good = false;
-    bool nrf_rail = false;
+    std::optional<bool> nrf_rail;
     Transfer tx;
     Transfer rx;
 };
@@ -151,6 +154,11 @@ inline std::string json(const Snapshot& s)
     number("tx_retries", s.tx.retries);
     boolean("peer_complete", s.tx.peer_complete);
     boolean("tx_no_ack", s.tx.no_ack);
+    if (s.fem_mode) {
+        const std::string_view mode(s.fem_mode);
+        if (mode == "off" || mode == "rx" || mode == "tx") text("fem_mode", mode);
+    }
+    if (s.fem_antenna == 1 || s.fem_antenna == 2) number("fem_antenna", s.fem_antenna);
     boolean("rx_no_ack", s.rx_no_ack);
     boolean("no_ack_files", true);
     transfer("rx", s.rx);
@@ -162,7 +170,7 @@ inline std::string json(const Snapshot& s)
         boolean("sense_saturated", s.sense.saturated);
         boolean("sense_noisy", s.sense.noisy);
         boolean("power_good", s.power_good);
-        boolean("nrf_rail", s.nrf_rail);
+        if (s.nrf_rail.has_value()) boolean("nrf_rail", *s.nrf_rail);
         text("battery_profile","soikon_6s_3300");
         number("battery_mv",s.battery.pack_mv);
         number("battery_estimated_mv",s.battery.estimated_mv);

@@ -16,6 +16,8 @@ constexpr std::array<uint8_t, 5> kDemoAddress = {0x52, 0x46, 0x33, 0x24, 0x01};
 // a different rate can still override this at build time with RF3_NRF24_RF_SETUP.
 constexpr uint8_t kDemoRfSetup = RF3_NRF24_RF_SETUP;
 constexpr uint32_t kTxCePulseUs = RF3_NRF24_TX_CE_PULSE_US;
+constexpr uint32_t kColdPowerUpUs = 4500;
+constexpr uint32_t kReliableTurnaroundUs = 5000;
 }
 
 Nrf24::Nrf24(Nrf24Hal& hal)
@@ -23,6 +25,25 @@ Nrf24::Nrf24(Nrf24Hal& hal)
       static_payload_size_(32),
       packet_rf_setup_(kDemoRfSetup)
 {
+}
+
+void Nrf24::selectFrontEnd(FrontEndMode mode)
+{
+#if RF3_AUTOMATIC_FEM
+    hal_.frontEnd(mode);
+#else
+    (void)mode;
+#endif
+}
+
+void Nrf24::abortTransmit()
+{
+#if RF3_AUTOMATIC_FEM
+    // CE low alone does not abort an in-flight packet. Power down and allow
+    // the slowest supported 32-byte frame to drain before removing the PA.
+    hal_.ce(false);
+    writeReg(0x00, static_cast<uint8_t>(readReg(0x00) & ~0x02u));
+#endif
 }
 
 bool Nrf24::probe()
@@ -43,10 +64,14 @@ bool Nrf24::probe()
 
 bool Nrf24::initDefaults(uint8_t channel)
 {
+#if RF3_AUTOMATIC_FEM
+    if (channel > 83) return false;
+#endif
     if (channel > 125) {
         return false;
     }
 
+    received_packet_ = false;
     // This demo keeps the radio setup intentionally small:
     // - no auto-ack
     // - one enabled receive (RX) pipe
@@ -164,6 +189,11 @@ void Nrf24::readRegs(uint8_t reg, uint8_t* out, size_t len)
 
 void Nrf24::writeReg(uint8_t reg, uint8_t value)
 {
+#if RF3_AUTOMATIC_FEM
+    const bool shutting_down = (reg & 0x1F) == 0 && !(value & 0x02);
+    if (shutting_down) hal_.ce(false);
+#endif
+    if ((reg & 0x1F) == 0) rx_active_ = false;
     // The write command is just the register address with bit 5 set.
     const uint8_t tx[2] = {
         static_cast<uint8_t>(0x20 | (reg & 0x1F)),
@@ -172,6 +202,12 @@ void Nrf24::writeReg(uint8_t reg, uint8_t value)
     uint8_t rx[2] = {0, 0};
 
     hal_.spiTxRx(tx, rx, 2);
+#if RF3_AUTOMATIC_FEM
+    if (shutting_down) {
+        hal_.delayUs(1500);
+        selectFrontEnd(FrontEndMode::Off);
+    }
+#endif
 }
 
 void Nrf24::writeRegs(uint8_t reg, const uint8_t* data, size_t len)
@@ -236,14 +272,19 @@ bool Nrf24::powerUp()
     // The power-up bit (PWR_UP) requires a small settling delay before the
     // radio is fully ready.
     uint8_t config = readReg(0x00);
+    const bool was_powered = (config & 0x02) != 0;
     config |= (1 << 1);
     writeReg(0x00, config);
-    hal_.delayUs(1500);
+    if (!was_powered) hal_.delayUs(kColdPowerUpUs);
     return true;
 }
 
 bool Nrf24::powerDown()
 {
+#if RF3_AUTOMATIC_FEM
+    if (cw_restore_.valid) stopContinuousCarrier();
+    hal_.ce(false);
+#endif
     // Power-down is immediate from the driver's perspective; the chip handles
     // the lower-level transition internally.
     uint8_t config = readReg(0x00);
@@ -252,22 +293,46 @@ bool Nrf24::powerDown()
     return true;
 }
 
-bool Nrf24::startRx()
+bool Nrf24::startRx(bool preservePending)
 {
+#if RF3_AUTOMATIC_FEM
+    if (cw_restore_.valid) stopContinuousCarrier();
+#endif
+    // A reliable send can arm RX before returning to the application. Repeated
+    // enterRx must keep that live receiver and any early queued response intact.
+    if (rx_active_) {
+#if RF3_AUTOMATIC_FEM
+        if ((readReg(0x00) & 0x03) != 0x03 || readReg(0x05) > 83) {
+            abortTransmit();
+            return false;
+        }
+#endif
+        return true;
+    }
     // Receive (RX) mode is entered by setting the primary-receive bit
     // (PRIM_RX) and then holding Chip Enable (CE) high.
     hal_.ce(false);
 
     uint8_t config = readReg(0x00);
+    const bool was_powered = (config & 0x02) != 0;
     config |= (1 << 1);
     config |= (1 << 0);
     writeReg(0x00, config);
+    if (!was_powered) hal_.delayUs(kColdPowerUpUs);
+#if RF3_AUTOMATIC_FEM
+    if (readReg(0x00) != config || readReg(0x05) > 83) {
+        abortTransmit();
+        return false;
+    }
+#endif
 
-    clearIrq();
-    flushRx();
+    clearIrq(!preservePending, true, true);
+    if (!preservePending) flushRx();
 
+    selectFrontEnd(FrontEndMode::Rx);
     hal_.ce(true);
     hal_.delayUs(150);
+    rx_active_ = true;
 
     return true;
 }
@@ -282,15 +347,29 @@ bool Nrf24::stopRx()
     config &= static_cast<uint8_t>(~(1 << 0));
     writeReg(0x00, config);
 
+    selectFrontEnd(FrontEndMode::Off);
     return true;
 }
 
-bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs, bool allowRecovery)
+bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
+                         bool allowRecovery, bool listenAfterSend)
 {
     if (!payload || len == 0 || len > 32) {
         return false;
     }
+#if RF3_AUTOMATIC_FEM
+    if (cw_restore_.valid) stopContinuousCarrier();
+#endif
 
+    // Anchor at completed payload drain, which is at or after its last on-air
+    // bit. Processing/storage time counts toward the symmetric peer turn guard.
+    // This applies to ACK/control replies and the sender's next reliable frame.
+    if (listenAfterSend && received_packet_) {
+        const uint64_t elapsed = hal_.nowUs() - last_rx_read_us_;
+        if (elapsed < kReliableTurnaroundUs)
+            hal_.delayUs(static_cast<uint32_t>(kReliableTurnaroundUs - elapsed));
+    }
+    bool frame_transmitted = false;
     auto attempt_transmit = [&](bool rearm_radio, bool hold_ce_until_done) {
         if (rearm_radio) {
             RuntimeDiagnostics::global().tx_recoveries.add();
@@ -328,9 +407,21 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
         hal_.ce(false);
 
         uint8_t config = readReg(0x00);
+#if RF3_AUTOMATIC_FEM
+        const bool was_powered = (config & 0x02) != 0;
+#endif
         config |= (1 << 1);
         config &= static_cast<uint8_t>(~(1 << 0));
         writeReg(0x00, config);
+#if RF3_AUTOMATIC_FEM
+        if (!was_powered) hal_.delayUs(kColdPowerUpUs);
+        writeReg(0x06, packet_rf_setup_);
+        if (readReg(0x00) != config || readReg(0x05) > 83 ||
+            (readReg(0x06) & 0xBE) != (packet_rf_setup_ & 0xBE)) {
+            abortTransmit();
+            return false;
+        }
+#endif
 
         clearIrq();
         flushTx();
@@ -347,6 +438,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
 
         // Leave extra time between the payload write and CE assertion.
         hal_.delayUs(150);
+        selectFrontEnd(FrontEndMode::Tx);
         hal_.ce(true);
         if (!hold_ce_until_done) {
             hal_.delayUs(kTxCePulseUs);
@@ -363,7 +455,8 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
                 const uint64_t now = hal_.nowUs();
                 const bool irq_now = hal_.irqAsserted();
                 last_tx_saw_irq_ = last_tx_saw_irq_ || irq_now;
-                should_read_status = irq_now || ((now - last_status_poll) >= 200);
+                const uint64_t poll_interval_us = listenAfterSend ? 25 : 200;
+                should_read_status = irq_now || ((now - last_status_poll) >= poll_interval_us);
             }
 
             if (!should_read_status) {
@@ -375,15 +468,27 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
 
             const uint8_t status = getStatus();
             const uint8_t fifo_status = readReg(0x17);
+#if RF3_AUTOMATIC_FEM
+            if (status == 0 || status == 0xFF || (status & 0x80) || (status & 0x30) == 0x30) {
+                abortTransmit();
+                flushTx();
+                return false;
+            }
+#endif
 
             if (status & (1 << 5)) {
+                frame_transmitted = true;
                 RuntimeDiagnostics::global().tx_ds.add();
                 last_tx_status_ = status;
                 last_tx_fifo_status_ = fifo_status;
                 last_tx_observe_ = readReg(0x08);
                 last_tx_timed_out_ = false;
                 hal_.ce(false);
+                // Restore receive before manager bookkeeping or host logging.
+                // TX_DS confirms the last on-air bit has completed.
+                if (listenAfterSend) return startRx(true);
                 clearIrq(false, true, false);
+                selectFrontEnd(FrontEndMode::Off);
                 return true;
             }
 
@@ -394,6 +499,8 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
                 last_tx_observe_ = readReg(0x08);
                 last_tx_timed_out_ = false;
                 hal_.ce(false);
+                abortTransmit();
+                selectFrontEnd(FrontEndMode::Off);
                 clearIrq(false, false, true);
                 flushTx();
                 return false;
@@ -403,7 +510,8 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
             // presenting TX_DS cleanly. In no-ACK mode, an empty TX FIFO after
             // launch is a practical fallback indicator that the one-shot send
             // completed.
-            if (!auto_ack_enabled &&
+#if !RF3_AUTOMATIC_FEM
+            if (!listenAfterSend && !auto_ack_enabled &&
                 (hal_.nowUs() - start) >= 300 &&
                 (fifo_status & (1 << 4)) != 0) {
                 RuntimeDiagnostics::global().tx_fifo_only.add();
@@ -415,6 +523,9 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
                 clearIrq(false, true, true);
                 return true;
             }
+#else
+            (void)auto_ack_enabled;
+#endif
 
             hal_.delayUs(25);
         }
@@ -428,6 +539,8 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
         RuntimeDiagnostics::global().tx_attempt_timeouts.add();
         last_tx_timed_out_ = true;
         hal_.ce(false);
+        abortTransmit();
+        selectFrontEnd(FrontEndMode::Off);
         flushTx();
         return false;
     };
@@ -441,7 +554,9 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
     // Some clone modules and long-wire bench setups need a stronger re-prime
     // after cold start or a stalled first transmit. Re-apply the known packet
     // configuration and try once more before reporting failure to the app.
-    return allowRecovery && attempt_transmit(true, true);
+    // A confirmed on-air transmission followed by RX rearm failure must not
+    // silently retransmit or flush a response through clone recovery.
+    return allowRecovery && !frame_transmitted && attempt_transmit(true, true);
 }
 
 bool Nrf24::readOnePacket(uint8_t* out, size_t capacity, size_t& outLen)
@@ -475,11 +590,16 @@ bool Nrf24::readOnePacket(uint8_t* out, size_t capacity, size_t& outLen)
 
     outLen = static_payload_size_;
     clearIrq(true, false, false);
+    received_packet_ = true;
+    last_rx_read_us_ = hal_.nowUs();
     return true;
 }
 
 bool Nrf24::startContinuousCarrier(uint8_t channel, uint8_t rfPowerBits)
 {
+#if RF3_AUTOMATIC_FEM
+    if (channel > 83) return false;
+#endif
     if (channel > 125) {
         return false;
     }
@@ -513,9 +633,22 @@ bool Nrf24::startContinuousCarrier(uint8_t channel, uint8_t rfPowerBits)
     flushTx();
 
     if (!was_powered) {
-        hal_.delayUs(1500);
+        hal_.delayUs(kColdPowerUpUs);
     }
 
+#if RF3_AUTOMATIC_FEM
+    const uint8_t expected_setup = static_cast<uint8_t>(rf_setup_base | 0x90 | (rfPowerBits & 0x06));
+    if (readReg(0x00) != config || readReg(0x05) != channel ||
+        (readReg(0x06) & 0xBE) != (expected_setup & 0xBE)) {
+        stopContinuousCarrier();
+        return false;
+    }
+    cw_mode_ = CwMode::ContWave;
+    selectFrontEnd(FrontEndMode::Tx);
+    hal_.ce(true);
+    hal_.delayUs(150);
+    return true;
+#else
     // Genuine nRF24L01+ parts support CONT_WAVE. If the bit does not stick,
     // fall back to the older payload-reuse sequence so CW still produces RF
     // output on older radios and some clone modules.
@@ -583,6 +716,7 @@ bool Nrf24::startContinuousCarrier(uint8_t channel, uint8_t rfPowerBits)
     flushTx();
     stopContinuousCarrier();
     return false;
+#endif
 }
 
 void Nrf24::stopContinuousCarrier()
@@ -590,6 +724,9 @@ void Nrf24::stopContinuousCarrier()
     // Leave continuous-wave (CW) mode by dropping Chip Enable (CE), clearing
     // any queued payload reuse, and restoring the packet-oriented demo setup.
     hal_.ce(false);
+#if RF3_AUTOMATIC_FEM
+    abortTransmit();
+#endif
     clearIrq();
     flushTx();
 
@@ -605,6 +742,11 @@ void Nrf24::stopContinuousCarrier()
     writeReg(0x05, cw_restore_.rf_ch);
     writeReg(0x06, cw_restore_.rf_setup);
     writeRegs(0x10, cw_restore_.tx_addr, sizeof(cw_restore_.tx_addr));
+#if RF3_AUTOMATIC_FEM
+    // abortTransmit powered the radio down. Restoring a saved PWR_UP bit
+    // starts a new crystal startup even though the following caller reads 1.
+    if (cw_restore_.config & 0x02) hal_.delayUs(kColdPowerUpUs);
+#endif
 
     cw_restore_ = CwRestoreState{};
     cw_mode_ = CwMode::None;

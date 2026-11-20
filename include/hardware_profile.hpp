@@ -9,6 +9,21 @@ enum class Id : uint8_t {
     Esp32Devboard = 2,
 };
 
+enum class BatteryPower : uint8_t {
+    None,
+    BatteryOnly,
+    BatteryAndNrfRail,
+};
+
+constexpr BatteryPower batteryPowerFor(Id id)
+{
+    switch (id) {
+    case Id::CustomPcb: return BatteryPower::BatteryOnly;
+    case Id::Esp32Devboard: return BatteryPower::BatteryAndNrfRail;
+    }
+    return BatteryPower::None;
+}
+
 struct Pins {
     int ce;
     int csn;
@@ -41,6 +56,7 @@ static_assert(RF3_HARDWARE_PROFILE_ID == 1 || RF3_HARDWARE_PROFILE_ID == 2,
 
 inline constexpr Id kSelectedId = static_cast<Id>(RF3_HARDWARE_PROFILE_ID);
 inline constexpr Pins kSelectedPins = pinsFor(kSelectedId);
+inline constexpr BatteryPower kSelectedBatteryPower = batteryPowerFor(kSelectedId);
 inline constexpr const char* kSelectedName = nameFor(kSelectedId);
 static_assert(NRF24_CE_PIN == kSelectedPins.ce &&
               NRF24_CSN_PIN == kSelectedPins.csn &&

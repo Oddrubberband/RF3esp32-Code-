@@ -112,13 +112,14 @@ bool RadioManager::hasPendingRx()
            (status_.last_fifo_status & 0x01) == 0;
 }
 
-bool RadioManager::sendPayload(const uint8_t* payload, size_t len, bool allowRecovery)
+bool RadioManager::sendPayload(const uint8_t* payload, size_t len, bool allowRecovery,
+                               bool listenAfterSend)
 {
     // Expose one-shot transmit (TX) as a simple state change plus the last
     // success/failure snapshot.
     status_.state = RadioState::TxBusy;
 
-    if (radio_.transmitOnce(payload, len, 60000, allowRecovery)) {
+    if (radio_.transmitOnce(payload, len, 60000, allowRecovery, listenAfterSend)) {
         status_.last_tx_ok = true;
         status_.last_tx_timed_out = false;
         status_.last_tx_saw_irq = radio_.lastTxSawIrq();
@@ -129,7 +130,7 @@ bool RadioManager::sendPayload(const uint8_t* payload, size_t len, bool allowRec
         status_.irq_connected = radio_.irqConnected();
         status_.irq_asserted = radio_.irqAsserted();
         refreshPowerLevel();
-        status_.state = RadioState::Standby;
+        status_.state = listenAfterSend ? RadioState::RxListening : RadioState::Standby;
         return true;
     }
 

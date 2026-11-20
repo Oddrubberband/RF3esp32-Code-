@@ -21,7 +21,9 @@ $env:TMP = $env:TEMP
 .\.venv-host\Scripts\python.exe tools/tests/test_no_ack_runtime.py --compiler g++ --output .test-output/noack
 .\.venv-host\Scripts\python.exe tools/tests/test_resume_runtime.py --compiler g++ --output .test-output/resume
 .\.venv-host\Scripts\python.exe tools/tests/test_diagnostics_runtime.py --compiler g++ --output .test-output/diagnostics
-.\.venv-host\Scripts\python.exe -m platformio run -e rf3_custom_pcb -e rf3_esp32_devboard
+.\.venv-host\Scripts\python.exe -m platformio run -e rf3_custom_pcb
+.\.venv-host\Scripts\python.exe -m platformio run -d profiles/usb-devboard -e rf3_usb_fem
+.\.venv-host\Scripts\python.exe -m platformio test -d profiles/usb-devboard -e native
 .\.venv-host\Scripts\python.exe -m PyInstaller --noconfirm RF3Desktop.spec
 ```
 

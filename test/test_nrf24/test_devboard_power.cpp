@@ -4,6 +4,7 @@
 #include "devboard_power.hpp"
 
 namespace {
+using HardwareProfile::BatteryPower;
 struct FakePowerIo : DevboardPower::Io {
     std::vector<std::pair<int, bool>> outputs;
     int adc_gpio = -1;
@@ -32,7 +33,7 @@ bool powerWindow(DevboardPower::Controller& power, uint64_t start)
 
 void boot_asserts_battery_before_radio_and_configures_input() {
     FakePowerIo io;
-    DevboardPower::Controller power(io, true);
+    DevboardPower::Controller power(io, BatteryPower::BatteryAndNrfRail);
     TEST_ASSERT_TRUE(power.initialize());
     TEST_ASSERT_EQUAL(2, io.outputs.size());
     TEST_ASSERT_EQUAL(15, io.outputs[0].first);
@@ -45,7 +46,7 @@ void boot_asserts_battery_before_radio_and_configures_input() {
 
 void adc_remains_live_when_radio_rail_is_off() {
     FakePowerIo io;
-    DevboardPower::Controller power(io, true);
+    DevboardPower::Controller power(io, BatteryPower::BatteryAndNrfRail);
     TEST_ASSERT_TRUE(power.initialize());
     TEST_ASSERT_TRUE(power.setNrfRail(false));
     TEST_ASSERT_FALSE(power.nrfRail());
@@ -64,22 +65,65 @@ void adc_remains_live_when_radio_rail_is_off() {
     TEST_ASSERT_EQUAL(21, io.outputs.back().first);
 }
 
-void custom_profile_does_not_touch_reserved_pins() {
+void unsupported_power_profile_does_not_touch_pins()
+{
     FakePowerIo io;
-    DevboardPower::Controller power(io, false);
+    DevboardPower::Controller power(io, BatteryPower::None);
     TEST_ASSERT_TRUE(power.initialize());
     TEST_ASSERT_EQUAL(-1, power.sample().millivolts);
     TEST_ASSERT_FALSE(power.setNrfRail(false));
+    TEST_ASSERT_FALSE(power.applyCutoff());
     TEST_ASSERT_TRUE(io.outputs.empty());
     TEST_ASSERT_EQUAL(-1, io.adc_gpio);
     TEST_ASSERT_EQUAL(0, io.reads);
-    TEST_ASSERT_TRUE(power.nrfRail());
+    TEST_ASSERT_TRUE(power.radioAvailable());
+}
+
+void custom_battery_latches_and_recovers_without_gpio21()
+{
+    FakePowerIo io;
+    DevboardPower::Controller power(io, HardwareProfile::batteryPowerFor(HardwareProfile::Id::CustomPcb));
+    TEST_ASSERT_TRUE(power.initialize());
+    TEST_ASSERT_EQUAL(34, io.adc_gpio);
+    TEST_ASSERT_TRUE(power.powerGood());
+    TEST_ASSERT_TRUE(power.radioAvailable());
+    TEST_ASSERT_FALSE(power.hasNrfRailControl());
+    TEST_ASSERT_FALSE(power.setNrfRail(false));
+    TEST_ASSERT_FALSE(power.setNrfRail(true));
+    TEST_ASSERT_EQUAL(1, io.outputs.size());
+    TEST_ASSERT_TRUE(io.outputs.back().second);
+
+    io.reading.millivolts = 2200;
+    for (unsigned i = 0; i < 5; ++i)
+        TEST_ASSERT_EQUAL(i == 4, powerWindow(power, 10000 + 4250 * i));
+    TEST_ASSERT_TRUE(power.requestCutoff());
+    TEST_ASSERT_TRUE(power.radioAvailable()); // Still available for orderly shutdown.
+    TEST_ASSERT_TRUE(power.applyCutoff(31000));
+    TEST_ASSERT_FALSE(power.powerGood());
+    TEST_ASSERT_FALSE(power.radioAvailable());
+    TEST_ASSERT_TRUE(io.persisted);
+
+    DevboardPower::Controller reboot(io, HardwareProfile::batteryPowerFor(HardwareProfile::Id::CustomPcb));
+    TEST_ASSERT_TRUE(reboot.initialize());
+    TEST_ASSERT_TRUE(reboot.battery(0).cutoff);
+    TEST_ASSERT_FALSE(reboot.radioAvailable());
+    TEST_ASSERT_FALSE(reboot.resetCutoff(9000));
+    io.reading.millivolts = 2400;
+    TEST_ASSERT_FALSE(powerWindow(reboot, 10000));
+    TEST_ASSERT_TRUE(reboot.resetCutoff(14000));
+    TEST_ASSERT_TRUE(reboot.radioAvailable());
+    TEST_ASSERT_FALSE(io.persisted);
+    TEST_ASSERT_EQUAL(4, io.outputs.size());
+    for (const auto& output : io.outputs) TEST_ASSERT_EQUAL(15, output.first);
+    TEST_ASSERT_FALSE(io.outputs[1].second);
+    TEST_ASSERT_FALSE(io.outputs[2].second);
+    TEST_ASSERT_TRUE(io.outputs[3].second);
 }
 
 void adc_failure_does_not_cut_battery_power_or_report_zero() {
     FakePowerIo io;
     io.adc_ok = false;
-    DevboardPower::Controller power(io, true);
+    DevboardPower::Controller power(io, BatteryPower::BatteryAndNrfRail);
     TEST_ASSERT_TRUE(power.initialize());
     TEST_ASSERT_TRUE(power.powerGood());
     TEST_ASSERT_EQUAL(-1, power.sample().millivolts);
@@ -88,7 +132,7 @@ void adc_failure_does_not_cut_battery_power_or_report_zero() {
 
 void failed_output_does_not_claim_rail_change() {
     FakePowerIo io;
-    DevboardPower::Controller power(io, true);
+    DevboardPower::Controller power(io, BatteryPower::BatteryAndNrfRail);
     TEST_ASSERT_TRUE(power.initialize());
     io.output_ok = false;
     TEST_ASSERT_FALSE(power.setNrfRail(false));
@@ -99,7 +143,7 @@ void failed_output_does_not_claim_rail_change() {
 void failed_boot_output_stops_before_adc_or_radio_enable() {
     FakePowerIo io;
     io.output_ok = false;
-    DevboardPower::Controller power(io, true);
+    DevboardPower::Controller power(io, BatteryPower::BatteryAndNrfRail);
     TEST_ASSERT_FALSE(power.initialize());
     TEST_ASSERT_EQUAL(1, io.outputs.size());
     TEST_ASSERT_FALSE(power.powerGood());
@@ -108,7 +152,7 @@ void failed_boot_output_stops_before_adc_or_radio_enable() {
 void status_reads_cache_and_never_samples_during_rf()
 {
     FakePowerIo io;
-    DevboardPower::Controller power(io, true);
+    DevboardPower::Controller power(io, BatteryPower::BatteryAndNrfRail);
     TEST_ASSERT_TRUE(power.initialize());
     for (int i = 0; i < 100; ++i) TEST_ASSERT_EQUAL(-1, power.sample().millivolts);
     TEST_ASSERT_EQUAL(0, io.reads);
@@ -126,7 +170,7 @@ void status_reads_cache_and_never_samples_during_rf()
 void sustained_low_latches_both_outputs_and_survives_reboot()
 {
     FakePowerIo io;
-    DevboardPower::Controller power(io, true);
+    DevboardPower::Controller power(io, BatteryPower::BatteryAndNrfRail);
     TEST_ASSERT_TRUE(power.initialize());
     io.reading.millivolts = 2200;
     for (unsigned i = 0; i < 5; ++i)
@@ -144,7 +188,7 @@ void sustained_low_latches_both_outputs_and_survives_reboot()
     TEST_ASSERT_EQUAL(0, power.battery(31000).percent);
     TEST_ASSERT_FALSE(power.setNrfRail(true));
     io.outputs.clear();
-    DevboardPower::Controller reboot(io, true);
+    DevboardPower::Controller reboot(io, BatteryPower::BatteryAndNrfRail);
     TEST_ASSERT_TRUE(reboot.initialize());
     for (const auto& output : io.outputs) TEST_ASSERT_FALSE(output.second);
     TEST_ASSERT_TRUE(reboot.battery(0).cutoff);
@@ -154,7 +198,7 @@ void sustained_low_latches_both_outputs_and_survives_reboot()
 void rebound_does_not_reset_and_manual_reset_requires_fresh_recovery()
 {
     FakePowerIo io;
-    DevboardPower::Controller power(io, true);
+    DevboardPower::Controller power(io, BatteryPower::BatteryAndNrfRail);
     TEST_ASSERT_TRUE(power.initialize());
     io.reading.millivolts = 2200;
     for (unsigned i = 0; i < 5; ++i) (void)powerWindow(power, 10000 + 4250 * i);
@@ -176,7 +220,7 @@ void rebound_does_not_reset_and_manual_reset_requires_fresh_recovery()
 void noise_saturation_and_failed_persistence_do_not_invent_valid_readings()
 {
     FakePowerIo io;
-    DevboardPower::Controller power(io, true);
+    DevboardPower::Controller power(io, BatteryPower::BatteryAndNrfRail);
     TEST_ASSERT_TRUE(power.initialize());
     io.reading.millivolts = 2200;
     io.reading.noisy = true;
@@ -206,16 +250,26 @@ void noise_saturation_and_failed_persistence_do_not_invent_valid_readings()
 }
 
 void unreadable_persistent_latch_fails_closed() {
-    FakePowerIo io;io.load_ok=false;DevboardPower::Controller power(io,true);
-    TEST_ASSERT_FALSE(power.initialize());TEST_ASSERT_FALSE(power.powerGood());
-    TEST_ASSERT_EQUAL(1,io.outputs.size());TEST_ASSERT_FALSE(io.outputs[0].second);
+    for (const auto mode : {BatteryPower::BatteryOnly, BatteryPower::BatteryAndNrfRail}) {
+        FakePowerIo io;
+        io.load_ok = false;
+        DevboardPower::Controller power(io, mode);
+        TEST_ASSERT_FALSE(power.initialize());
+        TEST_ASSERT_FALSE(power.powerGood());
+        TEST_ASSERT_FALSE(power.radioAvailable());
+        TEST_ASSERT_EQUAL(1, io.outputs.size());
+        TEST_ASSERT_EQUAL(15, io.outputs[0].first);
+        TEST_ASSERT_FALSE(io.outputs[0].second);
+        TEST_ASSERT_EQUAL(-1, io.adc_gpio);
+    }
 }
 }
 
 void runDevboardPowerTests() {
     RUN_TEST(boot_asserts_battery_before_radio_and_configures_input);
     RUN_TEST(adc_remains_live_when_radio_rail_is_off);
-    RUN_TEST(custom_profile_does_not_touch_reserved_pins);
+    RUN_TEST(unsupported_power_profile_does_not_touch_pins);
+    RUN_TEST(custom_battery_latches_and_recovers_without_gpio21);
     RUN_TEST(adc_failure_does_not_cut_battery_power_or_report_zero);
     RUN_TEST(failed_output_does_not_claim_rail_change);
     RUN_TEST(failed_boot_output_stops_before_adc_or_radio_enable);

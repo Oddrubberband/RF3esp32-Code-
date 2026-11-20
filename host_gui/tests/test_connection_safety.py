@@ -211,7 +211,7 @@ class TestConnectionSafety(unittest.TestCase):
         self.assertEqual(list(backend._write_queue.queue), ["HELLO", "STATUS"])
         backend._on_worker_event(backend._connection_generation, "written", "STATUS")
         backend._send_handshake_status()
-        self.assertEqual(list(backend._write_queue.queue), ["HELLO", "STATUS", "STATUS"])
+        self.assertEqual(list(backend._write_queue.queue), ["HELLO", "STATUS", "HELLO", "STATUS"])
 
     def test_writer_never_calls_unbounded_driver_flush(self):
         stop = threading.Event()

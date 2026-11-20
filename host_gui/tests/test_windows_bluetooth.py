@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
@@ -157,6 +157,12 @@ class TestWindowsBluetooth(unittest.TestCase):
 
     def test_incoming_listener_is_never_used(self):
         self.assertEqual(matching_spp_ports(ADDRESS, [port(incoming=True)]), [])
+
+    def test_stale_registry_port_cannot_override_enumerated_peer_or_listener(self):
+        conflicting = [port("COM9", "AABBCCDDEEFF"), port("COM7", incoming=True)]
+        self.assertEqual(matching_spp_ports(ADDRESS, conflicting, ["COM7", "COM9"]), [])
+        self.assertEqual(matching_spp_ports(ADDRESS, conflicting + [port("COM11")],
+                                            ["COM7", "COM9"]), ["COM11"])
 
     def test_registry_mapping_requires_existing_bluetooth_port(self):
         unknown = SimpleNamespace(device="COM12", description="Bluetooth link", hwid="BTHENUM\\SPP")
@@ -457,6 +463,36 @@ class TestBluetoothGuiIntegration(unittest.TestCase):
         self.assertEqual(opened[0].bluetooth_address, ADDRESS)
         self.assertEqual(opened[0].transport, "serial")
         self.assertEqual(_write_timeout_for(opened[0]), 8.0)
+
+    def test_bluetooth_open_timeout_resolves_same_peer_again_before_retry(self):
+        first, second = Mock(), Mock()
+        first.open.side_effect = OSError("could not open port 'COM9': OSError(22, 'timed out', None, 121)")
+        self.adapter.prepare_serial = Mock(side_effect=["COM9", "COM11"])
+        self.backend._start_serial_io = Mock()
+        with patch("serial.Serial", side_effect=[first, second]), patch(
+                "rf3_gui.device.serial_device.BLUETOOTH_OPEN_RETRY_SECONDS", 0):
+            self.backend._connect_worker(DeviceInfo("ESP", ADDRESS, "bluetooth"), self.backend._connection_generation)
+        self.assertEqual([call.args[0] for call in self.adapter.prepare_serial.call_args_list], [ADDRESS, ADDRESS])
+        first.close.assert_called_once()
+        second.open.assert_called_once()
+        self.assertEqual(self.backend._start_serial_io.call_args.args[0].address, "COM11")
+
+    def test_usb_open_timeout_does_not_retry_or_start_bluetooth(self):
+        first = Mock()
+        first.open.side_effect = OSError("[WinError 121] timeout")
+        with patch("serial.Serial", return_value=first) as constructor:
+            self.backend._connect_worker(DeviceInfo("USB", "COM3", "serial"), self.backend._connection_generation)
+        constructor.assert_called_once()
+        first.close.assert_called_once()
+
+    def test_scan_selects_peer_by_address_after_serial_refresh(self):
+        controller = AppController(self.backend)
+        mapped = DeviceInfo("SPP", "COM11", "serial", bluetooth_address=ADDRESS)
+        controller._on_devices_discovered([mapped])
+        other = DeviceInfo("ESP", "11:22:33:44:55:66", "bluetooth")
+        desired = DeviceInfo("ESP", ADDRESS, "bluetooth")
+        controller._on_devices_discovered([other, desired, mapped])
+        self.assertEqual(controller.selected_device, desired)
 
     def test_ui_shows_pair_connect_and_distinguishes_cached_results(self):
         controller = AppController(self.backend)

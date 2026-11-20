@@ -88,7 +88,7 @@ int main(){
     lines = run.stdout.decode().splitlines()
     assert len(lines)==4 and lines[1]=='OK DIAG', lines
     hello, diag, worst = map(json.loads, (lines[0],lines[2],lines[3]))
-    assert hello['diagnostics'] is True and hello['build']=='RF3-BAT-R1-20261105'
+    assert hello['diagnostics'] is True and hello['build']=='RF3-CBT-R4-20261119'
     assert diag['type']=='diag' and diag['v']==1 and diag['tick_hz']==1000
     assert worst['tx_ds']==4294967295 and worst['ack_wait_us_max']==4294967295
     assert all(len(line)<1280 for line in lines)

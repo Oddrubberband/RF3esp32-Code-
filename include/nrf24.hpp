@@ -38,11 +38,11 @@ public:
     // Coarse radio state controls.
     bool powerUp();
     bool powerDown();
-    bool startRx();
+    bool startRx(bool preservePending = false);
     bool stopRx();
 
     // One-shot payload send/receive helpers used by the console demo.
-    bool transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs = 60000, bool allowRecovery = true);
+    bool transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs = 60000, bool allowRecovery = true, bool listenAfterSend = false);
     bool readOnePacket(uint8_t* out, size_t capacity, size_t& outLen);
 
     // Minimal continuous-wave test helpers.
@@ -61,6 +61,8 @@ public:
     bool lastTxSawIrq() const;
 
 private:
+    void selectFrontEnd(FrontEndMode mode);
+    void abortTransmit();
     enum class CwMode {
         None,
         ContWave,
@@ -85,6 +87,9 @@ private:
     uint8_t last_tx_observe_ = 0;
     bool last_tx_timed_out_ = false;
     bool last_tx_saw_irq_ = false;
+    bool rx_active_ = false;
+    bool received_packet_ = false;
+    uint64_t last_rx_read_us_ = 0;
     CwMode cw_mode_ = CwMode::None;
     CwRestoreState cw_restore_{};
 };

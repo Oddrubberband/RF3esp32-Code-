@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cctype>
+#include <charconv>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -16,6 +17,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
 #include "esp_err.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -110,6 +113,11 @@
 // files keep packet formatting and radio access focused and testable.
 namespace {
 constexpr const char* TAG = "APP";
+#if RF3_AUTOMATIC_FEM
+constexpr unsigned kMaxRadioChannel = 83;
+#else
+constexpr unsigned kMaxRadioChannel = 125;
+#endif
 
 class DevboardPowerIo final : public DevboardPower::Io {
 public:
@@ -246,6 +254,7 @@ constexpr size_t kBluetoothTxMessageBytes = 2048;
 // RF3 STATUS JSON + CRLF remains one bounded Bluetooth SIG SPP message.
 static_assert(HostStatusProtocol::kMaxResponseBytes + 2 <= kBluetoothTxMessageBytes);
 constexpr int64_t kBluetoothWriteTimeoutUs = 8000000;
+constexpr uint32_t kBluetoothDisconnectRetryMs = 250;
 constexpr int64_t kHostSessionTimeoutUs = 60000000;
 constexpr bool kWirelessControlEnabled = WIRELESS_CONTROL_ENABLED != 0;
 constexpr bool kWirelessControlAutoRx = WIRELESS_CONTROL_AUTO_RX != 0;
@@ -496,38 +505,31 @@ bool parseUint8Arg(std::string_view text, uint8_t minimum, uint8_t maximum, uint
     return true;
 }
 
+bool parseUnsignedArg(std::string_view text, int base, uint32_t minimum, uint32_t maximum, uint32_t& out)
+{
+    if (!text.empty() && text.front() == '+') text.remove_prefix(1);
+    if (base == 16 && (text.substr(0, 2) == "0x" || text.substr(0, 2) == "0X")) {
+        text.remove_prefix(2);
+    }
+    if (text.empty()) return false;
+    uint32_t value = 0;
+    const char* end = text.data() + text.size();
+    const auto result = std::from_chars(text.data(), end, value, base);
+    if (result.ec != std::errc{} || result.ptr != end || value < minimum || value > maximum) {
+        return false;
+    }
+    out = value;
+    return true;
+}
+
 bool parseUint32Arg(std::string_view text, uint32_t minimum, uint32_t maximum, uint32_t& out)
 {
-    if (text.empty()) {
-        return false;
-    }
-
-    char* end = nullptr;
-    const std::string value(text);
-    const unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
-    if (!end || *end != '\0' || parsed < minimum || parsed > maximum) {
-        return false;
-    }
-
-    out = static_cast<uint32_t>(parsed);
-    return true;
+    return parseUnsignedArg(text, 10, minimum, maximum, out);
 }
 
 bool parseHexUint32Arg(std::string_view text, uint32_t& out)
 {
-    if (text.empty() || text.size() > 8) {
-        return false;
-    }
-
-    char* end = nullptr;
-    const std::string value(text);
-    const unsigned long parsed = std::strtoul(value.c_str(), &end, 16);
-    if (!end || *end != '\0' || parsed > UINT32_MAX) {
-        return false;
-    }
-
-    out = static_cast<uint32_t>(parsed);
-    return true;
+    return text.size() <= 8 && parseUnsignedArg(text, 16, 0, UINT32_MAX, out);
 }
 
 bool isValidHostFilename(std::string_view name)
@@ -641,7 +643,7 @@ bool initializeNvsFlash(const char* owner)
 {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        if (HardwareProfile::kSelectedId==HardwareProfile::Id::Esp32Devboard) {
+        if (HardwareProfile::kSelectedBatteryPower != HardwareProfile::BatteryPower::None) {
             ESP_LOGE(TAG,"Refusing to erase persistent battery cutoff state for %s",owner);
             return false;
         }
@@ -1117,7 +1119,7 @@ bool sendDataFile(RadioManager& manager,
         }
         const int64_t send_start_us = esp_timer_get_time();
         const uint64_t send_time_ms = monotonicMilliseconds();
-        if (!manager.sendPayload(outbound.data(), outbound.size())) {
+        if (!manager.sendPayloadAndListen(outbound.data(), outbound.size())) {
             (void)sender.onTransportFailure(send_time_ms);
             updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
             delayAtLeastMs(2);
@@ -1127,16 +1129,16 @@ bool sendDataFile(RadioManager& manager,
             break;
         }
 
-        if (outbound_packet.type == ProtocolV2::PacketType::End) {
-            ESP_LOGI(TAG,
-                     "Protocol v2 local DATA acknowledged id=%08lX; awaiting remote verification",
-                     static_cast<unsigned long>(transfer_id));
-        }
-
         if (!manager.enterRx()) {
             (void)sender.onTransportFailure(monotonicMilliseconds());
             updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
             continue;
+        }
+
+        if (outbound_packet.type == ProtocolV2::PacketType::End) {
+            ESP_LOGI(TAG,
+                     "Protocol v2 local DATA acknowledged id=%08lX; awaiting remote verification",
+                     static_cast<unsigned long>(transfer_id));
         }
 
         bool leave_wait = false;
@@ -1274,6 +1276,13 @@ public:
         }
 #endif
 
+        // Hex-encoded negotiated upload chunks exceed the UART hardware FIFO.
+        // Keep receiving while command processing and diagnostics run.
+#if CONFIG_ESP_CONSOLE_UART
+        constexpr uart_port_t console_uart = static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM);
+        ESP_ERROR_CHECK(uart_driver_install(console_uart, 4096, 0, 0, nullptr, 0));
+        uart_vfs_dev_use_driver(console_uart);
+#endif
         std::setvbuf(stdin, nullptr, _IONBF, 0);
         std::setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -1296,8 +1305,8 @@ public:
 
         // Channel 76 is used as the demo default, but the console can
         // reinitialize on another channel later.
-        const bool boot_ok = power_.nrfRail() && manager_.boot(76);
-        if (!power_.nrfRail()) (void)manager_.powerDown();
+        const bool boot_ok = power_.radioAvailable() && manager_.boot(76);
+        if (!power_.radioAvailable()) (void)manager_.powerDown();
         const RadioStatus status = manager_.status();
         giveRadio();
 
@@ -1405,6 +1414,7 @@ public:
         pending_line.reserve(kConsoleLineBytes);
         bool prompt_visible = false;
         bool swallow_lf_after_cr = false;
+        bool line_overflow = false;
 
         while (true) {
             if (!prompt_visible) {
@@ -1432,12 +1442,17 @@ public:
                 std::fflush(stdout);
                 const std::string command_line = trimAscii(pending_line);
                 pending_line.clear();
-                if (!command_line.empty()) {
+                if (line_overflow) {
+                    std::printf("ERR command line too long\n");
+                    line_overflow = false;
+                } else if (!command_line.empty()) {
                     dispatchCommand(command_line, CommandOrigin::Local);
                 }
                 prompt_visible = false;
                 continue;
             }
+
+            if (line_overflow) continue;
 
             if (ch == '\b' || byte == 0x7F) {
                 swallow_lf_after_cr = false;
@@ -1461,6 +1476,8 @@ public:
                 pending_line.push_back(ch);
                 std::printf("%c", ch);
                 std::fflush(stdout);
+            } else {
+                line_overflow = true;
             }
         }
     }
@@ -1686,14 +1703,21 @@ private:
 
             case ESP_SPP_SRV_OPEN_EVT:
                 if (param->srv_open.status == ESP_SPP_SUCCESS) {
-                    if (bluetooth_client_connected_.load()) {
+                    // A failed link retains its slot until the stack confirms CLOSE.
+                    if (bluetooth_spp_handle_.load() != 0) {
                         esp_spp_disconnect(param->srv_open.handle);
                         break;
                     }
+                    xQueueReset(bluetooth_command_queue_);
+                    xQueueReset(bluetooth_tx_queue_);
+                    portENTER_CRITICAL(&bluetooth_session_mux_);
                     const uint32_t epoch = bluetooth_epoch_.fetch_add(1) + 1;
                     bluetooth_tx_flow_.reset(param->srv_open.handle, epoch);
                     bluetooth_spp_handle_.store(param->srv_open.handle);
                     bluetooth_client_connected_.store(true);
+                    bluetooth_close_received_ = false;
+                    bluetooth_retry_handle_ = 0;
+                    portEXIT_CRITICAL(&bluetooth_session_mux_);
                     bluetooth_rx_line_.clear();
                     bluetooth_rx_overflow_ = false;
                     ESP_LOGI(TAG,
@@ -1705,12 +1729,22 @@ private:
 
             case ESP_SPP_CLOSE_EVT:
                 if (param->close.handle == bluetooth_spp_handle_.load()) {
+                    portENTER_CRITICAL(&bluetooth_session_mux_);
                     bluetooth_client_connected_.store(false);
-                    bluetooth_spp_handle_.store(0);
                     const uint32_t epoch = bluetooth_epoch_.fetch_add(1) + 1;
                     bluetooth_tx_flow_.reset(0, epoch);
+                    bluetooth_retry_handle_ = 0;
+                    portEXIT_CRITICAL(&bluetooth_session_mux_);
+                    xQueueReset(bluetooth_command_queue_);
+                    xQueueReset(bluetooth_tx_queue_);
                     bluetooth_rx_line_.clear();
                     bluetooth_rx_overflow_ = false;
+                    portENTER_CRITICAL(&bluetooth_session_mux_);
+                    // Keep the handle reserved until any disconnect API call
+                    // returns, so a recycled handle cannot target a new peer.
+                    bluetooth_close_received_ = true;
+                    if (!bluetooth_disconnect_pending_) bluetooth_spp_handle_.store(0);
+                    portEXIT_CRITICAL(&bluetooth_session_mux_);
                 }
                 ESP_LOGI(TAG,
                          "Bluetooth SPP client closed handle=%lu",
@@ -1718,7 +1752,8 @@ private:
                 break;
 
             case ESP_SPP_DATA_IND_EVT:
-                if (param->data_ind.handle == bluetooth_spp_handle_.load()) {
+                if (bluetooth_client_connected_.load() &&
+                    param->data_ind.handle == bluetooth_spp_handle_.load()) {
                     handleBluetoothData(param->data_ind.data, param->data_ind.len);
                 }
                 break;
@@ -1902,7 +1937,18 @@ private:
         if (text.size() <= sizeof(message.bytes)) {
             message.length = static_cast<uint16_t>(text.size());
             std::memcpy(message.bytes, text.data(), text.size());
-            if (xQueueSend(bluetooth_tx_queue_, &message, 0) == pdTRUE) return true;
+            // Command replies can briefly outrun SPP during congestion. Apply
+            // bounded backpressure in the command task while GAP/SPP callbacks
+            // and asynchronous radio notifications remain nonblocking.
+            const bool can_wait = xTaskGetCurrentTaskHandle() == bluetooth_command_task_;
+            const int64_t deadline = esp_timer_get_time() + kBluetoothWriteTimeoutUs;
+            do {
+                if (!bluetooth_client_connected_.load() ||
+                    !bluetooth_tx_flow_.matches(handle, message.epoch)) return false;
+                if (xQueueSend(bluetooth_tx_queue_, &message, 0) == pdTRUE) return true;
+                if (!can_wait || esp_timer_get_time() >= deadline) break;
+                delayAtLeastMs(2);
+            } while (true);
         }
         // A dropped fragment would corrupt framing. Close the link so the
         // host gets an explicit failure rather than continuing with bad data.
@@ -1913,25 +1959,58 @@ private:
 
     void failBluetoothLink(uint32_t handle, uint32_t epoch)
     {
-        if (bluetooth_tx_flow_.matches(handle, epoch)) {
+        // Serialize the generation check and mutation with callback CLOSE/OPEN.
+        // An old TX failure must never clear a replacement session's state.
+        const int64_t now = esp_timer_get_time();
+        bool disconnect = false;
+        portENTER_CRITICAL(&bluetooth_session_mux_);
+        const bool retry_due = bluetooth_retry_handle_ == handle &&
+            bluetooth_retry_epoch_ == epoch && now >= bluetooth_retry_at_us_;
+        if (!bluetooth_disconnect_pending_ && bluetooth_tx_flow_.matches(handle, epoch) &&
+            (bluetooth_client_connected_.load() || retry_due)) {
             bluetooth_client_connected_.store(false);
-            esp_spp_disconnect(handle);
+            bluetooth_disconnect_pending_ = true;
+            bluetooth_retry_handle_ = 0;
+            disconnect = true;
         }
+        portEXIT_CRITICAL(&bluetooth_session_mux_);
+        if (!disconnect) return;
+
+        const esp_err_t result = esp_spp_disconnect(handle);
+        const int64_t retry_at = esp_timer_get_time() + 1000LL * kBluetoothDisconnectRetryMs;
+        portENTER_CRITICAL(&bluetooth_session_mux_);
+        bluetooth_disconnect_pending_ = false;
+        if (bluetooth_close_received_) {
+            bluetooth_spp_handle_.store(0);
+        } else if (result != ESP_OK && bluetooth_tx_flow_.matches(handle, epoch)) {
+            bluetooth_retry_epoch_ = epoch;
+            bluetooth_retry_at_us_ = retry_at;
+            bluetooth_retry_handle_ = handle;
+        }
+        portEXIT_CRITICAL(&bluetooth_session_mux_);
     }
 
     void bluetoothTxTask()
     {
         BluetoothTxMessage message{};
         while (true) {
-            if (xQueueReceive(bluetooth_tx_queue_, &message, portMAX_DELAY) != pdTRUE) continue;
+            portENTER_CRITICAL(&bluetooth_session_mux_);
+            const uint32_t retry_handle = bluetooth_retry_handle_;
+            const uint32_t retry_epoch = bluetooth_retry_epoch_;
+            portEXIT_CRITICAL(&bluetooth_session_mux_);
+            if (retry_handle != 0) failBluetoothLink(retry_handle, retry_epoch);
+            if (xQueueReceive(bluetooth_tx_queue_, &message, pdMS_TO_TICKS(kBluetoothDisconnectRetryMs)) != pdTRUE) continue;
             size_t offset = 0;
             while (offset < message.length && bluetooth_client_connected_.load() &&
                    bluetooth_tx_flow_.matches(message.handle, message.epoch)) {
                 const int64_t deadline = esp_timer_get_time() + kBluetoothWriteTimeoutUs;
                 while (bluetooth_tx_flow_.congested() && esp_timer_get_time() < deadline &&
+                       bluetooth_client_connected_.load() &&
                        bluetooth_tx_flow_.matches(message.handle, message.epoch)) {
                     delayAtLeastMs(2);
                 }
+                if (!bluetooth_client_connected_.load() ||
+                    !bluetooth_tx_flow_.matches(message.handle, message.epoch)) break;
                 if (!bluetooth_tx_flow_.begin(message.handle, message.epoch)) {
                     failBluetoothLink(message.handle, message.epoch);
                     break;
@@ -1945,6 +2024,7 @@ private:
                     break;
                 }
                 while (bluetooth_tx_flow_.pending() && esp_timer_get_time() < deadline &&
+                       bluetooth_client_connected_.load() &&
                        bluetooth_tx_flow_.matches(message.handle, message.epoch)) {
                     delayAtLeastMs(2);
                 }
@@ -2337,7 +2417,7 @@ private:
         }
 
         uint8_t channel = 0;
-        if (!parseUint8Arg(value_buf, 0, 125, channel)) {
+        if (!parseUint8Arg(value_buf, 0, kMaxRadioChannel, channel)) {
             return sendHttpJson(req, "{\"error\":\"invalid_channel\"}", "400 Bad Request");
         }
 
@@ -2412,6 +2492,7 @@ private:
             "  STORAGE LIST <offset>  List visible SPIFFS files (host JSON pages)\n"
             "  STORAGE DELETE <hex>   Delete one idle visible file (host only)\n"
             "  STATUS               Show radio state and selected file\n"
+            "  FEM ANT <1|2>        Select the custom FEM antenna while in standby\n"
             "  STOP                 Stop any active TX/CW/Morse/RX and return to standby\n"
             "  FILES                List staged files in SPIFFS\n"
             "  SELECT <file>        Choose which staged file TX will send\n"
@@ -2786,37 +2867,22 @@ private:
         text_message_assembler_.reset();
     }
 
-    bool isLoopActive()
+    bool isLoopActive() const
     {
-        if (!takeLoop(pdMS_TO_TICKS(50))) {
-            return false;
-        }
-
-        const bool active = loop_config_.active;
-        giveLoop();
-        return active;
+        return loop_owns_radio_.load();
     }
 
     bool stopLoopAndWait(TickType_t timeout = kLoopStopTimeout)
     {
-        if (!isLoopActive()) {
-            loop_stop_requested_.store(false);
-            return true;
-        }
-
+        const TickType_t start = xTaskGetTickCount();
         loop_stop_requested_.store(true);
-        TickType_t waited = 0;
-        while (waited < timeout) {
-            if (!isLoopActive()) {
-                loop_stop_requested_.store(false);
-                return true;
-            }
-
-            vTaskDelay(kLoopStopPollPeriod);
-            waited += kLoopStopPollPeriod;
+        while (isLoopActive()) {
+            const TickType_t elapsed = xTaskGetTickCount() - start;
+            if (elapsed >= timeout) return false;
+            vTaskDelay(std::min(kLoopStopPollPeriod, static_cast<TickType_t>(timeout - elapsed)));
         }
-
-        return !isLoopActive();
+        loop_stop_requested_.store(false);
+        return true;
     }
 
     bool waitForLoopStopOrTimeout(uint32_t duration_ms)
@@ -2911,7 +2977,7 @@ private:
 
     void tryResumeWirelessRx(const char* reason)
     {
-        if (!power_.nrfRail() || test_mode_ || !kWirelessControlEnabled || !kWirelessControlAutoRx || isLoopActive()) {
+        if (!power_.radioAvailable() || test_mode_ || !kWirelessControlEnabled || !kWirelessControlAutoRx || isLoopActive()) {
             return;
         }
 
@@ -2955,7 +3021,7 @@ private:
             return;
         }
 
-        if (power_.nrfRail()) manager_.refreshSnapshot();
+        if (power_.radioAvailable()) manager_.refreshSnapshot();
         const bool rx_pending =
             manager_.status().state == RadioState::RxListening ? manager_.hasPendingRx() : false;
         const RadioStatus status = manager_.status();
@@ -2972,6 +3038,7 @@ private:
         const uint32_t receiver_sequence = receiver_.expectedSequence();
         const uint32_t receiver_packets = receiver_.totalPackets();
         const uint32_t receiver_crc = receiver_.calculatedCrc32();
+        const bool receiver_no_ack = rx_no_ack_mode_;
         giveRadio();
         LoopConfig loop;
         const bool loop_snapshot_available = takeLoop(pdMS_TO_TICKS(50));
@@ -3017,7 +3084,7 @@ private:
                     static_cast<unsigned>(saved_rx_byte_count_),
                     static_cast<unsigned>(carrier_events),
                     status.last_fault);
-        std::printf(" protocol=%u tx_id=%08lX tx_state=%s tx_bytes=%lu/%lu tx_seq=%lu/%lu tx_retries=%lu tx_error=%s tx_crc32=%08lX peer_complete=%s rx_id=%08lX rx_state=%s rx_bytes=%lu/%lu rx_seq=%lu/%lu rx_error=%s rx_crc32=%08lX",
+        std::printf(" protocol=%u tx_id=%08lX tx_state=%s tx_bytes=%lu/%lu tx_seq=%lu/%lu tx_retries=%lu tx_error=%s tx_crc32=%08lX peer_complete=%s tx_no_ack=%s rx_no_ack=%s no_ack_files=true rx_id=%08lX rx_state=%s rx_bytes=%lu/%lu rx_seq=%lu/%lu rx_error=%s rx_crc32=%08lX",
                     static_cast<unsigned>(ProtocolV2::kVersion),
                     static_cast<unsigned long>(tx_report.transfer_id),
                     transferReportStateName(tx_report),
@@ -3029,6 +3096,8 @@ private:
                     ProtocolV2::errorName(tx_report.error),
                     static_cast<unsigned long>(tx_report.crc32),
                     tx_report.peer_complete ? "true" : "false",
+                    tx_report.no_ack ? "true" : "false",
+                    receiver_no_ack ? "true" : "false",
                     static_cast<unsigned long>(receiver_id),
                     ReliableTransferV2::receiverStateName(receiver_state),
                     static_cast<unsigned long>(receiver_bytes),
@@ -3044,6 +3113,10 @@ private:
             HostConnectionProtocol::appendJsonString(rx_path_token, buildFilePath(last_saved_rx_file_));
             std::printf(" rx_last=%s rx_last_path=%s", rx_name_token.c_str(), rx_path_token.c_str());
         }
+#if RF3_AUTOMATIC_FEM
+        std::printf(" fem_antenna=%u", hal_.femAntenna());
+        if (const char* mode = hal_.femMode()) std::printf(" fem_mode=%s", mode);
+#endif
         std::printf(" tx_file=%s test_mode_supported=%s host_stored_tx=%s",
                     tx_file_token.c_str(),
                     HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard ? "true" : "false",
@@ -3105,9 +3178,12 @@ private:
         if (power_.supported()) {
             const auto reading = power_.sample();
             std::printf(" board_power=enabled sense_raw=%d sense_mv=%d sense_calibrated=%s "
-                "sense_saturated=%s power_good=%s nrf_rail=%s", reading.raw, reading.millivolts,
+                "sense_saturated=%s power_good=%s", reading.raw, reading.millivolts,
                 reading.calibrated ? "true" : "false", reading.saturated ? "true" : "false",
-                power_.powerGood() ? "true" : "false", power_.nrfRail() ? "true" : "false");
+                power_.powerGood() ? "true" : "false");
+            if (power_.hasNrfRailControl()) {
+                std::printf(" nrf_rail=%s", power_.nrfRail() ? "true" : "false");
+            }
             const auto battery=power_.battery(monotonicMilliseconds());
             std::printf(" sense_noisy=%s battery_profile=soikon_6s_3300 battery_mv=%d "
                 "battery_estimated_mv=%d battery_percent=%d battery_remaining_mah=%d "
@@ -3150,6 +3226,7 @@ private:
         out.filesystem_ready = filesystem_ready_;
         out.test_mode_supported = HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard;
         out.host_chunk_max = HostTransferProtocol::kMaxChunkBytes;
+        out.fem_antenna = hal_.femAntenna();
         out.supports_remote = kWirelessControlEnabled;
         out.remote_auto_rx = kWirelessControlAutoRx;
         // Never hold radio while acquiring the loop lock: encoded commands use
@@ -3170,7 +3247,7 @@ private:
         ProtocolTransferReport tx_report{};
         const bool acquired = takeRadio(pdMS_TO_TICKS(50));
         if (acquired) {
-            if (power_.nrfRail()) manager_.refreshSnapshot();
+            if (power_.radioAvailable()) manager_.refreshSnapshot();
             out.rx_pending = manager_.status().state == RadioState::RxListening
                 ? manager_.hasPendingRx() : false;
             const RadioStatus status = manager_.status();
@@ -3238,6 +3315,7 @@ private:
         out.tx.crc32 = tx_report.crc32;
         out.tx.peer_complete = tx_report.peer_complete;
         out.tx.no_ack = tx_report.no_ack;
+        out.fem_mode = hal_.femMode();
         size_t selected_bytes = 0;
         out.selected_bytes = statFileSize(buildFilePath(out.selected_name), selected_bytes)
             ? static_cast<uint32_t>(selected_bytes) : 0;
@@ -3250,10 +3328,11 @@ private:
     {
         HttpStatusSnapshot snapshot{};
         if (!captureHttpStatus(snapshot)) snapshot.state_name = "Unavailable";
+        snapshot.fem_mode = hal_.femMode();
         snapshot.board_power = power_.supported();
         snapshot.sense = power_.sample();
         snapshot.power_good = power_.powerGood();
-        snapshot.nrf_rail = power_.nrfRail();
+        if (power_.hasNrfRailControl()) snapshot.nrf_rail = power_.nrfRail();
         snapshot.battery = power_.battery(monotonicMilliseconds());
         return HostStatusProtocol::json(snapshot);
     }
@@ -3376,14 +3455,19 @@ private:
                 return false;
             }
 
+            if (!takeLoop(pdMS_TO_TICKS(50))) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR loop_busy_retry");
+                return false;
+            }
+            const LoopConfig loop = loop_config_;
+            giveLoop();
+            if (loop.active && loop.mode == LoopMode::Tx && loop.file_name == words[2]) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR file_in_use");
+                return false;
+            }
             HostPublishOps publication;
             if (!HostUploadPublish::recover(publication)) {
                 emitHostTransferResponse(origin, "UPLOAD ERROR recovery_pending");
-                return false;
-            }
-            const LoopConfig loop = loopSnapshot();
-            if (loop.active && loop.mode == LoopMode::Tx && loop.file_name == words[2]) {
-                emitHostTransferResponse(origin, "UPLOAD ERROR file_in_use");
                 return false;
             }
             resetHostUpload(true);
@@ -3883,7 +3967,7 @@ private:
             HostStorageProtocol::StoredGuards guards;
             guards.host_transfer_active = host_upload_.active || host_download_.active;
             guards.loop_active = loop_config_.active;
-            if (power_.nrfRail()) manager_.refreshSnapshot();
+            if (power_.radioAvailable()) manager_.refreshSnapshot();
             const RadioStatus radio = manager_.status();
             guards.radio_active = radio.state == RadioState::TxBusy || radio.state == RadioState::CwTest;
             guards.receive_active = receiver_.active() || incoming_file_.file != nullptr || active_api_receive_id_ != 0;
@@ -3952,6 +4036,10 @@ private:
 
     bool commandTx(const std::vector<std::string>& words, CommandOrigin origin)
     {
+        if (host_upload_.active || host_download_.active) {
+            emitHostTransferResponse(origin, "ERR TX host_transfer_active");
+            return false;
+        }
         if (words.size() >= 2) {
             const std::string action = uppercaseCopy(words[1]);
             if (action == "STOP") {
@@ -4005,7 +4093,7 @@ private:
                     std::printf("Radio is busy; TX was not queued.\n");
                     return false;
                 }
-                if (power_.nrfRail()) manager_.refreshSnapshot();
+                if (power_.radioAvailable()) manager_.refreshSnapshot();
                 setSelectedFile(file.name);
                 loop_stop_requested_.store(false);
                 loop_config_ = LoopConfig{};
@@ -4061,7 +4149,7 @@ private:
             std::printf("Radio is busy; TX was not queued.\n");
             return false;
         }
-        if (power_.nrfRail()) manager_.refreshSnapshot();
+        if (power_.radioAvailable()) manager_.refreshSnapshot();
         setSelectedFile(file.name);
         loop_stop_requested_.store(false);
         loop_config_ = LoopConfig{};
@@ -4623,13 +4711,13 @@ private:
         // packet mode returns to a known baseline on the new channel while
         // preserving the selected TX power level.
         if (words.size() < 2) {
-            std::printf("Usage: CHANNEL <0-125>\n");
+            std::printf("Usage: CHANNEL <0-%u>\n", kMaxRadioChannel);
             return false;
         }
 
         uint8_t channel = 0;
-        if (!parseUint8Arg(words[1], 0, 125, channel)) {
-            std::printf("Channel must be in the range 0-125.\n");
+        if (!parseUint8Arg(words[1], 0, kMaxRadioChannel, channel)) {
+            std::printf("Channel must be in the range 0-%u.\n", kMaxRadioChannel);
             return false;
         }
 
@@ -4657,6 +4745,32 @@ private:
 
         std::printf("Radio reinitialized on channel %u\n", static_cast<unsigned>(status.channel));
         return true;
+    }
+
+    bool commandFem(const std::vector<std::string>& words, CommandOrigin origin)
+    {
+        if ((origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth) ||
+            words.size() != 3 || uppercaseCopy(words[1]) != "ANT" ||
+            (words[2] != "1" && words[2] != "2") || !hal_.femAntenna()) {
+            std::printf("FEM ERROR requires_supported_board_and_FEM_ANT_1_or_2\n");
+            return false;
+        }
+        if (!takeLoop(pdMS_TO_TICKS(50))) {
+            std::printf("FEM ERROR busy\n");
+            return false;
+        }
+        if (!takeRadio(pdMS_TO_TICKS(50))) {
+            giveLoop();
+            std::printf("FEM ERROR busy\n");
+            return false;
+        }
+        const bool idle = !loop_config_.active && manager_.status().state == RadioState::Standby &&
+            !hasActiveIncomingReceiveLocked();
+        const bool accepted = idle && hal_.selectFemAntenna(words[2] == "2" ? 2 : 1);
+        giveRadio();
+        giveLoop();
+        std::printf("FEM %s ANT %s\n", accepted ? "OK" : "ERROR", words[2].c_str());
+        return accepted;
     }
 
     bool commandPower(const std::vector<std::string>& words)
@@ -4756,8 +4870,8 @@ private:
                 }
 
                 if (!parsed_channel) {
-                    if (!parseUint8Arg(words[i], 0, 125, channel)) {
-                        std::printf("CW channel must be in the range 0-125.\n");
+                    if (!parseUint8Arg(words[i], 0, kMaxRadioChannel, channel)) {
+                        std::printf("CW channel must be in the range 0-%u.\n", kMaxRadioChannel);
                         return false;
                     }
                     parsed_channel = true;
@@ -4832,9 +4946,9 @@ private:
         uint8_t channel = manager_.status().channel;
         uint8_t power_level = 3;
 
-        if (words.size() >= 3 && !parseUint8Arg(words[2], 0, 125, channel)) {
+        if (words.size() >= 3 && !parseUint8Arg(words[2], 0, kMaxRadioChannel, channel)) {
             giveRadio();
-            std::printf("CW channel must be in the range 0-125.\n");
+            std::printf("CW channel must be in the range 0-%u.\n", kMaxRadioChannel);
             return false;
         }
 
@@ -4871,7 +4985,7 @@ private:
             return;
         }
 
-        if (power_.nrfRail()) manager_.refreshSnapshot();
+        if (power_.radioAvailable()) manager_.refreshSnapshot();
         const RadioStatus status = manager_.status();
         giveRadio();
 
@@ -4901,8 +5015,13 @@ private:
             (void)statFileSize(buildFilePath(loop.file_name), bytes);
             prepareTransferReport(last_tx_report_, FileInfo{loop.file_name, bytes}, manager_.status(), nextTransferId());
         }
+        // Keep the requested mode even when battery/radio preparation aborts
+        // before the selected sender has a chance to publish its own report.
+        queued = copyTransferReport(last_tx_report_);
+        queued.no_ack = loop.no_ack;
+        publishTransferReport(last_tx_report_, queued);
         const bool cutoff = power_.battery(monotonicMilliseconds()).cutoff;
-        bool ok = !cutoff && power_.nrfRail() && ensureStandbyLocked();
+        bool ok = !cutoff && power_.radioAvailable() && ensureStandbyLocked();
         RadioStatus status = manager_.status();
         if (ok) {
             const std::string path = buildFilePath(loop.file_name);
@@ -4924,12 +5043,13 @@ private:
         }
         giveRadio();
 
-        const bool stopped = loop_stop_requested_.load();
+        bool stopped = false;
         bool restore_rx = false;
-        if (!takeLoop(pdMS_TO_TICKS(50))) {
+        if (!takeLoop()) {
             return;
         }
 
+        stopped = loop_stop_requested_.load();
         if (loop_config_.active && loop_config_.mode == LoopMode::Tx) {
             if (ok) {
                 ++loop_config_.completed_iterations;
@@ -4940,7 +5060,7 @@ private:
 
             const bool finished = ok && !loop_config_.infinite && loop_config_.remaining_iterations == 0;
             if (stopped || !ok || finished) {
-                restore_rx = loop_config_.restore_rx_after_completion;
+                restore_rx = !stopped && loop_config_.restore_rx_after_completion;
                 clearLoopLocked();
             }
         }
@@ -4958,7 +5078,7 @@ private:
                      status.last_fault);
         }
 
-        if (restore_rx && power_.nrfRail() &&
+        if (restore_rx && power_.radioAvailable() &&
             !power_.battery(monotonicMilliseconds()).cutoff) {
             tryResumeWirelessRx("Remote control RX resumed after TX");
         }
@@ -5039,7 +5159,7 @@ private:
         const std::vector<KeyEvent> events = Morse::encode(loop.morse_text, kDefaultMorseDotMs);
         const std::string morse_line = Morse::render(loop.morse_text);
         if (events.empty()) {
-            if (takeLoop(pdMS_TO_TICKS(50))) {
+            if (takeLoop()) {
                 if (loop_config_.active && loop_config_.mode == LoopMode::Morse) {
                     clearLoopLocked();
                 }
@@ -5067,9 +5187,10 @@ private:
         }
         giveRadio();
 
-        const bool stopped = loop_stop_requested_.load();
+        bool stopped = false;
         bool restore_rx = false;
-        if (takeLoop(pdMS_TO_TICKS(50))) {
+        if (takeLoop()) {
+            stopped = loop_stop_requested_.load();
             if (loop_config_.active && loop_config_.mode == LoopMode::Morse) {
                 if (ok) {
                     ++loop_config_.completed_iterations;
@@ -5078,7 +5199,7 @@ private:
                     }
                 }
 
-                restore_rx = loop_config_.restore_rx_after_completion;
+                restore_rx = !stopped && loop_config_.restore_rx_after_completion;
                 clearLoopLocked();
             }
             giveLoop();
@@ -5134,7 +5255,7 @@ private:
             !manager_.leaveRx()) {
             return false;
         }
-        const bool sent = manager_.sendPayload(response.data(), response.size());
+        const bool sent = manager_.sendPayloadAndListen(response.data(), response.size());
         const bool resumed = manager_.enterRx();
         return sent && resumed;
     }
@@ -5306,10 +5427,10 @@ private:
             loop_stop_requested_.store(true);
             discardIncomingFileTransfer("Battery cutoff discarded incomplete RX");
         }
-        if (power_.nrfRail()) (void)manager_.powerDown();
+        if (power_.radioAvailable()) (void)manager_.powerDown();
         (void)hal_.setSignalOutputsEnabled(false);
         const bool outputs_low = power_.applyCutoff(now);
-        if (!outputs_low) ESP_LOGW(TAG, "Battery cutoff could not request both enables LOW");
+        if (!outputs_low) ESP_LOGW(TAG, "Battery cutoff could not request the configured enables LOW");
     }
 
     // Caller owns radio_mutex_ from classifying the RF state through sampling
@@ -5317,7 +5438,7 @@ private:
     bool serviceBatteryLocked(uint64_t now, bool file_tx)
     {
         const auto battery = power_.battery(now);
-        if (battery.cutoff && (power_.powerGood() || power_.nrfRail() || !battery.persisted)) {
+        if (battery.cutoff && (power_.powerGood() || power_.radioAvailable() || !battery.persisted)) {
             applyBatteryCutoffLocked(now);
             return false;
         }
@@ -5362,7 +5483,7 @@ private:
         if (!file_tx) {
             const bool quiet = quiet_radio && !loop_owns_radio_.load() &&
                 !hasActiveIncomingReceiveLocked();
-            const unsigned context = (static_cast<unsigned>(state) << 1) | power_.nrfRail();
+            const unsigned context = (static_cast<unsigned>(state) << 1) | power_.radioAvailable();
             if (power_.poll(now, quiet, hal_.lastRadioActivityMs(), false, context)) {
                 applyBatteryCutoffLocked(now);
                 return false;
@@ -5404,7 +5525,7 @@ private:
                     if (previous_poll_us != 0)
                         RuntimeDiagnostics::global().rx_poll.record(static_cast<uint64_t>(poll_us - previous_poll_us));
                     previous_poll_us = poll_us;
-                    if (power_.nrfRail()) manager_.refreshSnapshot();
+                    if (power_.radioAvailable()) manager_.refreshSnapshot();
                     const RadioStatus snapshot = manager_.status();
 
                     if (snapshot.carrier_detected && !last_carrier_detected_) {
@@ -5545,8 +5666,11 @@ private:
     {
         // Local USB / Bluetooth SPP board control only; never an over-air REMOTE
         // operation. GPIO21 is a logic request to an external rail switch.
-        if (!power_.supported() ||
-            (origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth) ||
+        if (!power_.hasNrfRailControl()) {
+            std::printf("NRFRAIL ERROR no_independent_rail_control\n");
+            return false;
+        }
+        if ((origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth) ||
             words.size() != 2 || (uppercaseCopy(words[1]) != "ON" && uppercaseCopy(words[1]) != "OFF")) {
             std::printf("NRFRAIL ERROR use_ON_or_OFF_on_devboard_USB_or_Bluetooth\n");
             return false;
@@ -5610,17 +5734,32 @@ private:
             if (!beginReceiveMutation(words, origin)) return false;
             reservation.acquired(receive_mutation_reserved_);
         }
+        if (command == "FEM") return commandFem(words, origin);
         if (command == "NRFRAIL") return commandNrfRail(words, origin);
         if (command == "BATTERY") {
             if (!power_.supported() || (origin!=CommandOrigin::Local && origin!=CommandOrigin::Bluetooth) ||
                 words.size()!=2 || action!="RESET" || !takeRadio(pdMS_TO_TICKS(50))) {
-                std::printf("BATTERY ERROR reset_requires_local_devboard_and_idle_radio\n"); return false;
+                std::printf("BATTERY ERROR reset_requires_local_battery_control_and_idle_radio\n");
+                return false;
             }
-            const bool ok=power_.resetCutoff(monotonicMilliseconds());
+            const bool reset = power_.resetCutoff(monotonicMilliseconds());
+            if (reset && !power_.hasNrfRailControl()) {
+                // On the old PCB GPIO15 is the only external power control.
+                // Restore the SPI outputs after power has had time to settle.
+                delayAtLeastMs(10);
+                if (!hal_.setSignalOutputsEnabled(true)) {
+                    applyBatteryCutoffLocked(monotonicMilliseconds());
+                    giveRadio();
+                    std::printf("BATTERY ERROR RESET radio_outputs_unavailable\n");
+                    return false;
+                }
+                (void)manager_.boot(manager_.status().channel);
+            }
             giveRadio();
-            std::printf("BATTERY %s RESET%s\n",ok ? "OK" : "ERROR",
-                ok ? " nRF_rail_remains_OFF" : " requires_fresh_quiet_pack_at_least_21V");
-            return ok;
+            const char* detail = !reset ? " requires_fresh_quiet_pack_at_least_21V" :
+                power_.hasNrfRailControl() ? " nRF_rail_remains_OFF" : "";
+            std::printf("BATTERY %s RESET%s\n", reset ? "OK" : "ERROR", detail);
+            return reset;
         }
         const bool rf_command = command == "TX" || command == "TXNOACK" || command == "TXHEX" ||
             command == "TXNOACKHEX" || command == "RX" || command == "RXNOACK" || command == "MORSE" ||
@@ -5634,8 +5773,9 @@ private:
             std::printf("ERR %s battery_requires_fresh_quiet_measurement_or_cutoff_reset\n",command.c_str());
             return false;
         }
-        if (!power_.nrfRail() && rf_command) {
-            std::printf("ERR %s nrf_rail_off_use_NRFRAIL_ON\n", command.c_str());
+        if (!power_.radioAvailable() && rf_command) {
+            std::printf("ERR %s %s\n", command.c_str(), power_.hasNrfRailControl()
+                ? "nrf_rail_off_use_NRFRAIL_ON" : "battery_cutoff_requires_BATTERY_RESET");
             return false;
         }
         if (command == "ECHO") {
@@ -5949,6 +6089,12 @@ private:
     TaskHandle_t bluetooth_command_task_ = nullptr;
     std::string bluetooth_rx_line_;
     bool bluetooth_rx_overflow_ = false;
+    portMUX_TYPE bluetooth_session_mux_ = portMUX_INITIALIZER_UNLOCKED;
+    bool bluetooth_disconnect_pending_ = false;  // Session mux protected.
+    bool bluetooth_close_received_ = false;      // Session mux protected.
+    uint32_t bluetooth_retry_handle_ = 0;  // All retry fields are session-mux protected.
+    uint32_t bluetooth_retry_epoch_ = 0;
+    int64_t bluetooth_retry_at_us_ = 0;
     BluetoothTx::Flow bluetooth_tx_flow_;
     std::atomic<uint32_t> bluetooth_epoch_{0};
     uint32_t bluetooth_dispatch_epoch_ = 0;  // Command mutex protected.
@@ -5963,10 +6109,9 @@ extern "C" void app_main(void);
 void app_main(void)
 {
     DevboardPowerIo power_io;
-    DevboardPower::Controller power(power_io,
-        HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard);
+    DevboardPower::Controller power(power_io, HardwareProfile::kSelectedBatteryPower);
     if (!power.initialize()) {
-        ESP_LOGE(TAG, "Could not initialize devboard power outputs; stopping startup.");
+        ESP_LOGE(TAG, "Could not initialize board power outputs; stopping startup.");
         return;
     }
     if (power.supported()) delayAtLeastMs(10);
@@ -5986,7 +6131,7 @@ void app_main(void)
              static_cast<int>(config.irq_pin));
 
     Esp32Nrf24Hal hal(config);
-    if (!power.nrfRail()) (void)hal.setSignalOutputsEnabled(false);
+    if (!power.radioAvailable()) (void)hal.setSignalOutputsEnabled(false);
     Nrf24 radio(hal);
     RadioManager manager(radio);
     DemoConsoleApp app(manager, power, hal);

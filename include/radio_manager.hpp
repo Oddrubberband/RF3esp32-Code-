@@ -59,7 +59,12 @@ public:
     bool hasPendingRx();
 
     // Data plane operations.
-    bool sendPayload(const uint8_t* payload, size_t len, bool allowRecovery = true);
+    bool sendPayload(const uint8_t* payload, size_t len, bool allowRecovery = true,
+                     bool listenAfterSend = false);
+    bool sendPayloadAndListen(const uint8_t* payload, size_t len, bool allowRecovery = true)
+    {
+        return sendPayload(payload, len, allowRecovery, true);
+    }
     bool receivePayload(uint8_t* out, size_t capacity, size_t& outLen);
 
     // Power controls.

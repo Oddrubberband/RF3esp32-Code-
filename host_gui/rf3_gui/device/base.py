@@ -78,6 +78,9 @@ class DeviceBackend(QObject):
     def set_power(self, level: int) -> None:
         raise NotImplementedError
 
+    def set_fem_antenna(self, antenna: int) -> None:
+        self.command_finished.emit("FEM ANT", False, "This board does not report a selectable FEM antenna")
+
     def enter_rx(self) -> None:
         raise NotImplementedError
 

@@ -10,13 +10,16 @@ $projectRoot = if ($Version -eq 'Previous') {
     if (-not $PreviousRoot) { throw 'Previous requires -PreviousRoot pointing to the complete preserved implementation.' }; $PreviousRoot
 } else { $PSScriptRoot }
 $projectRoot = (Resolve-Path -LiteralPath $projectRoot).Path
-$environmentName = if ($Board -eq 'custom') { 'rf3_custom_pcb' } else { 'rf3_esp32_devboard' }
+$environmentName = if ($Board -eq 'custom') { 'rf3_custom_pcb' } else { 'rf3_usb_fem' }
 $imageBase = if (Test-Path -LiteralPath (Join-Path $projectRoot 'firmware')) {
     Join-Path $projectRoot 'firmware'
 } else { Join-Path $projectRoot '.pio\build' }
-$imageDirectory = Join-Path $imageBase $environmentName
 $manifest = Get-Content -LiteralPath (Join-Path $projectRoot 'Firmware_Images.json') -Raw | ConvertFrom-Json
 $selected = if ($manifest.Current) { $manifest.Current } else { $manifest.Repaired }
+if ($Version -eq 'Previous' -and $Board -eq 'devboard' -and -not $selected.rf3_usb_fem) {
+    $environmentName = 'rf3_esp32_devboard'
+}
+$imageDirectory = Join-Path $imageBase $environmentName
 $expected = $selected.$environmentName
 if (-not $expected) { throw 'No verified image hashes for this board. Use the complete release package.' }
 foreach ($fileName in @('bootloader.bin','partitions.bin','firmware.bin')) {

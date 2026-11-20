@@ -2,7 +2,8 @@
 
 The maintained GUI is `dist/RF3Desktop/RF3Desktop.exe`, built with RF3Desktop.spec.
 Use the root README.md and docs/build_and_test.md for portable commands. Complete
-prebuilt GUI distributions are attached to the current GitHub release after CI.
+prebuilt GUI distributions accompany their matching firmware. This local
+candidate uses the RF3-CBT-R1-20261119 build identity.
 
 ```powershell
 py -3.11 -m venv .venv-host
@@ -29,8 +30,9 @@ File payloads and live-message contents are omitted from saved diagnostics.
 A debug RX arrow means the PC received text, not proof of RF peer delivery.
 Both boards need current firmware for suffix metadata; see docs/protocol_v2.md.
 
-The devboard battery update reports separate sensed and corrected pack voltages,
-firmware charge estimates and GPIO15/21 output requests. Five completed quiet4s
-means below20.4V sensed latch cutoff; explicit recovery needs a fresh quiet21V
-reading. The nonmodal shutdown warning survives a disconnect. STATUS confirms
+Both profiles report sensed and corrected pack voltages, firmware charge
+estimates and the GPIO15 output request. Only the devboard reports a separate
+GPIO21 radio-rail request. Five completed 4-second means below 20.4 V sensed
+latch cutoff. Explicit recovery needs a fresh quiet reading of at least 21 V.
+The shutdown warning remains visible after disconnect. STATUS reports requested
 output levels. See the root README and calibration guide for timing and limits.

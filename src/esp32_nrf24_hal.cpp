@@ -6,6 +6,34 @@
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 
+#if RF3_AUTOMATIC_FEM
+namespace {
+// Explicit jumper assignments belong to the selected custom-board build.
+constexpr gpio_num_t kCtx = static_cast<gpio_num_t>(RF3_FEM_CTX_PIN);
+constexpr gpio_num_t kCrx = static_cast<gpio_num_t>(RF3_FEM_CRX_PIN);
+constexpr gpio_num_t kCsd = static_cast<gpio_num_t>(RF3_FEM_CSD_PIN);
+constexpr gpio_num_t kCps = static_cast<gpio_num_t>(RF3_FEM_CPS_PIN);
+constexpr gpio_num_t kAnt = static_cast<gpio_num_t>(RF3_FEM_ANT_PIN);
+constexpr gpio_num_t kFemPins[] = {kCtx, kCrx, kCsd, kCps, kAnt};
+static_assert(RF3_HARDWARE_PROFILE_ID == 1, "Automatic FEM requires the explicit custom-board profile");
+constexpr bool validFemPins()
+{
+    for (unsigned index = 0; index < 5; ++index) {
+        const int pin = static_cast<int>(kFemPins[index]);
+        if (pin < 0 || pin > 33 || pin == 6 || pin == 7 || pin == 8 ||
+            pin == 9 || pin == 10 || pin == 11 || pin == 15 ||
+            pin == NRF24_CE_PIN || pin == NRF24_CSN_PIN || pin == NRF24_IRQ_PIN ||
+            pin == NRF24_SCK_PIN || pin == NRF24_MOSI_PIN || pin == NRF24_MISO_PIN) return false;
+        for (unsigned prior = 0; prior < index; ++prior) {
+            if (kFemPins[prior] == kFemPins[index]) return false;
+        }
+    }
+    return true;
+}
+static_assert(validFemPins(), "FEM jumpers conflict with custom radio, battery, flash or each other");
+}
+#endif
+
 // The constructor performs all one-time Espressif IoT Development Framework
 // (ESP-IDF) hardware setup needed by the generic nRF24 driver: configure Chip
 // Enable (CE) as a General-Purpose Input/Output (GPIO) pin, then create a
@@ -14,6 +42,16 @@
 Esp32Nrf24Hal::Esp32Nrf24Hal(const Esp32Nrf24Config& config)
     : config_(config)
 {
+#if RF3_AUTOMATIC_FEM
+    gpio_config_t fem{};
+    fem.mode = GPIO_MODE_OUTPUT;
+    for (auto pin : kFemPins) {
+        ESP_ERROR_CHECK(gpio_set_level(pin, 0));
+        fem.pin_bit_mask |= 1ULL << pin;
+    }
+    ESP_ERROR_CHECK(gpio_config(&fem));
+    frontEnd(FrontEndMode::Off);
+#endif
     // Chip Enable (CE) is controlled outside normal SPI transfers, so it is a
     // plain output pin that starts low to keep the radio quiescent during
     // setup.
@@ -94,6 +132,7 @@ bool Esp32Nrf24Hal::setSignalOutputsEnabled(bool enabled)
     // RF Protocol v2 remains unchanged; caller owns the radio mutex.
     ce(false);
     signal_outputs_enabled_ = false;
+    frontEnd(FrontEndMode::Off);
     const gpio_mode_t mode = enabled ? GPIO_MODE_OUTPUT : GPIO_MODE_INPUT;
     bool ok = true;
     for (gpio_num_t pin : {config_.csn_pin, config_.sck_pin, config_.mosi_pin}) {
@@ -130,4 +169,70 @@ uint64_t Esp32Nrf24Hal::nowUs()
     // esp_timer_get_time already returns microseconds, which is exactly what the
     // driver's polling loops expect.
     return static_cast<uint64_t>(esp_timer_get_time());
+}
+
+void Esp32Nrf24Hal::frontEnd(FrontEndMode mode)
+{
+#if RF3_AUTOMATIC_FEM
+    // Hide telemetry until every GPIO operation and settling delay completes.
+    fem_completed_mode_.store(-1);
+    // CPS first removes gain. Break both directions before enabling the next path.
+    ESP_ERROR_CHECK(gpio_set_level(kCps, 0));
+    ESP_ERROR_CHECK(gpio_set_level(kCtx, 0));
+    ESP_ERROR_CHECK(gpio_set_level(kCrx, 0));
+    ESP_ERROR_CHECK(gpio_set_level(kCsd, 0));
+    ESP_ERROR_CHECK(gpio_set_level(kAnt, signal_outputs_enabled_ && fem_antenna_.load() == 2 ? 1 : 0));
+    esp_rom_delay_us(5);
+    front_end_mode_ = FrontEndMode::Off;
+    if (mode != FrontEndMode::Off && signal_outputs_enabled_) {
+        ESP_ERROR_CHECK(gpio_set_level(kCsd, 1));
+        ESP_ERROR_CHECK(gpio_set_level(mode == FrontEndMode::Tx ? kCtx : kCrx, 1));
+        ESP_ERROR_CHECK(gpio_set_level(kCps, 1));
+        esp_rom_delay_us(5);
+        front_end_mode_ = mode;
+    }
+    fem_completed_mode_.store(static_cast<int>(front_end_mode_));
+#else
+    (void)mode;
+#endif
+}
+
+
+unsigned Esp32Nrf24Hal::femAntenna() const
+{
+#if RF3_AUTOMATIC_FEM
+    return fem_antenna_.load();
+#else
+    return 0;
+#endif
+}
+
+bool Esp32Nrf24Hal::selectFemAntenna(unsigned antenna)
+{
+#if RF3_AUTOMATIC_FEM
+    if ((antenna != 1 && antenna != 2) || !signal_outputs_enabled_ || ce_asserted_ ||
+        front_end_mode_ != FrontEndMode::Off) return false;
+    frontEnd(FrontEndMode::Off);
+    fem_antenna_.store(static_cast<uint8_t>(antenna));
+    frontEnd(FrontEndMode::Off);
+    return true;
+#else
+    (void)antenna;
+    return false;
+#endif
+}
+
+
+const char* Esp32Nrf24Hal::femMode() const
+{
+#if RF3_AUTOMATIC_FEM
+    switch (fem_completed_mode_.load()) {
+    case static_cast<int>(FrontEndMode::Off): return "off";
+    case static_cast<int>(FrontEndMode::Rx): return "rx";
+    case static_cast<int>(FrontEndMode::Tx): return "tx";
+    default: return nullptr;
+    }
+#else
+    return nullptr;
+#endif
 }

@@ -51,6 +51,7 @@ int main(int argc, char**)
     assert(json_line.find("\"power\":-1") != std::string::npos);
     assert(json_line.find("\"loop\":\"CwLoop\"") != std::string::npos);
     if (argc > 1) std::cout << json_line << '\n';
+    s.fem_antenna=2;s.fem_mode="off";
     // Maximum legal filename escaping, all counters at UINT32_MAX, and the
     // longest actual state/error names. This must fit one SPP message + CRLF.
     s.board_power = true;

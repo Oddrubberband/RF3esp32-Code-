@@ -84,6 +84,33 @@ class TestNoAckMode(unittest.TestCase):
         self.terminal(tx_no_ack=False)
         self.assertEqual(self.progress[-1].state, TransferState.FAILED)
 
+    def test_console_summary_then_json_after_stop_keeps_mode_and_reason(self):
+        for no_ack in (False, True):
+            with self.subTest(no_ack=no_ack):
+                self.status(no_ack_files=True, tx_no_ack=False, tx_state="Idle", tx_id="00000000")
+                self.assertTrue(self.backend.set_no_ack_mode(no_ack))
+                self.backend.start_stored_tx("report.bin")
+                self.backend._handle_line("OK " + console_protocol.stored_tx_command("report.bin", no_ack=no_ack))
+                self.terminal(tx_state="SendingData", tx_bytes="1/3", tx_no_ack=no_ack)
+                self.backend.stop()
+                self.backend._handle_line("OK STOP")
+                self.backend._handle_line("profile=custom-pcb State=Standby tx_id=11112222 "
+                                          "tx_state=Cancelled tx_file=report.bin tx_bytes=1/3 "
+                                          "peer_complete=false tx_error=cancelled")
+                self.assertIsNotNone(self.backend._rf_tx_name)
+                self.assertTrue(self.backend._snapshot.capabilities.supports_no_ack_files)
+                self.terminal(tx_state="Cancelled", tx_bytes="1/3", tx_error="cancelled",
+                              tx_no_ack=no_ack)
+                self.assertEqual(self.progress[-1].state, TransferState.CANCELLED)
+                self.assertEqual(self.progress[-1].sent_bytes, 1)
+                self.assertNotIn("mode", self.progress[-1].message)
+
+    def test_terminal_failure_reports_esp_reason_even_when_mode_resets(self):
+        self.start()
+        self.terminal(tx_state="Failed", tx_no_ack=False, tx_error="timeout")
+        self.assertEqual(self.progress[-1].state, TransferState.FAILED)
+        self.assertIn("timeout", self.progress[-1].message)
+
     def test_upload_uses_its_latched_mode_after_local_preference_changes(self):
         self.arm()
         with tempfile.TemporaryDirectory() as directory:

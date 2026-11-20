@@ -174,15 +174,18 @@ def _serial_ports():
     return list(list_ports.comports())
 
 
-def _address_in_instance(address: str, instance: str) -> bool:
-    return re.search(r"(?<![0-9A-F])" + compact_address(address) + r"(?![0-9A-F])",
-                     instance.upper()) is not None
+def instance_address(instance: str) -> str | None:
+    """Read the peer field from the instance suffix, excluding the service UUID."""
+    suffix = instance.upper().rsplit("\\", 1)[-1]
+    match = re.search(r"(?:^|&)([0-9A-F]{12})(?:_|$)", suffix)
+    return match.group(1) if match else None
 
 
 def _registry_spp_ports(address: str) -> list[str]:
     """Read only the selected remote device's SPP driver mapping; no registry writes."""
     import winreg
-    result = []
+    selected = compact_address(address)
+    owners: dict[str, set[str]] = {}
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
                             r"SYSTEM\CurrentControlSet\Enum\BTHENUM") as root:
@@ -193,33 +196,38 @@ def _registry_spp_ports(address: str) -> list[str]:
                 with winreg.OpenKey(root, service_name) as service:
                     for child in range(winreg.QueryInfoKey(service)[0]):
                         instance = winreg.EnumKey(service, child)
-                        if not _address_in_instance(address, instance):
+                        owner = instance_address(instance)
+                        if owner is None:
                             continue
                         try:
                             with winreg.OpenKey(service, instance + r"\Device Parameters") as parameters:
                                 port, _ = winreg.QueryValueEx(parameters, "PortName")
                                 if re.fullmatch(r"COM[0-9]+", str(port), re.IGNORECASE):
-                                    result.append(str(port))
+                                    owners.setdefault(str(port).upper(), set()).add(owner)
                         except OSError:
                             continue
     except OSError:
-        pass
-    return result
+        return []
+    return [port for port, addresses in owners.items() if addresses == {selected}]
 
 
 def matching_spp_ports(address: str, ports, registry_ports=()) -> list[str]:
+    selected = compact_address(address)
     matches = set()
     mapped = {str(port).upper() for port in registry_ports}
     for port in ports:
         hardware = str(getattr(port, "hwid", ""))
         label = str(getattr(port, "description", ""))
         combined = (hardware + " " + label).upper()
-        if "INCOMING" in combined or "000000000000" in combined:
+        if "INCOMING" in combined or not ("BLUETOOTH" in combined or "BTHENUM" in combined):
             continue
-        if ("BTHENUM" in combined and _address_in_instance(address, hardware)) or (
-            str(port.device).upper() in mapped and ("BLUETOOTH" in combined or "BTHENUM" in combined)
-        ):
-            matches.add(str(port.device))
+        remote = instance_address(hardware)
+        name = str(port.device).upper()
+        if remote is not None:
+            if remote == selected:
+                matches.add(name)
+        elif name in mapped:
+            matches.add(name)
     return sorted(matches)
 
 

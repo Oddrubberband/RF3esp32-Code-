@@ -37,7 +37,9 @@ jobs:
       - name: Check source hygiene
         run: python tools/check_repository_hygiene.py
       - name: Native RF protocol and HAL tests
-        run: python -m platformio test -e native
+        run: |
+          python -m platformio test -e native
+          python -m platformio test -d profiles/usb-devboard -e native
       - name: Python host and release tooling tests
         run: python -m unittest discover -s test -p 'test_*.py' -v
       - name: Strict native host helper fixtures
@@ -62,7 +64,9 @@ jobs:
       - name: Actual diagnostics dispatch and framing
         run: python tools/tests/test_diagnostics_runtime.py --compiler g++ --output .ci-native/diagnostics
       - name: Build both matching firmware profiles
-        run: python -m platformio run -e rf3_custom_pcb -e rf3_esp32_devboard
+        run: |
+          python -m platformio run -e rf3_custom_pcb
+          python -m platformio run -d profiles/usb-devboard -e rf3_usb_fem
       - name: Package verified firmware images
         run: python tools/package_current_release.py --kind firmware
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

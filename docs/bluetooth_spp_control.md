@@ -1,6 +1,6 @@
-## Battery update RF3-BAT-R1-20261105
+## Battery telemetry
 
-Devboard STATUS adds `battery_estimated_mv` beside `battery_mv`. Both are integer
+Both battery-enabled profiles include `battery_estimated_mv` beside `battery_mv`. Both are integer
 millivolts: `battery_mv` is the sensed protection value, and the estimate is
 100 mV lower, floored at zero. Missing values remain unavailable. Battery states
 include startup, averaging, settling, fresh, held, stale, low_pending,
@@ -8,7 +8,7 @@ sensor_error and cutoff. Existing status is cached; requests do not sample ADC.
 
 USB text and Classic Bluetooth SPP may emit this asynchronous event:
 `BATTERY SHUTOFF turn_physical_power_boot_switch_OFF_connect_charged_replacement_source`
-It means shutdown has started. STATUS confirms persisted latch and output levels.
+It means shutdown has started. STATUS reports the persisted latch and output requests. The 4 MB USB FEM build uses independent radio power. The custom PCB uses GPIO21 for antenna selection.
 No host acknowledgement is required. Message delivery is not guaranteed if device
 or connection power disappears. The event does not change RF Protocol v2.
 

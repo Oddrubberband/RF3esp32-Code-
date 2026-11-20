@@ -174,6 +174,26 @@ class DevboardPowerTests(unittest.TestCase):
         self.assertFalse(self.backend._battery_reset_timer.isActive())
         self.assertTrue(window.nrf_rail_on_button.isEnabled())
 
+    def test_custom_pcb_has_battery_reset_without_independent_rail_control(self):
+        window = self.window()
+        self.gauge(profile="custom-pcb", state="PowerDown", test_mode=False, nrf_rail=None,
+                   battery_cutoff=True, battery_persisted=True, battery_state="cutoff", power_good=False)
+        self.assertEqual(window.nrf_rail_value.text(), "not available")
+        self.assertFalse(window.nrf_rail_on_button.isEnabled())
+        self.assertFalse(window.nrf_rail_off_button.isEnabled())
+        self.assertFalse(window.wake_button.isEnabled())
+        with patch("rf3_gui.ui.main_window.QMessageBox.warning") as warning:
+            self.backend.set_nrf_rail(True)
+            warning.assert_called_once()
+        self.assertTrue(self.backend._write_queue.empty())
+        self.assertTrue(window.battery_reset_button.isEnabled())
+        window.battery_reset_button.click()
+        self.assertEqual(self.backend._write_queue.get_nowait(), "BATTERY RESET")
+        self.gauge(profile="custom-pcb", state="Standby", test_mode=False, nrf_rail=None)
+        self.assertFalse(self.backend._awaiting_battery_reset)
+        self.assertTrue(window.wake_button.isEnabled())
+        self.assertFalse(window.nrf_rail_on_button.isEnabled())
+
     def test_stale_voltage_does_not_allow_reset(self):
         self.gauge(battery_cutoff=True,battery_state="stale",battery_age_ms=20000)
         self.backend.reset_battery_cutoff()

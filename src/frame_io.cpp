@@ -1,7 +1,9 @@
 #include "frame_io.hpp"
 
 #include <cstdio>
-#include <sstream>
+#include <charconv>
+#include <string_view>
+#include <utility>
 
 std::string FrameIO::toLine(const FrameRecord& record)
 {
@@ -18,42 +20,38 @@ std::string FrameIO::toLine(const FrameRecord& record)
 
 bool FrameIO::fromLine(const std::string& line, FrameRecord& record)
 {
-    // Parse the same pipe-delimited layout emitted by toLine.
-    std::stringstream ss(line);
-    std::string direction;
-    std::string timestamp_str;
-    std::string channel_str;
-    std::string payload_hex;
-
-    if (!std::getline(ss, direction, '|')) {
-        return false;
-    }
-    if (!std::getline(ss, timestamp_str, '|')) {
-        return false;
-    }
-    if (!std::getline(ss, channel_str, '|')) {
-        return false;
-    }
-    if (!std::getline(ss, payload_hex, '|')) {
-        return false;
-    }
-
-    record.is_tx = (direction == "TX");
-
-    try {
-        record.timestamp_us = static_cast<uint64_t>(std::stoull(timestamp_str));
-        record.channel = static_cast<uint8_t>(std::stoul(channel_str));
-    } catch (...) {
-        return false;
-    }
-
-    return hexToBytes(payload_hex, record.payload);
+    std::string_view fields(line);
+    if (!fields.empty() && fields.back() == '\n') fields.remove_suffix(1);
+    if (!fields.empty() && fields.back() == '\r') fields.remove_suffix(1);
+    const auto field = [&](std::string_view& value) {
+        const auto end = fields.find('|');
+        if (end == std::string_view::npos) return false;
+        value = fields.substr(0, end);
+        fields.remove_prefix(end + 1);
+        return true;
+    };
+    const auto decimal = [](std::string_view value, auto& output) {
+        if (value.empty()) return false;
+        const char* end = value.data() + value.size();
+        const auto result = std::from_chars(value.data(), end, output);
+        return result.ec == std::errc{} && result.ptr == end;
+    };
+    FrameRecord parsed;
+    std::string_view direction, timestamp, channel;
+    if (!field(direction) || !field(timestamp) || !field(channel) ||
+        (direction != "TX" && direction != "RX") ||
+        !decimal(timestamp, parsed.timestamp_us) || !decimal(channel, parsed.channel) ||
+        !hexToBytes(std::string(fields), parsed.payload)) return false;
+    parsed.is_tx = direction == "TX";
+    record = std::move(parsed);
+    return true;
 }
 
 bool FrameIO::appendRecord(const char* path, const FrameRecord& record)
 {
     // Persisting frames as newline-delimited records keeps appends cheap and
     // avoids having to maintain a more complex binary log format.
+    if (!path || !*path) return false;
     const std::string line = toLine(record);
     if (line.empty()) {
         return false;
@@ -65,9 +63,8 @@ bool FrameIO::appendRecord(const char* path, const FrameRecord& record)
     }
 
     const int written = std::fprintf(fp, "%s\n", line.c_str());
-    std::fclose(fp);
-
-    return written > 0;
+    const int closed = std::fclose(fp);
+    return written > 0 && closed == 0;
 }
 
 std::string FrameIO::bytesToHex(const std::vector<uint8_t>& data)

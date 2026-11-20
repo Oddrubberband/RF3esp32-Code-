@@ -1,2 +1,2 @@
-BUILD_ID = "RF3-BAT-R1-20261105"
-DISPLAY_NAME = "RF3 Desktop — Battery Update"
+BUILD_ID = "RF3-CBT-R1-20261119"
+DISPLAY_NAME = "RF3 Desktop — Custom PCB with FEM"

@@ -171,6 +171,9 @@ class AppController(QObject):
     def set_power(self, level: int) -> None:
         self._backend.set_power(level)
 
+    def set_fem_antenna(self, antenna: int) -> None:
+        self._backend.set_fem_antenna(antenna)
+
     def enter_rx(self) -> None:
         self._backend.enter_rx()
 
@@ -265,6 +268,12 @@ class AppController(QObject):
         previous = self._selected_device
         self._devices = devices
         self._selected_device = _matching_device(previous, devices) or (devices[0] if devices else None)
+        # After Scan Bluetooth, select a scan result so Connect resolves the
+        # chosen peer's current address instead of opening an old COM number.
+        peers = [device for device in devices if device.transport == "bluetooth"]
+        if peers and previous and previous.transport == "serial":
+            self._selected_device = next((peer for peer in peers if peer.address == previous.bluetooth_address),
+                                         peers[0])
         self._snapshot = replace(
             self._snapshot,
             connection_state=ConnectionState.DISCONNECTED,

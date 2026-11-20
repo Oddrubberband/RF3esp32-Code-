@@ -55,7 +55,7 @@ struct TestSink {
     std::atomic<uint32_t> bluetooth_epoch_{1};
     std::vector<std::string> cutoff_events;
     bool sendBluetoothText(std::string_view text) {
-        assert(radio_held && power_.powerGood() && power_.nrfRail() && hal_.enabled);
+        assert(radio_held && power_.powerGood() && power_.radioAvailable() && hal_.enabled);
         assert(power_.battery(monotonicMilliseconds()).cutoff);
         cutoff_events.emplace_back(text);
         return true;
@@ -69,7 +69,7 @@ struct TestSink {
     cpp=cpp.replace('bool takeRadio(TickType_t){','bool takeRadio(TickType_t=100){')
     old='    bool ensureStandbyLocked(){assert(radio_held);if(manager_.value.state==RadioState::Fault)return false;manager_.value.state=RadioState::Standby;return true;}\n'
     cpp=cpp.replace(old,'')
-    methods=''
+    methods=main[main.index('    bool commandFem('):main.index('    bool commandPower(')]
     methods+=main[main.index('    static bool txBatteryCheckEntry('):main.index('    void rxTask()')]
     methods+=main[main.index('    void discardIncomingFileTransfer('):main.index('    bool isLoopActive()')]
     methods+=main[main.index('    bool ensureStandbyLocked()'):main.index('    bool isRemoteCommandAllowed(')]
@@ -168,9 +168,12 @@ int main(int argc,char** argv){
         assert(power_app.power_.nrfRail());
     } else {
         assert(!power_app.guardedAttempt("NRFRAIL OFF",CommandOrigin::Local));
-        assert(power_app.power_io_.outputs.empty());
+        assert(!power_app.guardedAttempt("NRFRAIL ON",CommandOrigin::Local));
+        assert(power_app.power_.radioAvailable() && power_app.hal_.enabled);
+        const std::vector<std::pair<int, bool>> expected_outputs{{15, true}};
+        assert(power_app.power_io_.outputs == expected_outputs);
     }
-    if (HardwareProfile::kSelectedId==HardwareProfile::Id::Esp32Devboard) {
+    {
         DemoConsoleApp gauge;
         const auto service_at = [](DemoConsoleApp& target, uint64_t time) {
             runtime_test_clock_ms = time;
@@ -259,12 +262,29 @@ int main(int argc,char** argv){
             assert(report.state == ReliableTransferV2::SenderState::Cancelled);
             assert(!report.peer_complete && report.error == ProtocolV2::ErrorCode::Cancelled);
             assert(tx.power_.battery(runtime_test_clock_ms).cutoff);
-            assert(!tx.power_.powerGood() && !tx.power_.nrfRail() && !tx.hal_.enabled);
+            assert(!tx.power_.powerGood() && !tx.power_.radioAvailable() && !tx.hal_.enabled);
             assert(tx.manager_.value.state == RadioState::PowerDown);
             assert(tx.cutoff_events == std::vector<std::string>{event});
             tx.giveRadio();
             service_at(tx, runtime_test_clock_ms + 250);
             assert(tx.cutoff_events.size() == 1);
+            assert(!tx.guardedAttempt("RX", CommandOrigin::Local));
+            assert(!tx.guardedAttempt("BATTERY RESET", CommandOrigin::Local));
+
+            tx.power_io_.reading.millivolts = 2400;
+            const uint64_t start = runtime_test_clock_ms + 250;
+            for (uint64_t t = start; t <= start + 4000; t += 250) service_at(tx, t);
+            assert(!tx.guardedAttempt("BATTERY RESET", CommandOrigin::Remote));
+            assert(tx.guardedAttempt("BATTERY RESET", CommandOrigin::Local));
+            assert(!tx.power_.battery(runtime_test_clock_ms).cutoff && tx.power_.powerGood());
+            if (HardwareProfile::kSelectedId == HardwareProfile::Id::CustomPcb) {
+                assert(tx.power_.radioAvailable() && tx.hal_.enabled);
+                assert(tx.manager_.boot_count == 1 && tx.manager_.value.state == RadioState::Standby);
+                const std::vector<std::pair<int, bool>> expected_outputs{{15, true}, {15, false}, {15, true}};
+                assert(tx.power_io_.outputs == expected_outputs);
+            } else {
+                assert(!tx.power_.radioAvailable() && !tx.hal_.enabled && tx.manager_.boot_count == 0);
+            }
         }
     }
     std::cerr<<"Real receiver repeat-RX/partial-sink/CRC completion/command guard/STOP cancellation checks passed for "<<HardwareProfile::kSelectedName<<'\n';

@@ -72,7 +72,8 @@ class TestReleaseTools(unittest.TestCase):
         (gui / "unrelated.txt").write_text("not part of the executable distribution")
         (self.root / "Flash_Manual.ps1").write_text("# manual BOOT/EN helper test\n", encoding="utf-8")
         for environment in packaging.ENVIRONMENTS:
-            folder = self.root / ".pio/build" / environment
+            project = self.root / "profiles/usb-devboard" if environment == "rf3_usb_fem" else self.root
+            folder = project / ".pio/build" / environment
             folder.mkdir(parents=True)
             for name in packaging.IMAGE_NAMES:
                 (folder / name).write_bytes((environment + ":" + name).encode())

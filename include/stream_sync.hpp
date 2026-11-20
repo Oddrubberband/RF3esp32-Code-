@@ -423,6 +423,10 @@ public:
         }
 
         if (chunk.chunk_index == 0) {
+            if (active_ && chunk.message_id == message_id_ && chunk.chunk_count == chunk_count_ &&
+                chunk.text == std::string_view(text_buffer_.data(), chunk.text.size())) {
+                return Action::Ignored;
+            }
             reset();
             active_ = true;
             message_id_ = chunk.message_id;

@@ -1,6 +1,7 @@
 import unittest
 import os
 import sys
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -343,7 +344,8 @@ class TestDevboardMode(unittest.TestCase):
                 time.sleep(0.01)
             backend._close_serial_port()
 
-            backend._connect_worker(device, backend._connection_generation)
+            # connect_to creates a fresh cancellation token for every new setup.
+            backend._connect_worker(device, backend._connection_generation, threading.Event())
             backend._write_queue.put("STATUS")
             deadline = time.monotonic() + 1.0
             while not created[1].writes and time.monotonic() < deadline:

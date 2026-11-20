@@ -526,7 +526,7 @@ void test_powerUp_sets_power_bit_and_waits_for_startup(void)
 
     TEST_ASSERT_TRUE(ok);
     TEST_ASSERT_TRUE((hal.regs[0x00] & (1 << 1)) != 0);
-    TEST_ASSERT_EQUAL_UINT32(1500, static_cast<uint32_t>(hal.time_us));
+    TEST_ASSERT_EQUAL_UINT32(4500, static_cast<uint32_t>(hal.time_us));
 }
 
 void test_probe_restores_original_channel_after_check(void)
@@ -1022,6 +1022,47 @@ void test_rxDrain_exits_on_receive_failure(void)
     TEST_ASSERT_TRUE(result.receive_failed);
 }
 
+void test_frame_io_empty_payload_and_rejected_input(void)
+{
+    FrameRecord record;
+    TEST_ASSERT_TRUE(FrameIO::fromLine("TX|18446744073709551615|255|\r\n", record));
+    TEST_ASSERT_TRUE(record.is_tx && record.timestamp_us == UINT64_MAX && record.channel == 255);
+    TEST_ASSERT_TRUE(record.payload.empty());
+    const std::string before = FrameIO::toLine(record);
+    for (const char* line : {"OTHER|12|3|00", "RX|-1|2|00", "TX|12x|3|00",
+                             "TX|18446744073709551616|3|00", "RX|0|256|00",
+                             "RX|0|3|0Z", "RX|0|3|AB|", "RX|0|3"}) {
+        TEST_ASSERT_FALSE(FrameIO::fromLine(line, record));
+        TEST_ASSERT_TRUE(FrameIO::toLine(record) == before);
+    }
+}
+
+void test_text_duplicate_first_chunk_preserves_progress(void)
+{
+    constexpr auto width = StreamSync::kTextChunkMaxBytes;
+    const std::string first(width, 'A'), middle(width, 'B'), replacement(width, 'X');
+    StreamSync::TextMessageAssembler assembler;
+    std::string_view result;
+    using Action = StreamSync::TextMessageAssembler::Action;
+    const auto accept = [&](uint8_t index, const std::string& text) {
+        uint8_t frame[AudioPacket::kPacketBytes]{};
+        size_t length = 0;
+        if (!StreamSync::encodeTextChunk(12, index, 3, text.data(), text.size(), frame, length))
+            return Action::Invalid;
+        return assembler.accept(frame, length, result);
+    };
+    TEST_ASSERT_TRUE(accept(0, first) == Action::InProgress);
+    TEST_ASSERT_TRUE(accept(1, middle) == Action::InProgress);
+    TEST_ASSERT_TRUE(accept(0, first) == Action::Ignored);
+    TEST_ASSERT_TRUE(accept(2, "C") == Action::Complete);
+    TEST_ASSERT_TRUE(result == first + middle + "C");
+    TEST_ASSERT_TRUE(accept(0, first) == Action::InProgress);
+    TEST_ASSERT_TRUE(accept(0, replacement) == Action::InProgress);
+    TEST_ASSERT_TRUE(accept(1, middle) == Action::InProgress);
+    TEST_ASSERT_TRUE(accept(2, "D") == Action::Complete);
+    TEST_ASSERT_TRUE(result == replacement + middle + "D");
+}
+
 void test_frame_io_round_trip_preserves_record(void)
 {
     FrameRecord original;
@@ -1514,6 +1555,28 @@ void test_driver_diagnostics_distinguish_completion_and_timeout_paths()
     TEST_ASSERT_EQUAL_UINT32(max_rt + 1, d.tx_max_rt.value());
 }
 
+void test_reply_listening_requires_confirmed_TX_DS_and_retains_rx_state(void)
+{
+    const std::array<uint8_t, 32> payload{};
+    FakeHal normal;
+    Nrf24 radio(normal);
+    RadioManager manager(radio);
+    TEST_ASSERT_TRUE(manager.sendPayloadAndListen(payload.data(), payload.size(), false));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(RadioState::RxListening),
+                          static_cast<int>(manager.status().state));
+    TEST_ASSERT_TRUE(normal.ce_level);
+    TEST_ASSERT_EQUAL_UINT8(3, normal.regs[0] & 3);
+    const int flushes = normal.flush_rx_count;
+    normal.queueRxPayload({1, 2, 3});
+    TEST_ASSERT_TRUE(manager.enterRx());
+    TEST_ASSERT_EQUAL_INT(flushes, normal.flush_rx_count);
+    TEST_ASSERT_EQUAL_UINT32(1, normal.rx_fifo_packets.size());
+
+    FifoOnlyHal no_done;
+    Nrf24 no_done_radio(no_done);
+    TEST_ASSERT_FALSE(no_done_radio.transmitOnce(payload.data(), payload.size(), 5000, false, true));
+}
+
 void test_radioManager_boot_probe_failure_sets_fault_code_1(void)
 {
     ProbeFailHal hal;
@@ -1926,6 +1989,7 @@ int main(void)
     runIntegrationReadinessTests();
     RUN_TEST(test_radioManager_rx_counter_survives_ack_turnaround_until_boot);
     RUN_TEST(test_driver_diagnostics_distinguish_completion_and_timeout_paths);
+    RUN_TEST(test_reply_listening_requires_confirmed_TX_DS_and_retains_rx_state);
     RUN_TEST(test_readReg_reads_value_and_formats_spi_command);
     RUN_TEST(test_readRfPowerLevel_decodes_rf_setup_bits);
     RUN_TEST(test_setRfPowerLevel_updates_packet_setup_and_register);
@@ -1968,6 +2032,8 @@ int main(void)
     RUN_TEST(test_rxDrain_processes_multiple_pending_packets);
     RUN_TEST(test_rxDrain_exits_on_receive_failure);
     RUN_TEST(test_frame_io_round_trip_preserves_record);
+    RUN_TEST(test_frame_io_empty_payload_and_rejected_input);
+    RUN_TEST(test_text_duplicate_first_chunk_preserves_progress);
     RUN_TEST(test_validation_rejects_oversized_payload);
     RUN_TEST(test_morse_encode_e_creates_single_dot_event);
     RUN_TEST(test_morse_encode_word_gap_is_seven_dots);
