@@ -44,6 +44,8 @@ constexpr unsigned configTICK_RATE_HZ=1000;
 #include "transfer_rate_limiter.hpp"
 #include "reliable_transfer_v2.hpp"
 #include "no_ack_transfer.hpp"
+#include "delivery_meter.hpp"
+uint32_t Delivery::observationId(){ static uint32_t id=1; return id+=2; }
 #include "host_storage_protocol.hpp"
 #include "host_status_protocol.hpp"
 #include "host_transfer_protocol.hpp"
@@ -89,6 +91,7 @@ public:
     bool send_success=false, ack_disable_success=true;
     unsigned ack_disable_calls=0;
     std::vector<ProtocolV2::Frame> sent_frames;
+    bool lastFrameTransmitted() const {return send_success;}
     bool disableAutoAck(){++ack_disable_calls;return ack_disable_success;}
     bool sendPayload(const uint8_t* bytes,size_t length,bool=true){++send_attempts;if(send_success){assert(length==32);ProtocolV2::Frame f{};std::copy(bytes,bytes+length,f.begin());sent_frames.push_back(f);value.state=RadioState::Standby;return true;}value.state=RadioState::Fault;value.last_fault=3;return false;}
     bool sendPayloadAndListen(const uint8_t* bytes,size_t length,bool recover=true){return sendPayload(bytes,length,recover);}
@@ -184,6 +187,7 @@ public:
     std::string last_saved_rx_file_;
     struct HostSession {bool active=false;} host_upload_, host_download_;
     struct Incoming {std::FILE* file=nullptr;} incoming_file_;
+    Delivery::Rx file_meter_,text_meter_; std::vector<Delivery::Row> pending_delivery_;
     FakeReceiver receiver_;
     bool rx_no_ack_mode_=false, rx_no_ack_requested_=false;
     LoopConfig loop_config_;

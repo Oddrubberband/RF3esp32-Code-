@@ -112,6 +112,8 @@
 //
 // Most of the project's user-visible behavior lives here, while lower-level
 // files keep packet formatting and radio access focused and testable.
+uint32_t Delivery::observationId() { return esp_random(); }
+
 namespace {
 constexpr const char* TAG = "APP";
 #if RF3_AUTOMATIC_FEM
@@ -966,7 +968,7 @@ using TxBatteryCheck = bool (*)(void*);
 bool sendDataFileNoAck(RadioManager& manager, const char* path,
                        const std::atomic_bool* stop_requested,
                        ProtocolTransferReport* report,
-                       TxBatteryCheck battery_check = nullptr, void* battery_context = nullptr, uint32_t pass = 0, uint32_t passes = 1)
+                       TxBatteryCheck battery_check = nullptr, void* battery_context = nullptr, uint32_t pass = 0, uint32_t passes = 1, uint32_t observation = 0)
 {
     ProtocolTransferReport next = copyTransferReport(*report);
     next.no_ack = true;
@@ -1005,6 +1007,17 @@ bool sendDataFileNoAck(RadioManager& manager, const char* path,
                 if (NoAckTransfer::encode(cancel, frame)) { frame[2]='G'; (void)manager.sendPayload(frame.data(), frame.size(), false); }
                 return finish(ReliableTransferV2::SenderState::Cancelled, ProtocolV2::ErrorCode::Cancelled);
             }
+            if (round==0 && slot==0 && observation) {
+                ProtocolV2::Packet marker{};
+                marker.type=ProtocolV2::PacketType::End; marker.transfer_id=next.transfer_id;
+                marker.total_packets=next.total_packets; marker.total_size=next.total_bytes; marker.crc32=next.crc32;
+                ProtocolV2::Frame boundary{};
+                if (NoAckTransfer::encode(marker,boundary)) {
+                    boundary[2]='M'; boundary[21]=4;
+                    ProtocolV2::storeLe32(boundary.data()+22,observation);
+                    (void)manager.sendPayload(boundary.data(),boundary.size(),false);
+                }
+            }
             if(slot==0 || (slot<symbols && slot%32==0)) {
                 if(!manager.sendPayload(start.data(),start.size(),false))
                     return finish(ReliableTransferV2::SenderState::Failed,ProtocolV2::ErrorCode::TransportFailure);
@@ -1031,6 +1044,7 @@ bool sendDataFileNoAck(RadioManager& manager, const char* path,
         // Optional one-way observation boundary. Older receivers ignore this magic.
         if (round == 0 || round + 1 == passes) {
             tail[2] = 'M';
+            ProtocolV2::storeLe32(tail.data()+22,observation);
             tail[21] = (round == 0 ? 1 : 0) | (round + 1 == passes ? 2 : 0);
             (void)manager.sendPayload(tail.data(), tail.size(), false);
         }
@@ -2880,6 +2894,8 @@ private:
             receiver_.active() ||
             receiver_.state() == ReliableTransferV2::ReceiverState::Failed;
         if (had_incomplete_transfer) {
+            file_meter_.end(receiver_.transferId(),
+                failure==ProtocolV2::ErrorCode::Cancelled ? "Cancelled" : "Failed",pending_delivery_);
             (void)receiver_.abort(failure);
             transfer_service_.reportReceiveFailed(
                 receiver_.transferId(), receiver_.error(), monotonicMilliseconds());
@@ -5103,7 +5119,7 @@ private:
             const std::string path = buildFilePath(loop.file_name);
             const auto check = power_.supported() ? &DemoConsoleApp::txBatteryCheckEntry : nullptr;
             ok = loop.no_ack
-                ? sendDataFileNoAck(manager_, path.c_str(), &loop_stop_requested_, &last_tx_report_, check, this, loop.completed_iterations, 3)
+                ? sendDataFileNoAck(manager_, path.c_str(), &loop_stop_requested_, &last_tx_report_, check, this, loop.completed_iterations, 3, tx_row.instance)
                 : sendDataFile(manager_, transfer_service_, path.c_str(), &loop_stop_requested_,
                                &last_tx_report_, check, this);
             status = manager_.status();
@@ -5363,10 +5379,14 @@ private:
         if (rx_no_ack_mode_ && len == adapted.size() && payload[2] == 'M') {
             std::copy_n(payload, len, adapted.data());
             const unsigned flags = adapted[21];
-            adapted[21] = 0; adapted[2] = 'N';
-            if (flags >= 1 && flags <= 3 && NoAckTransfer::decode(adapted.data(), len, one_way, adapted)
+            const uint32_t observation = ProtocolV2::loadLe32(adapted.data()+22);
+            std::fill_n(adapted.data()+21,5,0); adapted[2] = 'N';
+            if (flags >= 1 && flags <= 4 && NoAckTransfer::decode(adapted.data(), len, one_way, adapted)
                 && one_way.type == ProtocolV2::PacketType::End) {
-                file_meter_.boundary(one_way.transfer_id, one_way.total_packets, flags, pending_delivery_);
+                if (flags == 4 && observation) {
+                    file_meter_.beginPasses(one_way.transfer_id,one_way.total_packets,observation,
+                                             monotonicMilliseconds(),pending_delivery_);
+                } else file_meter_.boundary(one_way.transfer_id,one_way.total_packets,flags,observation,pending_delivery_);
             }
             return;
         }
@@ -5388,7 +5408,8 @@ private:
         const ReliableTransferV2::ReceiverEvent event = rx_no_ack_mode_ ? receiver_.onGapPacket(one_way,parity,now_ms,response) : receiver_.onFrame(
             payload, len, now_ms, response);
 
-        if (decoded_status == ProtocolV2::DecodeStatus::Ok) {
+        if (decoded_status == ProtocolV2::DecodeStatus::Ok &&
+            (receiver_.transferId()==incoming.transfer_id || (rx_no_ack_mode_ && !receiver_.active()))) {
             file_meter_.file(incoming, parity, rx_no_ack_mode_, event, now_ms, pending_delivery_);
         }
 
@@ -5626,6 +5647,7 @@ private:
         while (true) {
             std::string remote_command;
             std::vector<std::string> received_texts;
+            static std::vector<Delivery::Row> ready_delivery;
 
             if (takeRadio(pdMS_TO_TICKS(10))) {
                 if (receiveWorkerPaused()) {
@@ -5729,10 +5751,11 @@ private:
                 }
                 file_meter_.poll(monotonicMilliseconds(), false, pending_delivery_);
                 text_meter_.poll(monotonicMilliseconds(), true, pending_delivery_);
+                ready_delivery.swap(pending_delivery_);
                 giveRadio();
             }
-            for (const auto& row : pending_delivery_) emitDelivery(row);
-            pending_delivery_.clear();
+            for (const auto& row : ready_delivery) emitDelivery(row);
+            ready_delivery.clear();
 
             if (!remote_command.empty()) {
                 ESP_LOGI(TAG, "RX remote command: %s", remote_command.c_str());

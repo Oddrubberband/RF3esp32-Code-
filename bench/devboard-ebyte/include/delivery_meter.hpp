@@ -5,9 +5,10 @@
 #include <new>
 #include <vector>
 #include <string>
-#include "esp_random.h"
+
 
 namespace Delivery {
+uint32_t observationId();
 // All sequence sets are scoped to one on-air transmission ID. A missing
 // allocation makes the observation unavailable without aborting a transfer.
 class Bits {
@@ -35,7 +36,7 @@ struct Row {
     bool verified=false, closed=false;
     const char* result="Observing";
     Row(const char* d="RX", const char* m="ack", uint32_t i=0, int p=-1)
-        : direction(d), mode(m), id(i), instance(i ? esp_random() : 0), planned(p) {}
+        : direction(d), mode(m), id(i), instance(i ? (observationId() | 1u) : 0), planned(p) {}
     std::string line(const char* board) const {
         char data[220];
         std::snprintf(data,sizeof(data),"DELIVERY1 %s %s %s %08lX %08lX %d %d %d %d %d %d %d %s\r\n",
@@ -49,7 +50,7 @@ class Rx {
     Row row_;
     Bits bits_;
     uint64_t last_emit_=0, last_input_=0;
-    bool dirty_=false;
+    bool dirty_=false, tagged_=false, final_boundary_=false;
     void start(uint32_t id,int planned,const char* mode,uint64_t now,std::vector<Row>& out) {
         if (row_.id==id && std::string_view(row_.mode)==mode) {
             if (planned>=0) row_.planned=planned;
@@ -57,6 +58,8 @@ class Rx {
         }
         if (row_.id && !row_.closed) { row_.closed=true; out.push_back(row_); }
         row_=Row("RX",mode,id,planned);
+        tagged_=false; final_boundary_=false;
+        if (std::string_view(mode)=="noack") row_.instance &= ~1u;
         bits_=Bits(planned<0 ? ProtocolV2::kMaxPacketCount : unsigned(planned));
         row_.received=bits_.count(); dirty_=true; last_emit_=last_input_=now;
         out.push_back(row_);
@@ -79,6 +82,7 @@ public:
         const int plan=(p.type==T::Start || p.type==T::End) ? int(p.total_packets) : -1;
         start(p.transfer_id,plan,noack?"noack":"ack",now,out);
         last_input_=now;
+        if (final_boundary_) return;
         if (p.type==T::Data && !parity) {
             bits_.add(p.sequence); row_.received=bits_.count(); dirty_=true;
         }
@@ -90,11 +94,18 @@ public:
         } else if (event==E::Cancelled || p.type==T::Cancel) end(p.transfer_id,"Cancelled",out);
         else if (event==E::Failed) end(p.transfer_id,"Failed",out);
     }
-    void boundary(uint32_t id,int plan,unsigned flags,std::vector<Row>& out) {
-        if (id!=row_.id || row_.planned!=plan) return;
+    void beginPasses(uint32_t id,int plan,uint32_t observation,uint64_t now,std::vector<Row>& out) {
+        if (tagged_ && row_.instance==observation && row_.id==id) return;
+        if (row_.id && !row_.closed) { row_.closed=true; publish(out); }
+        row_=Row("RX","noack",id,plan); row_.instance=observation;
+        bits_=Bits(plan); row_.received=bits_.count(); tagged_=true; final_boundary_=false;
+        last_emit_=last_input_=now; publish(out);
+    }
+    void boundary(uint32_t id,int plan,unsigned flags,uint32_t observation,std::vector<Row>& out) {
+        if (id!=row_.id || row_.planned!=plan || (tagged_ && observation!=row_.instance)) return;
         row_.sent=plan;
         if (flags&1) row_.first=row_.received;
-        if (flags&2) { row_.closed=true; if (!row_.verified) row_.result="Incomplete"; }
+        if (flags&2) { final_boundary_=true; row_.closed=true; if (!row_.verified) row_.result="Incomplete"; }
         publish(out);
     }
     void end(uint32_t id,const char* result,std::vector<Row>& out) {
