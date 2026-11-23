@@ -18,12 +18,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
-    QScrollArea,
     QPushButton,
-    QComboBox,
     QSizePolicy,
     QSpinBox,
-    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QAbstractItemView,
@@ -35,6 +32,8 @@ from PySide6.QtWidgets import (
 from rf3_gui.app.controller import AppController
 from rf3_gui.app.receive_rate import ReceiveRateTracker
 from rf3_gui.build_info import BUILD_ID, DISPLAY_NAME
+from rf3_gui.ui import workbench
+from rf3_gui.ui.field_art import FieldComboBox
 from rf3_gui.protocol import console_protocol
 from rf3_gui.app.state_model import (
     BATTERY_CUTOFF_MV,
@@ -66,8 +65,6 @@ class MainWindow(QMainWindow):
         self._connection_epoch = 0
         self._was_connected = False
         self._closing = False
-        self._battery_cutoff_notified = False
-        self._battery_cutoff_notice = None
         self._rx_rate_tracker = ReceiveRateTracker()
         self._rx_rate_snapshot = None
 
@@ -82,54 +79,7 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _build_ui(self) -> None:
-        central = QWidget(self)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(14, 14, 14, 14)
-        root.setSpacing(8)
-
-        title = QLabel(DISPLAY_NAME)
-        title.setWordWrap(True)
-        title.setToolTip(f"GUI build: {BUILD_ID}\nApplication: {sys.executable}")
-        title.setObjectName("titleLabel")
-        title.setStyleSheet("font-size: 22px; font-weight: 600;")
-        root.addWidget(title)
-
-        root.addWidget(self._build_connection_group())
-
-        tabs = QTabWidget()
-        radio_page = QWidget()
-        radio_layout = QVBoxLayout(radio_page)
-        radio_layout.setContentsMargins(0, 8, 0, 0)
-        radio_layout.setSpacing(8)
-
-        middle = QHBoxLayout()
-        middle.setSpacing(10)
-        middle.addWidget(self._build_controls_group(), 1)
-        middle.addWidget(self._build_received_group(), 1)
-        radio_layout.addLayout(middle)
-
-        transfer_row = QHBoxLayout()
-        transfer_row.setSpacing(10)
-        transfer_row.addWidget(self._build_transfer_group(), 3)
-        transfer_row.addWidget(self._build_status_group(), 2)
-        radio_layout.addLayout(transfer_row)
-        radio_layout.addWidget(self._build_log_group(), 1)
-
-        text_page = QWidget()
-        text_layout = QVBoxLayout(text_page)
-        text_layout.setContentsMargins(0, 8, 0, 0)
-        text_layout.addWidget(self._build_over_air_group(), 1)
-
-        for page, label in ((radio_page, "Radio && Files"), (text_page, "Live Text && CW")):
-            scroll = QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setWidget(page)
-            tabs.addTab(scroll, label)
-        tabs.addTab(self._build_storage_page(), "SPIFFS Files")
-        root.addWidget(tabs, 1)
-
-        self.setCentralWidget(central)
-        self.statusBar().showMessage("Ready")
+        workbench.build(self)
 
     def _build_storage_page(self) -> QWidget:
         page = QWidget()
@@ -140,6 +90,11 @@ class MainWindow(QMainWindow):
         self.storage_summary = QLabel("Connect and refresh to view SPIFFS files.")
         self.storage_summary.setWordWrap(True)
         layout.addWidget(self.storage_summary)
+        self.capacity_bar = QProgressBar()
+        self.capacity_bar.setRange(0, 1000)
+        self.capacity_bar.setAccessibleName("Storage used at last file refresh")
+        self.capacity_bar.hide()
+        layout.addWidget(self.capacity_bar)
         self.storage_table = QTableWidget(0, 2)
         self.storage_table.setHorizontalHeaderLabels(["File name", "Size (bytes)"])
         self.storage_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -168,8 +123,10 @@ class MainWindow(QMainWindow):
         layout.addLayout(tx_buttons)
         self.storage_progress = QProgressBar()
         self.storage_progress.setRange(0, 1000)
+        self.storage_progress.hide()
         self.storage_operation = QLabel("Import and export use the host connection; import does not transmit over nRF24.")
         self.storage_operation.setWordWrap(True)
+        layout.addWidget(QLabel("Latest file operation"))
         layout.addWidget(self.storage_progress)
         layout.addWidget(self.storage_operation)
         return page
@@ -194,8 +151,18 @@ class MainWindow(QMainWindow):
         else:
             self.storage_table.clearSelection()
             self.storage_table.setCurrentCell(-1, -1)
-        if listing.available:
-            self.storage_summary.setText(f"{len(listing.files)} file(s) | used {listing.used:,} / {listing.capacity:,} bytes | free {listing.capacity - listing.used:,} bytes")
+        online = self._controller.snapshot.connection_state in {ConnectionState.CONNECTED, ConnectionState.BUSY}
+        valid_capacity = online and listing.available and 0 <= listing.used <= listing.capacity and listing.capacity > 0
+        self.capacity_bar.setVisible(valid_capacity)
+        if valid_capacity:
+            per_mille = listing.used * 1000 // listing.capacity
+            percent = per_mille // 10
+            display = "<1%" if listing.used and percent == 0 else f"{percent}%"
+            self.capacity_bar.setFormat(f"{display} used")
+            self.capacity_bar.setValue(per_mille)
+            self.storage_summary.setText(f"Last file listing · {len(listing.files)} file(s) · {listing.capacity - listing.used:,} bytes free · {listing.used:,} of {listing.capacity:,} bytes used")
+        elif online and listing.available:
+            self.storage_summary.setText(f"{len(listing.files)} file(s) · Storage capacity unavailable")
         else:
             self.storage_summary.setText("Refresh Files to read this board's SPIFFS contents. Updated firmware is required.")
         self._apply_storage_controls()
@@ -285,42 +252,48 @@ class MainWindow(QMainWindow):
             self._controller.delete_file(entry.name)
 
     def _build_connection_group(self) -> QGroupBox:
-        group = QGroupBox("Connection")
+        group = QGroupBox("Choose a board")
         layout = QGridLayout(group)
 
-        self.device_combo = QComboBox()
+        self.device_combo = FieldComboBox()
         self.device_combo.addItem("No devices discovered")
         self.device_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.device_combo.setMinimumContentsLength(24)
-        self.device_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.device_combo.setSizeAdjustPolicy(FieldComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
 
         self.discover_button = QPushButton("Refresh Ports")
         self.bluetooth_scan_button = QPushButton("Scan Bluetooth")
         self.connect_button = QPushButton("Connect")
         self.disconnect_button = QPushButton("Disconnect")
         self.refresh_button = QPushButton("Refresh Status")
-        self.test_mode_checkbox = QCheckBox("Test/devboard mode (no nRF24 TX)")
-        self.test_mode_checkbox.setToolTip("Verify files and text with the connected ESP over USB/Bluetooth; nRF24 commands stay blocked")
+        self.test_mode_checkbox = QCheckBox("ESP link test only (RF disabled)")
+        self.test_mode_checkbox.setToolTip("Clear this for a physical radio test. Select it to test the PC-to-ESP link only.")
+        self.mode_status_label = QLabel()
 
         self.connection_state_label = QLabel("Disconnected")
         self.connection_state_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.connection_detail_label = QLabel()
         self.connection_detail_label.setWordWrap(True)
 
-        layout.addWidget(QLabel("Device"), 0, 0)
-        layout.addWidget(self.device_combo, 0, 1, 1, 3)
-        layout.addWidget(self.connection_state_label, 0, 4)
-        layout.addWidget(self.discover_button, 1, 1)
-        layout.addWidget(self.bluetooth_scan_button, 1, 2)
-        layout.addWidget(self.connect_button, 1, 3)
-        layout.addWidget(self.disconnect_button, 1, 4)
-        layout.addWidget(self.refresh_button, 2, 4)
-        layout.addWidget(self.test_mode_checkbox, 2, 1, 1, 3)
-        guidance = QLabel("Classic SPP: scan, select your ESP, then Pair & Connect. Windows may request confirmation or a PIN.")
-        guidance.setToolTip("BLE-only devices require a separate transport and compatible firmware.")
-        guidance.setWordWrap(True)
-        layout.addWidget(guidance, 3, 1, 1, 4)
-        layout.addWidget(self.connection_detail_label, 4, 1, 1, 4)
+        layout.addWidget(self.device_combo, 0, 0, 1, 2)
+        layout.addWidget(self.connect_button, 0, 2)
+        discover = QHBoxLayout()
+        discover.addWidget(self.discover_button)
+        discover.addWidget(self.bluetooth_scan_button)
+        discover.addStretch()
+        layout.addLayout(discover, 1, 0, 1, 2)
+        layout.addWidget(self.disconnect_button, 1, 2)
+        self.connection_help = QLabel("For USB, refresh the ports and select the board. For Classic Bluetooth, scan and select the ESP. Windows may ask for a pairing PIN.")
+        self.connection_help.setWordWrap(True)
+        self.connection_help.setToolTip("Bluetooth requires Classic SPP on the selected device.")
+        layout.addWidget(self.connection_help, 2, 0, 1, 3)
+        layout.setRowMinimumHeight(3, 10)
+        layout.addWidget(self.mode_status_label, 3, 0, 1, 3)
+        layout.addWidget(self.test_mode_checkbox, 4, 0, 1, 2)
+        layout.addWidget(self.refresh_button, 4, 2)
+        layout.addWidget(self.connection_detail_label, 5, 0, 1, 2)
+        layout.addWidget(self.connection_state_label, 5, 2)
+        layout.setColumnStretch(0, 1)
         layout.setColumnStretch(1, 1)
 
         return group
@@ -384,12 +357,10 @@ class MainWindow(QMainWindow):
         self.sleep_button = QPushButton("Sleep")
         self.wake_button = QPushButton("Wake")
         self.power_down_button = QPushButton("Power Down")
-        state_row.addWidget(self.stop_button, 0, 0)
-        state_row.addWidget(self.standby_button, 0, 1)
-        state_row.addWidget(self.rx_button, 0, 2)
-        state_row.addWidget(self.sleep_button, 1, 0)
-        state_row.addWidget(self.wake_button, 1, 1)
-        state_row.addWidget(self.power_down_button, 1, 2)
+        state_row.addWidget(self.standby_button, 0, 0)
+        state_row.addWidget(self.sleep_button, 0, 1)
+        state_row.addWidget(self.wake_button, 0, 2)
+        state_row.addWidget(self.power_down_button, 0, 3)
         layout.addLayout(state_row)
 
         rail_row = QHBoxLayout()
@@ -416,7 +387,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(channel_row)
 
         power_row = QHBoxLayout()
-        self.power_combo = QComboBox()
+        self.power_combo = FieldComboBox()
         for level in range(4):
             self.power_combo.addItem(str(level), level)
         self.power_combo.setCurrentIndex(3)
@@ -435,21 +406,19 @@ class MainWindow(QMainWindow):
         antenna_row.addWidget(self.fem_antenna_button)
         layout.addWidget(self.fem_antenna_row)
 
-        file_mode_row = QHBoxLayout()
-        self.file_mode_combo = QComboBox()
-        self.file_mode_combo.addItem("Reliable (ACK)", False)
-        self.file_mode_combo.addItem("No ACK (one-way)", True)
-        self.file_mode_combo.setToolTip("Choose the same file-transfer mode on both boards, then press Receive on the receiver.")
-        self.file_mode_combo.currentIndexChanged.connect(self._set_file_mode)
-        file_mode_row.addWidget(QLabel("File transfer mode"))
-        file_mode_row.addWidget(self.file_mode_combo)
-        layout.addLayout(file_mode_row)
-        self.file_mode_hint = QLabel()
-        self.file_mode_hint.setWordWrap(True)
-        layout.addWidget(self.file_mode_hint)
+        self.fem_lna_row = QWidget()
+        lna_row = QHBoxLayout(self.fem_lna_row)
+        lna_row.setContentsMargins(0, 0, 0, 0)
+        self.fem_lna_label = QLabel()
+        self.fem_lna_button = QPushButton()
+        lna_row.addWidget(self.fem_lna_label)
+        lna_row.addWidget(self.fem_lna_button)
+        layout.addWidget(self.fem_lna_row)
+
+
 
         mode_row = QHBoxLayout()
-        self.modulation_combo = QComboBox()
+        self.modulation_combo = FieldComboBox()
         self.modulation_combo.addItem("nRF24 packet mode (fixed)")
         self.modulation_combo.setEnabled(False)
         mode_row.addWidget(QLabel("RF mode"))
@@ -458,8 +427,31 @@ class MainWindow(QMainWindow):
 
         return group
 
+    def _build_transfer_options(self) -> QGroupBox:
+        group = QGroupBox("Transfer settings")
+        layout = QGridLayout(group)
+        self.file_mode_combo = FieldComboBox()
+        self.file_mode_combo.addItem("Reliable (ACK)", False)
+        self.file_mode_combo.addItem("No ACK (one-way)", True)
+        self.file_mode_combo.setAccessibleName("File transfer mode")
+        self.file_mode_combo.setToolTip("Set both boards to the same mode, then press Receive on the destination.")
+        self.file_mode_combo.currentIndexChanged.connect(self._set_file_mode)
+        self.file_mode_hint = QLabel()
+        self.file_mode_hint.setWordWrap(True)
+        layout.addWidget(QLabel("File mode"), 0, 0)
+        layout.addWidget(self.file_mode_combo, 0, 1)
+        self.transfer_channel = QLabel()
+        layout.addWidget(self.transfer_channel, 0, 2, Qt.AlignmentFlag.AlignRight)
+        layout.addWidget(self.file_mode_hint, 1, 0, 1, 3)
+        guidance = QLabel("Match the channel and mode on both boards. Start Receive on the destination first.")
+        guidance.setWordWrap(True)
+        layout.addWidget(guidance, 2, 0, 1, 3)
+        layout.setColumnStretch(2, 1)
+        return group
+
     def _build_transfer_group(self) -> QGroupBox:
-        group = QGroupBox("Transmit File")
+        group = QGroupBox("Send a file")
+        group.setObjectName("sendCard")
         layout = QGridLayout(group)
 
         self.file_path_edit = QLineEdit()
@@ -470,22 +462,26 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
+        self.progress_bar.hide()
         self.transfer_state_label = QLabel("Idle")
+        self.transfer_state_label.setWordWrap(True)
         self.transfer_detail_label = QLabel("Choose a file to transfer or verify.")
         self.transfer_detail_label.setWordWrap(True)
         self.transfer_detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
-        layout.addWidget(QLabel("PC source"), 0, 0)
-        layout.addWidget(self.file_path_edit, 0, 1)
-        layout.addWidget(self.browse_button, 0, 2)
-        layout.addWidget(self.transmit_button, 0, 3)
-        layout.addWidget(self.progress_bar, 1, 1, 1, 2)
-        layout.addWidget(self.transfer_state_label, 1, 3)
-        layout.addWidget(self.transfer_detail_label, 2, 1, 1, 3)
+        layout.addWidget(QLabel("PC source"), 0, 0, 1, 2)
+        layout.addWidget(self.file_path_edit, 1, 0)
+        layout.addWidget(self.browse_button, 1, 1)
         self.upload_name_value = QLabel("SPIFFS upload name: no PC file chosen")
         self.upload_name_value.setWordWrap(True)
-        layout.addWidget(self.upload_name_value, 3, 1, 1, 3)
-        layout.setColumnStretch(1, 1)
+        layout.addWidget(self.upload_name_value, 2, 0, 1, 2)
+        layout.addWidget(QLabel("Latest file operation"), 3, 0, 1, 2)
+        layout.addWidget(self.transfer_state_label, 4, 0, 1, 2)
+        layout.addWidget(self.progress_bar, 5, 0, 1, 2)
+        layout.addWidget(self.transfer_detail_label, 6, 0, 1, 2)
+        layout.setRowStretch(7, 1)
+        layout.addWidget(self.transmit_button, 8, 0, 1, 2)
+        layout.setColumnStretch(0, 1)
 
         return group
 
@@ -498,7 +494,7 @@ class MainWindow(QMainWindow):
         self._apply_snapshot(self._controller.snapshot)
 
     def _build_received_group(self) -> QGroupBox:
-        group = QGroupBox("Incoming && Saved Files")
+        group = QGroupBox("Receive a file")
         layout = QGridLayout(group)
 
         self.rx_storage_value = QLabel("ESP SPIFFS (/spiffs)")
@@ -517,7 +513,12 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("Incoming RF"), 0, 0)
         layout.addWidget(self.rx_transfer_value, 0, 1, 1, 2)
-        layout.addWidget(self.rx_progress, 1, 1, 1, 2)
+        self.rx_stages = workbench.ReceiveStages()
+        progress_layout = QVBoxLayout()
+        progress_layout.setContentsMargins(0, 0, 0, 0)
+        progress_layout.addWidget(self.rx_stages)
+        progress_layout.addWidget(self.rx_progress)
+        layout.addLayout(progress_layout, 1, 1, 1, 2)
         layout.addWidget(QLabel("Payload rate"), 2, 0)
         layout.addWidget(self.rx_rate_value, 2, 1, 1, 2)
         layout.addWidget(QLabel("Last file"), 3, 0)
@@ -526,8 +527,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.rx_saved_detail_value, 4, 1, 1, 2)
         layout.addWidget(QLabel("Storage"), 5, 0)
         layout.addWidget(self.rx_storage_value, 5, 1, 1, 2)
-        layout.addWidget(self.copy_rx_path_button, 6, 1)
-        layout.addWidget(self.save_received_button, 6, 2)
+        actions = QHBoxLayout()
+        actions.addWidget(self.rx_button)
+        actions.addStretch()
+        actions.addWidget(self.copy_rx_path_button)
+        actions.addWidget(self.save_received_button)
+        layout.addLayout(actions, 6, 0, 1, 3)
         layout.setColumnStretch(1, 1)
 
         return group
@@ -561,7 +566,7 @@ class MainWindow(QMainWindow):
         self.cw_channel_spin = QSpinBox()
         self.cw_channel_spin.setRange(MIN_CHANNEL, MAX_CHANNEL)
         self.cw_channel_spin.setValue(76)
-        self.cw_power_combo = QComboBox()
+        self.cw_power_combo = FieldComboBox()
         for level in range(4):
             self.cw_power_combo.addItem(str(level), level)
         self.cw_power_combo.setCurrentIndex(3)
@@ -626,6 +631,9 @@ class MainWindow(QMainWindow):
         self.firmware_build_label = QLabel("Firmware build: read diagnostics to identify")
         self.firmware_build_label.setTextFormat(Qt.TextFormat.PlainText)
         self.firmware_build_label.setWordWrap(True)
+        desktop_build = QLabel(f"Desktop: {BUILD_ID}")
+        desktop_build.setToolTip(sys.executable)
+        layout.addWidget(desktop_build)
         layout.addWidget(self.diagnostics_button)
         layout.addWidget(self.firmware_build_label)
         layout.addWidget(self.show_debug_checkbox)
@@ -657,6 +665,8 @@ class MainWindow(QMainWindow):
         self.apply_power_button.clicked.connect(self._set_power)
         self.fem_antenna_button.clicked.connect(
             lambda: self._controller.set_fem_antenna(self.fem_antenna_button.property("antenna")))
+        self.fem_lna_button.clicked.connect(
+            lambda: self._controller.set_fem_lna(self.fem_lna_button.property("mode")))
         self.channel_spin.valueChanged.connect(lambda: self._mark_draft("channel"))
         self.cw_channel_spin.valueChanged.connect(lambda: self._mark_draft("cw_channel"))
         self.power_combo.currentIndexChanged.connect(lambda: self._mark_draft("power"))
@@ -751,33 +761,7 @@ class MainWindow(QMainWindow):
             self.device_combo.setCurrentIndex(selected_index)
             self._controller.select_device(selected_index)
 
-    def _update_battery_cutoff_notice(self, snapshot: DeviceSnapshot) -> None:
-        t = snapshot.telemetry
-        if not t.battery_cutoff:
-            # A disconnect clears telemetry; it is not evidence of recovery.
-            if (snapshot.capabilities.supports_battery_percent and
-                    t.battery_state == "fresh" and t.power_good is True):
-                self._battery_cutoff_notified = False
-                if self._battery_cutoff_notice is not None:
-                    self._battery_cutoff_notice.close()
-                    self._battery_cutoff_notice = None
-            return
-        if self._battery_cutoff_notified:
-            return
-        self._battery_cutoff_notified = True
-        message = ("Battery cutoff has started. Turn the physical power switch OFF "
-                   "and connect a charged replacement battery or suitable power source. "
-                   "A voltage rebound or reboot does not reset the saved cutoff.")
-        self._append_log("warning", message)
-        notice = QMessageBox(QMessageBox.Icon.Warning, "Battery cutoff", message,
-                             QMessageBox.StandardButton.Ok, self)
-        notice.setModal(False)
-        notice.setWindowModality(Qt.WindowModality.NonModal)
-        self._battery_cutoff_notice = notice
-        notice.show()
-
     def _apply_snapshot(self, snapshot: DeviceSnapshot) -> None:
-        self._update_battery_cutoff_notice(snapshot)
         connected = snapshot.connection_state in {
             ConnectionState.CONNECTED,
             ConnectionState.BUSY,
@@ -788,6 +772,14 @@ class MainWindow(QMainWindow):
         if connected != self._was_connected:
             self._connection_epoch += 1
             self._was_connected = connected
+            self.capacity_bar.hide()
+            self.storage_summary.setText("Refresh Files to read this board’s storage." if connected else "Connect and refresh to view board storage.")
+            if connected and self._connection_epoch > 1:
+                self.progress_bar.hide()
+                self.storage_progress.hide()
+                self.transfer_state_label.setText("Idle")
+                self.transfer_detail_label.setText("No file operation reported in this connection.")
+                self.storage_operation.setText(self.transfer_detail_label.text())
         self._sync_drafts(snapshot, connected)
         if not connected:
             self._pending_test_mode = None
@@ -798,23 +790,26 @@ class MainWindow(QMainWindow):
             self.test_mode_checkbox.blockSignals(True)
             self.test_mode_checkbox.setChecked(snapshot.test_mode)
             self.test_mode_checkbox.blockSignals(False)
+        have_report = connected and snapshot.confirmed_radio_state != RadioState.UNKNOWN
+        mode_text = "Waiting for board status"
+        if have_report:
+            mode_text = "ESP link test only" if snapshot.test_mode else "Physical radio"
+            device = self._controller.selected_device
+            if device is not None and device.transport == "mock":
+                mode_text = "Practice (simulated radio)"
+        self.mode_status_label.setText("Reported operating mode: " + mode_text)
+        self.test_mode_checkbox.setVisible(connected and snapshot.capabilities.supports_test_mode)
         self.test_mode_checkbox.setEnabled(
             connected and not busy and self._pending_test_mode is None
             and snapshot.confirmed_radio_state != RadioState.UNKNOWN
             and snapshot.capabilities.supports_test_mode
-            and self._controller.selected_device is not None
-            and self._controller.selected_device.transport in {"serial", "bluetooth"}
         )
         rail_off = snapshot.telemetry.nrf_rail is False or snapshot.telemetry.battery_cutoff
         controls_enabled = (connected and not busy and not snapshot.test_mode and not rail_off
                             and snapshot.confirmed_radio_state != RadioState.UNKNOWN
                             and self._pending_test_mode is None)
         bt=snapshot.telemetry
-        battery_ready=not snapshot.capabilities.supports_battery_percent or (
-            not bt.battery_cutoff and bt.battery_mv is not None and bt.battery_mv>=BATTERY_CUTOFF_MV
-            and bt.battery_age_ms is not None and bt.battery_age_ms<=10000
-            and bt.battery_state in {"fresh","held"})
-        rf_ready = controls_enabled and battery_ready and snapshot.confirmed_radio_state in {RadioState.STANDBY, RadioState.RX_LISTENING}
+        rf_ready = controls_enabled and snapshot.confirmed_radio_state in {RadioState.STANDBY, RadioState.RX_LISTENING}
         antenna = snapshot.fem_antenna
         self.fem_antenna_row.setVisible(connected and antenna in (1, 2))
         if antenna in (1, 2):
@@ -824,6 +819,22 @@ class MainWindow(QMainWindow):
             self.fem_antenna_button.setText(f"Select ANT{other} ({ports[other]})")
             self.fem_antenna_button.setProperty("antenna", other)
             self.fem_antenna_button.setEnabled(controls_enabled and snapshot.confirmed_radio_state == RadioState.STANDBY)
+
+        lna = snapshot.fem_lna
+        if connected and lna in ("gain", "bypass"):
+            other = "bypass" if lna == "gain" else "gain"
+            self.fem_lna_label.setText("Receive LNA: " + ("Amplified" if lna == "gain" else "Bypassed"))
+            self.fem_lna_button.setText("Bypass LNA" if other == "bypass" else "Enable LNA")
+            self.fem_lna_button.setProperty("mode", other)
+            self.fem_lna_button.setToolTip(self.fem_lna_label.text() + ". Change the receive path in standby.")
+            self.fem_lna_button.setEnabled(controls_enabled and not bt.battery_cutoff
+                                          and snapshot.confirmed_radio_state == RadioState.STANDBY)
+        else:
+            self.fem_lna_label.setText("Receive LNA: " + ("Unavailable" if connected else "No board connected"))
+            self.fem_lna_button.setText("Bypass LNA")
+            self.fem_lna_button.setProperty("mode", None)
+            self.fem_lna_button.setEnabled(False)
+            self.fem_lna_button.setToolTip("Available on boards that report receive LNA control.")
 
         board_power_controls = (connected and not busy and self._pending_test_mode is None
                                 and snapshot.capabilities.supports_board_power
@@ -836,6 +847,23 @@ class MainWindow(QMainWindow):
         selected_device = self._controller.selected_device
         identity = (f"{selected_device.name} [{selected_device.address}]" if selected_device else snapshot.profile)
         self.setWindowTitle(DISPLAY_NAME + (f" — {identity}" if identity else ""))
+        self.station.setText(identity if connected and identity else "No board connected")
+        self.station.setToolTip(self.station.text())
+        radio = snapshot.confirmed_radio_state
+        radio_label = {
+            RadioState.TX_BUSY: "Transmitting", RadioState.RX_LISTENING: "Listening",
+            RadioState.CW_TEST: "CW active", RadioState.POWER_DOWN: "Powered down",
+            RadioState.UNKNOWN: "Radio state unknown",
+        }.get(radio, radio.value)
+        self.host_state.setText(snapshot.connection_state.value)
+        workbench.tone(self.host_state, "active" if connected else
+                       "fault" if snapshot.connection_state == ConnectionState.ERROR else "neutral")
+        self.link_state.setText(radio_label if connected else "Unavailable")
+        radio_tone = {RadioState.RX_LISTENING: "active", RadioState.TX_BUSY: "outbound",
+                      RadioState.CW_TEST: "outbound", RadioState.FAULT: "fault"}.get(radio, "neutral")
+        workbench.tone(self.link_state, radio_tone if connected else "neutral")
+        self.host_state.setAccessibleName(f"PC link: {self.host_state.text()}")
+        self.link_state.setAccessibleName(f"Last radio report: {self.link_state.text()}")
         self.diagnostics_button.setEnabled(connected)
         if not connected:
             self.firmware_build_label.setText("Firmware build: read diagnostics to identify")
@@ -950,8 +978,15 @@ class MainWindow(QMainWindow):
                           self.selected_file_value, self.active_tx_file_value):
                 label.setText("Unavailable")
         # Keep valid transfer metadata even while the radio register lock is busy.
+        self.transfer_channel.setText(f"Radio channel   {self.channel_value.text()}")
         # Unknown radio state continues to guard all disruptive RF controls.
         incoming_available = connected and (telemetry_available or bool(snapshot.rx_transfer_id))
+        received_report = incoming_available and bool(snapshot.rx_transfer_id)
+        self.rx_stages.show_report(rx_state if received_report else "")
+        self.rx_progress.setVisible(received_report and snapshot.rx_total_bytes > 0)
+        self.rx_progress.setFormat("%p% of bytes")
+        result_tone = {"Failed": "fault", "Cancelled": "attention", "Completed": "active"}
+        workbench.tone(self.rx_transfer_value, result_tone.get(rx_state, "neutral") if received_report else "neutral")
         if not incoming_available:
             self.rx_transfer_value.setText("Unavailable")
             self.rx_progress.setValue(0)
@@ -1000,7 +1035,7 @@ class MainWindow(QMainWindow):
             and self._pending_test_mode is None
             and snapshot.capabilities.supports_host_file_upload
             and (not snapshot.test_mode or snapshot.capabilities.supports_host_file_download)
-            and (snapshot.test_mode or (not rail_off and battery_ready))
+            and (snapshot.test_mode or not rail_off)
         )
         self.copy_rx_path_button.setEnabled(telemetry_available and bool(rx_path or rx_file))
         self.save_received_button.setEnabled(
@@ -1019,7 +1054,7 @@ class MainWindow(QMainWindow):
         text_enabled = connected and not busy and self._pending_test_mode is None and (
             snapshot.capabilities.supports_host_echo if snapshot.test_mode
             else snapshot.capabilities.supports_text_messages
-        ) and (snapshot.test_mode or (not rail_off and battery_ready and snapshot.confirmed_radio_state in {RadioState.STANDBY, RadioState.RX_LISTENING}))
+        ) and (snapshot.test_mode or (not rail_off and snapshot.confirmed_radio_state in {RadioState.STANDBY, RadioState.RX_LISTENING}))
         self.send_text_button.setText("Send to ESP" if snapshot.test_mode else "Send to Peer")
         if snapshot.test_mode:
             description = (
@@ -1050,12 +1085,14 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"{snapshot.connection_state.value} | radio {snapshot.confirmed_radio_state.value}"
             + (" | TEST MODE: no nRF24 TX" if snapshot.test_mode else "")
-            + (f" | Receiving {snapshot.rx_received_bytes:,}/{snapshot.rx_total_bytes:,} bytes"
+            + (f" | {rx_state} {snapshot.rx_received_bytes:,}/{snapshot.rx_total_bytes:,} bytes"
                if receiving else "")
         )
         self._apply_storage_controls()
 
     def _apply_transfer_progress(self, progress: TransferProgress) -> None:
+        self.progress_bar.setVisible(progress.total_bytes > 0)
+        self.storage_progress.setVisible(progress.total_bytes > 0)
         self.storage_progress.setValue(int(progress.ratio * 1000))
         self.storage_operation.setText(progress.message)
         self.progress_bar.setValue(int(progress.ratio * 1000))
@@ -1102,9 +1139,10 @@ class MainWindow(QMainWindow):
         if self._controller.set_selected_file(path):
             self.file_path_edit.setText(str(path))
             self.progress_bar.setValue(0)
+            self.progress_bar.hide()
             self.transfer_state_label.setText("Idle")
             self.upload_name_value.setText(f"SPIFFS upload name: {console_protocol.import_filename(path.name)}")
-            self.transfer_detail_label.setText("PC source chosen. Transmit uploads this file first. Use SPIFFS Files to transmit an existing stored file.")
+            self.transfer_detail_label.setText("Transmit uploads this file first. To send a file already on the ESP, open Board files.")
             self._apply_snapshot(self._controller.snapshot)
 
     def _set_channel(self) -> None:

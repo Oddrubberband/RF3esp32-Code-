@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 from PySide6.QtCore import QTimer
 
@@ -23,6 +24,7 @@ from rf3_gui.app.state_model import (
     StorageListing,
 )
 from rf3_gui.device.base import DeviceBackend
+from rf3_gui.app.sim_tx import timing_profile
 from rf3_gui.protocol import console_protocol
 
 
@@ -61,6 +63,11 @@ class MockDeviceBackend(DeviceBackend):
         self._transfer_path: Path | None = None
         self._transfer_total = 0
         self._transfer_sent = 0
+        self._rf_sample_sequence = 0
+        self._rf_sample_id = ""
+        self._transfer_started: float | None = None
+        self._transfer_profile = None
+        self._transfer_no_ack = False
 
     def discover(self) -> None:
         self.log_event.emit("info", "Mock discovery started")
@@ -80,6 +87,9 @@ class MockDeviceBackend(DeviceBackend):
         QTimer.singleShot(500, self._finish_connect)
 
     def disconnect_from_device(self) -> None:
+        if self._transfer_started is not None:
+            self.rf_ended.emit("TX", self._rf_sample_id, "Failed")
+        self._transfer_started = None
         self._connected = False
         self._transfer_timer.stop()
         self._snapshot = DeviceSnapshot(
@@ -100,6 +110,7 @@ class MockDeviceBackend(DeviceBackend):
             return
         self.command_finished.emit(console_protocol.status_command(), True, "Status refreshed")
         self.status_changed.emit(self._snapshot)
+        self.fresh_status_report.emit()
 
     def refresh_storage(self) -> None:
         if self._require_connected("STORAGE LIST"):
@@ -166,12 +177,7 @@ class MockDeviceBackend(DeviceBackend):
         if remote_name not in self._stored_files or not console_protocol.valid_storage_name(remote_name):
             self.command_finished.emit("TXHEX", False, "Invalid SPIFFS file")
             return
-        self._snapshot = self._replace_snapshot(selected_file=remote_name, active_tx_file=remote_name)
-        self.status_changed.emit(self._snapshot)
-        self.transfer_changed.emit(TransferProgress(
-            state=TransferState.COMPLETED, sent_bytes=len(self._stored_files[remote_name]),
-            total_bytes=len(self._stored_files[remote_name]),
-            message=f"Mock stored-file TX: {remote_name}; no hardware transmission"))
+        self._begin_transfer(len(self._stored_files[remote_name]), remote_name, None, "TXHEX")
 
     def set_channel(self, channel: int) -> None:
         command = console_protocol.channel_command(channel)
@@ -218,14 +224,24 @@ class MockDeviceBackend(DeviceBackend):
         command = console_protocol.stop_command()
         if not self._require_connected(command):
             return
-        was_transferring = self._transfer_timer.isActive()
+        if (self._transfer_started is not None
+                and time.monotonic() - self._transfer_started >=
+                self._transfer_profile.elapsed_for_size(self._transfer_total)):
+            self._advance_transfer()
+        was_transferring = self._transfer_started is not None
+        if was_transferring:
+            elapsed = max(0.0, time.monotonic() - self._transfer_started)
+            self._transfer_sent = self._transfer_profile.bytes_at(self._transfer_total, elapsed)
         self._transfer_timer.stop()
+        self._transfer_started = None
         self._snapshot = self._replace_snapshot(
             connection_state=ConnectionState.CONNECTED,
             requested_radio_state=RadioState.STANDBY,
             confirmed_radio_state=RadioState.STANDBY,
         )
         if was_transferring:
+            self.rf_sample.emit("TX", self._rf_sample_id, "Cancelled",
+                                self._transfer_sent, self._transfer_total)
             self.transfer_changed.emit(
                 TransferProgress(
                     state=TransferState.CANCELLED,
@@ -245,7 +261,11 @@ class MockDeviceBackend(DeviceBackend):
         if not source_path.exists() or not source_path.is_file():
             self.command_finished.emit(command, False, "Source file does not exist")
             return
-        size = source_path.stat().st_size
+        try:
+            size = source_path.stat().st_size
+        except OSError as exc:
+            self.command_finished.emit(command, False, f"Could not read source file: {exc}")
+            return
         if size > PROTOCOL_V2_MAX_FILE_SIZE:
             self.command_finished.emit(
                 command,
@@ -254,23 +274,39 @@ class MockDeviceBackend(DeviceBackend):
             )
             return
 
+        self._begin_transfer(size, source_path.name, source_path, command)
+
+    def _begin_transfer(self, size: int, name: str, source_path: Path | None, command: str) -> None:
+        if self._transfer_started is not None:
+            self.command_finished.emit(command, False, "A mock RF transfer is already active; use Stop first")
+            return
+        if not 0 <= size <= PROTOCOL_V2_MAX_FILE_SIZE:
+            self.command_finished.emit(command, False, "File exceeds the supported transfer size")
+            return
         self._transfer_path = source_path
         self._transfer_total = size
         self._transfer_sent = 0
+        self._transfer_no_ack = self._no_ack_selected
+        self._transfer_profile = timing_profile(self._transfer_no_ack)
+        self._transfer_started = time.monotonic()
+        self._rf_sample_sequence += 1
+        self._rf_sample_id = f"MOCK-{self._rf_sample_sequence:08X}"
         self._snapshot = self._replace_snapshot(
             connection_state=ConnectionState.BUSY,
             requested_radio_state=RadioState.TX_BUSY,
             confirmed_radio_state=RadioState.TX_BUSY,
-            selected_file=source_path.name,
+            selected_file=name,
+            active_tx_file=name,
         )
-        self.command_finished.emit(command, True, f"TX started for {source_path.name}")
+        self.command_finished.emit(command, True, f"Mock TX started for {name}")
         self.status_changed.emit(self._snapshot)
+        self.rf_sample.emit("TX", self._rf_sample_id, "Preparing", 0, size)
         self.transfer_changed.emit(
             TransferProgress(
                 state=TransferState.PREPARING,
                 sent_bytes=0,
                 total_bytes=size,
-                message="Preparing transfer",
+                message=f"Mock stored-file TX: {name}; preparing transfer" if source_path is None else "Preparing transfer",
                 source_path=source_path,
             )
         )
@@ -303,7 +339,7 @@ class MockDeviceBackend(DeviceBackend):
         command = console_protocol.morse_command(text)
         if not self._require_connected(command):
             return
-        self._transfer_timer.stop()
+        self._interrupt_transfer()
         self._snapshot = self._replace_snapshot(
             connection_state=ConnectionState.BUSY,
             requested_radio_state=RadioState.TX_BUSY,
@@ -346,7 +382,7 @@ class MockDeviceBackend(DeviceBackend):
         command = console_protocol.cw_start_command(channel, power_level)
         if not self._require_connected(command):
             return
-        self._transfer_timer.stop()
+        self._interrupt_transfer()
         self._snapshot = self._replace_snapshot(
             connection_state=ConnectionState.BUSY,
             requested_radio_state=RadioState.CW_TEST,
@@ -365,7 +401,7 @@ class MockDeviceBackend(DeviceBackend):
         command = console_protocol.cw_loop_command(on_ms, off_ms, channel, power_level)
         if not self._require_connected(command):
             return
-        self._transfer_timer.stop()
+        self._interrupt_transfer()
         self._snapshot = self._replace_snapshot(
             connection_state=ConnectionState.BUSY,
             requested_radio_state=RadioState.CW_TEST,
@@ -398,10 +434,16 @@ class MockDeviceBackend(DeviceBackend):
         self.log_event.emit("info", "Application handshake accepted by mock device")
         self.status_changed.emit(self._snapshot)
 
+    def _interrupt_transfer(self) -> None:
+        self._transfer_timer.stop()
+        if self._transfer_started is not None:
+            self._transfer_started = None
+            self.rf_ended.emit("TX", self._rf_sample_id, "Cancelled")
+
     def _set_radio_state(self, command: str, state: RadioState) -> None:
         if not self._require_connected(command):
             return
-        self._transfer_timer.stop()
+        self._interrupt_transfer()
         self._snapshot = self._replace_snapshot(
             connection_state=ConnectionState.CONNECTED,
             requested_radio_state=state,
@@ -411,24 +453,42 @@ class MockDeviceBackend(DeviceBackend):
         self.status_changed.emit(self._snapshot)
 
     def _advance_transfer(self) -> None:
-        if self._transfer_path is None:
+        if not self._connected or self._transfer_started is None:
             self._transfer_timer.stop()
             return
-
-        step = max(1, self._transfer_total // 24) if self._transfer_total else 1
-        self._transfer_sent = min(self._transfer_total, self._transfer_sent + step)
+        elapsed = max(0.0, time.monotonic() - self._transfer_started)
+        profile = self._transfer_profile
+        self._transfer_sent = profile.bytes_at(self._transfer_total, elapsed)
+        if elapsed < profile.data_start:
+            phase = "Preparing" if self._transfer_no_ack else "Handshaking"
+            state = TransferState.PREPARING if self._transfer_no_ack else TransferState.HANDSHAKING
+            message = "Mock transfer setup"
+        elif elapsed < profile.data_end(self._transfer_total) or self._transfer_no_ack:
+            phase, state = "Transferring", TransferState.TRANSFERRING
+            message = "Mock one-way RF send; delivery unconfirmed" if self._transfer_no_ack else "Mock RF transfer in progress"
+        else:
+            phase, state = "Verifying", TransferState.VERIFYING
+            message = "Mock peer verification and completion"
+        finished = elapsed >= profile.elapsed_for_size(self._transfer_total)
+        if finished:
+            phase = "SentUnconfirmed" if self._transfer_no_ack else "Completed"
+            state = TransferState.SENT_UNCONFIRMED if self._transfer_no_ack else TransferState.COMPLETED
+            message = "Mock sent locally; delivery unconfirmed" if self._transfer_no_ack else "Mock peer confirmed complete"
+        self.rf_sample.emit("TX", self._rf_sample_id, phase,
+                            self._transfer_sent, self._transfer_total)
         self.transfer_changed.emit(
             TransferProgress(
-                state=TransferState.TRANSFERRING,
+                state=state,
                 sent_bytes=self._transfer_sent,
                 total_bytes=self._transfer_total,
-                message="Transfer in progress",
+                message=message,
                 source_path=self._transfer_path,
             )
         )
 
-        if self._transfer_sent >= self._transfer_total:
+        if finished:
             self._transfer_timer.stop()
+            self._transfer_started = None
             telemetry = Telemetry(
                 battery_percent=self._battery_percent,
                 last_tx_ok=True,
@@ -443,15 +503,6 @@ class MockDeviceBackend(DeviceBackend):
                 requested_radio_state=RadioState.STANDBY,
                 confirmed_radio_state=RadioState.STANDBY,
                 telemetry=telemetry,
-            )
-            self.transfer_changed.emit(
-                TransferProgress(
-                    state=TransferState.SENT_UNCONFIRMED if self._no_ack_selected else TransferState.COMPLETED,
-                    sent_bytes=self._transfer_total,
-                    total_bytes=self._transfer_total,
-                    message="Sent locally; delivery unconfirmed" if self._no_ack_selected else "Mock transfer complete",
-                    source_path=self._transfer_path,
-                )
             )
             self.status_changed.emit(self._snapshot)
 

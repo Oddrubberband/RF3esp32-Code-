@@ -144,6 +144,7 @@ class DeviceSnapshot:
     telemetry: Telemetry = field(default_factory=Telemetry)
     capabilities: RadioCapabilities = field(default_factory=RadioCapabilities)
     fem_antenna: int | None = None
+    fem_lna: str | None = None
 
 
 @dataclass(frozen=True)

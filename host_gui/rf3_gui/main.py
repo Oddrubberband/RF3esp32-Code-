@@ -45,6 +45,10 @@ def main() -> int:
     controller = AppController(backend)
     window = MainWindow(controller)
     window.log_location_label.setText(f"Diagnostic log: {log_path or 'unavailable'}")
+    window.session_label.setText("Mock preview" if backend_name == "mock" else "Hardware session")
+    if backend_name == "mock":
+        window.connection_help.setText("Connect to the mock board and open File transfer. Simulated sends follow historical RF3 bench timing for the selected mode.")
+    controller.discover_devices()
     window.resize(1080, 720)
     window.show()
 

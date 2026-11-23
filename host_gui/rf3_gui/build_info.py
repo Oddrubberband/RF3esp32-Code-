@@ -1,2 +1,2 @@
-BUILD_ID = "RF3-CBT-R1-20261119"
-DISPLAY_NAME = "RF3 Desktop — Custom PCB with FEM"
+BUILD_ID = "RF3-FIELD-R8"
+DISPLAY_NAME = "RF3 Workbench — Field Edition"

@@ -19,7 +19,6 @@ from typing import Any, BinaryIO
 from PySide6.QtCore import QTimer, Signal
 
 from rf3_gui.app.state_model import (
-    BATTERY_CUTOFF_MV,
     BATTERY_RESET_MV,
     ConnectionState,
     DEFAULT_CHANNEL,
@@ -165,6 +164,8 @@ class SerialDeviceBackend(DeviceBackend):
         self._rf_progress_marker: tuple | None = None
         self._pending_selection_name: str | None = None
         self._observed_rf_id = ""
+        self._rf_sample_last: dict[str, tuple[str, str, int, int]] = {}
+        self._rf_sample_retired: deque[tuple[str, str]] = deque(maxlen=64)
         self._rx_cancel_requested = False
         self._handshake_ok = False
         self._identity_ok = False
@@ -535,12 +536,8 @@ class SerialDeviceBackend(DeviceBackend):
         if any(not item.startswith("STATUS") for item in self._pending_commands):
             self.command_finished.emit(command, False, "Wait for the previous command acknowledgement")
             return False
-        t=self._snapshot.telemetry
-        if radio and self._snapshot.capabilities.supports_battery_percent and (
-                t.battery_cutoff or t.battery_mv is None or t.battery_mv<BATTERY_CUTOFF_MV
-                or t.battery_age_ms is None or t.battery_age_ms>10000
-                or t.battery_state not in {"fresh","held"}):
-            self.command_finished.emit(command,False,"Battery reading is not ready; use Standby and wait for a valid quiet sample or reset the cutoff")
+        if radio and self._snapshot.telemetry.battery_cutoff:
+            self.command_finished.emit(command, False, "Board reports a latched battery cutoff")
             return False
         if radio and self._snapshot.telemetry.nrf_rail is False:
             self.command_finished.emit(command, False, "Enable the nRF rail before RF operations")
@@ -643,6 +640,21 @@ class SerialDeviceBackend(DeviceBackend):
         self.status_changed.emit(self._snapshot)
         self.request_status()
 
+    def set_fem_lna(self, mode: str) -> None:
+        if mode not in ("gain", "bypass") or self._snapshot.fem_lna is None:
+            self.command_finished.emit("FEM LNA", False, "LNA bypass selection is unavailable")
+            return
+        if not self._operation_allowed("FEM LNA"):
+            return
+        if (self._snapshot.confirmed_radio_state != RadioState.STANDBY or self._snapshot.test_mode
+                or self._snapshot.telemetry.battery_cutoff or self._snapshot.telemetry.nrf_rail is False):
+            self.command_finished.emit("FEM LNA", False, "Return to standby with battery power enabled")
+            return
+        self._send_command(f"FEM LNA {mode.upper()}")
+        self._snapshot = self._replace_snapshot(connection_state=ConnectionState.BUSY)
+        self.status_changed.emit(self._snapshot)
+        self.request_status()
+
     def set_no_ack_mode(self, enabled: bool) -> bool:
         if (self._snapshot.connection_state == ConnectionState.BUSY or self._incoming_rx_active()
                 or self._upload_session is not None or self._download_session is not None
@@ -739,6 +751,7 @@ class SerialDeviceBackend(DeviceBackend):
                            total_bytes: int = 0, no_ack: bool = False) -> None:
         self._rf_tx_no_ack = no_ack
         self._rf_tx_name = name
+        self.rf_tx_command_active.emit(True)
         self._rf_tx_baseline_id = self._last_tx_id
         self._rf_tx_id = ""
         self._rf_progress_marker = None
@@ -754,6 +767,10 @@ class SerialDeviceBackend(DeviceBackend):
         self._status_poll_timer.start()
 
     def _finish_rf_transfer(self, state: TransferState, message: str, sent: int = 0, total: int = 0) -> None:
+        if self._rf_tx_name is not None:
+            phase = "SentUnconfirmed" if state in {TransferState.COMPLETED, TransferState.SENT_UNCONFIRMED} else state.value
+            self._end_rf_trace("TX", self._rf_tx_id, phase)
+            self.rf_tx_command_active.emit(False)
         self._rf_progress_timer.stop()
         self._rf_tx_name = None
         self._rf_tx_id = ""
@@ -1704,6 +1721,8 @@ class SerialDeviceBackend(DeviceBackend):
         self._rf_progress_marker = None
         self._last_tx_id = ""
         self._observed_rf_id = ""
+        self._rf_sample_last.clear()
+        self._rf_sample_retired.clear()
         self._rx_cancel_requested = False
         self._pending_selection_name = None
         self._storage_kind = None
@@ -2077,6 +2096,13 @@ class SerialDeviceBackend(DeviceBackend):
                 **rx_fields,
             )
             self.status_changed.emit(self._snapshot)
+            self._sample_rx_status(values, rx_fields)
+            if (values.get("rx_state") == rx_fields["rx_transfer_state"]
+                    and isinstance(values.get("rx_id"), str)
+                    and values["rx_id"].upper() == rx_fields["rx_transfer_id"]
+                    and parse_fraction(values.get("rx_bytes")) ==
+                    (rx_fields["rx_received_bytes"], rx_fields["rx_total_bytes"])):
+                self.fresh_status_report.emit()
             return
         if self._serial is None or state == RadioState.UNKNOWN:
             self.log_event.emit("warning", "Ignored status without a recognized RF3 radio state")
@@ -2104,6 +2130,11 @@ class SerialDeviceBackend(DeviceBackend):
             antenna = None
         if antenna is not None:
             self._finish_pending(True, f"ESP reports ANT{antenna}", f"FEM ANT {antenna}", confirmed=True)
+        lna = values.get("fem_lna")
+        if lna not in ("gain", "bypass"):
+            lna = None
+        if lna is not None:
+            self._finish_pending(True, f"ESP reports LNA {lna}", f"FEM LNA {lna.upper()}", confirmed=True)
         tx_state_text = str(values.get("tx_state") or "")
         loop_text = str(values.get("loop") or "")
         connection_state = (
@@ -2161,6 +2192,7 @@ class SerialDeviceBackend(DeviceBackend):
             connection_state=connection_state,
             connection_detail="RF3 connected; radio status received",
             fem_antenna=antenna,
+            fem_lna=lna,
             test_mode=str(values.get("test_mode", "off")).lower() in {"on", "true"},
             test_tx_count=int(values.get("test_tx_count", 0) or 0),
             test_tx_bytes=int(values.get("test_tx_bytes", 0) or 0),
@@ -2179,6 +2211,8 @@ class SerialDeviceBackend(DeviceBackend):
         if confirmed_test_request:
             self._finish_pending(True, "ESP STATUS confirmed requested test mode", "TESTMODE")
         self._apply_transfer_status(values)
+        self._sample_rx_status(values, rx_fields)
+        self.fresh_status_report.emit()
 
         test_tx_count = int(values.get("test_tx_count", 0) or 0)
         if (self._awaiting_test_tx_count is not None
@@ -2250,7 +2284,7 @@ class SerialDeviceBackend(DeviceBackend):
 
     def _local_operation_active(self, *, include_rx: bool = True) -> bool:
         return bool(self._upload_session is not None or self._download_session is not None
-                    or any(command.startswith("FEM ANT ") for command in self._pending_commands)
+                    or any(command.startswith(("FEM ANT ", "FEM LNA ")) for command in self._pending_commands)
                     or self._storage_kind is not None or self._awaiting_echo is not None
                     or self._awaiting_test_mode is not None or self._rf_tx_name is not None
                     or self._awaiting_nrf_rail is not None or self._awaiting_battery_reset
@@ -2336,6 +2370,59 @@ class SerialDeviceBackend(DeviceBackend):
         return dict(rx_transfer_state=state, rx_transfer_id=identifier,
                     rx_received_bytes=received, rx_total_bytes=total, rx_error=_status_text(error))
 
+    def _emit_rf_sample(self, direction: str, identifier: str, phase: str,
+                        done: int, total: int, *, allow_terminal: bool = False) -> None:
+        # Device IDs scope a counter. Keep historical terminal reports and late
+        # active repeats from reopening a finished counter.
+        if re.fullmatch(r"[0-9A-Fa-f]{8}", identifier) is None or int(identifier, 16) == 0:
+            return
+        identifier = identifier.upper()
+        terminal = {"Completed", "SentUnconfirmed", "Failed", "Cancelled"}
+        if (direction, identifier) in self._rf_sample_retired:
+            return
+        previous = self._rf_sample_last.get(direction)
+        if previous is not None and previous[0] == identifier:
+            if previous[1] in terminal or total != previous[3] or done < previous[2]:
+                return
+            order = ({"Preparing": 0, "Handshaking": 1, "Transferring": 2, "Verifying": 3, "Cancelling": 4}
+                     if direction == "TX" else
+                     {"Receiving": 0, "WaitingForEnd": 1, "Verifying": 2, "Publishing": 3})
+            if phase in order and previous[1] in order and order[phase] < order[previous[1]]:
+                return
+        elif phase in terminal and not allow_terminal:
+            return
+        elif previous is not None:
+            self._rf_sample_retired.append((direction, previous[0]))
+        self._rf_sample_last[direction] = (identifier, phase, done, total)
+        self.rf_sample.emit(direction, identifier, phase, done, total)
+
+    def _end_rf_trace(self, direction: str, identifier: str, phase: str) -> None:
+        previous = self._rf_sample_last.get(direction)
+        if (previous is None or previous[0] != identifier.upper()
+                or previous[1] in {"Completed", "SentUnconfirmed", "Failed", "Cancelled"}
+                or phase not in {"SentUnconfirmed", "Failed", "Cancelled"}):
+            return
+        # A local error changes lifecycle only. Keep the last observed count and
+        # let the PC retain that sample's time when it closes its trace.
+        self._rf_sample_last[direction] = (previous[0], phase, previous[2], previous[3])
+        self.rf_ended.emit(direction, previous[0], phase)
+
+    def _sample_rx_status(self, values: dict[str, Any], fields: dict[str, Any]) -> None:
+        if self._snapshot.test_mode:
+            return
+        # _rx_status_fields can retain or clamp previous metadata. Only the
+        # accepted bytes/phase actually present in this wire report are fresh.
+        parsed = parse_fraction(values.get("rx_bytes"))
+        identifier = values.get("rx_id")
+        if (not isinstance(identifier, str)
+                or identifier.upper() != fields["rx_transfer_id"]
+                or values.get("rx_state") != fields["rx_transfer_state"]
+                or parsed != (fields["rx_received_bytes"], fields["rx_total_bytes"])):
+            if fields["rx_transfer_state"] in {"Failed", "Cancelled"}:
+                self._end_rf_trace("RX", fields["rx_transfer_id"], fields["rx_transfer_state"])
+            return
+        self._emit_rf_sample("RX", identifier, fields["rx_transfer_state"], *parsed)
+
     def _apply_transfer_status(self, values: dict[str, Any]) -> None:
         if self._snapshot.test_mode or self._upload_session is not None or self._download_session is not None:
             return  # RF transfer telemetry cannot complete a host-file check.
@@ -2420,10 +2507,15 @@ class SerialDeviceBackend(DeviceBackend):
             message += "; peer confirmed CRC/complete"
         elif transfer_state == TransferState.SENT_UNCONFIRMED:
             message += "; sent locally without ACK; receiver delivery is unconfirmed"
+        phase = "SentUnconfirmed" if transfer_state == TransferState.SENT_UNCONFIRMED else transfer_state.value
+        if transfer_state != TransferState.FAILED or tx_state == "Failed":
+            self._emit_rf_sample("TX", tx_id, phase, sent, total,
+                                 allow_terminal=self._rf_tx_name is not None)
         if transfer_state in {TransferState.COMPLETED, TransferState.SENT_UNCONFIRMED, TransferState.FAILED, TransferState.CANCELLED}:
             if self._rf_tx_name is not None:
                 self._finish_rf_transfer(transfer_state, message, sent, total)
             elif tx_id and tx_id == self._observed_rf_id:
+                self._end_rf_trace("TX", tx_id, phase)
                 self._observed_rf_id = ""
                 self.transfer_changed.emit(TransferProgress(state=transfer_state, sent_bytes=sent,
                                                             total_bytes=total, message=message))
@@ -2439,9 +2531,10 @@ class SerialDeviceBackend(DeviceBackend):
     def _apply_known_response(self, line: str) -> bool:
         if line.startswith(("FEM ERROR", "ERR FEM ")):
             self._finish_pending(False, line, "FEM ANT")
+            self._finish_pending(False, line, "FEM LNA")
             self.request_status()
             return True
-        if line.startswith("FEM OK ANT "):
+        if line.startswith(("FEM OK ANT ", "FEM OK LNA ")):
             return True  # Wait for the independent STATUS readback.
         if line.startswith("BATTERY OK "):
             self.request_status()
@@ -2615,7 +2708,7 @@ class SerialDeviceBackend(DeviceBackend):
                         if item == expected_prefix or item.startswith(expected_prefix + " ")), None)
         if command is None:
             return
-        if command.startswith("FEM ANT ") and accepted and not confirmed:
+        if command.startswith(("FEM ANT ", "FEM LNA ")) and accepted and not confirmed:
             return  # The matching antenna in STATUS confirms the switch.
         self._pending_commands.remove(command)
         self._command_deadlines.pop(command, None)
@@ -2654,6 +2747,7 @@ class SerialDeviceBackend(DeviceBackend):
         values = {
             "rx_no_ack": self._snapshot.rx_no_ack,
             "fem_antenna": self._snapshot.fem_antenna,
+            "fem_lna": self._snapshot.fem_lna,
             "connection_state": self._snapshot.connection_state,
             "connection_detail": self._snapshot.connection_detail,
             "test_mode": self._snapshot.test_mode,

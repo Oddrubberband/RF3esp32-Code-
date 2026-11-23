@@ -17,6 +17,10 @@ class DeviceBackend(QObject):
     text_message_received = Signal(str, str)
     storage_changed = Signal(object)
     diagnostics_received = Signal(object)
+    rf_sample = Signal(str, str, str, int, int)
+    rf_tx_command_active = Signal(bool)
+    rf_ended = Signal(str, str, str)
+    fresh_status_report = Signal()
 
     _no_ack_selected = False
 
@@ -80,6 +84,9 @@ class DeviceBackend(QObject):
 
     def set_fem_antenna(self, antenna: int) -> None:
         self.command_finished.emit("FEM ANT", False, "This board does not report a selectable FEM antenna")
+
+    def set_fem_lna(self, mode: str) -> None:
+        self.command_finished.emit("FEM LNA", False, "This board does not report selectable LNA bypass")
 
     def enter_rx(self) -> None:
         raise NotImplementedError

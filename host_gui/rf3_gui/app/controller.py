@@ -30,6 +30,10 @@ class AppController(QObject):
     text_message_received = Signal(str, str)
     storage_changed = Signal(object)
     diagnostics_received = Signal(object)
+    rf_sample = Signal(str, str, str, int, int)
+    rf_tx_command_active = Signal(bool)
+    rf_ended = Signal(str, str, str)
+    fresh_status_report = Signal()
 
     def __init__(self, backend: DeviceBackend) -> None:
         super().__init__()
@@ -48,6 +52,10 @@ class AppController(QObject):
         backend.text_message_received.connect(self.text_message_received)
         backend.storage_changed.connect(self._on_storage_changed)
         backend.diagnostics_received.connect(self.diagnostics_received)
+        backend.rf_sample.connect(self.rf_sample)
+        backend.rf_tx_command_active.connect(self.rf_tx_command_active)
+        backend.rf_ended.connect(self.rf_ended)
+        backend.fresh_status_report.connect(self.fresh_status_report)
 
     @property
     def storage(self) -> StorageListing:
@@ -173,6 +181,9 @@ class AppController(QObject):
 
     def set_fem_antenna(self, antenna: int) -> None:
         self._backend.set_fem_antenna(antenna)
+
+    def set_fem_lna(self, mode: str) -> None:
+        self._backend.set_fem_lna(mode)
 
     def enter_rx(self) -> None:
         self._backend.enter_rx()

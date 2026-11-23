@@ -89,10 +89,16 @@ class AuditUIRepairs(unittest.TestCase):
 
     def test_test_mode_capability_gates_checkbox_by_board(self):
         self.assertFalse(self.window.test_mode_checkbox.isEnabled())
+        self.assertTrue(self.window.test_mode_checkbox.isHidden())
+        self.assertIn("Physical radio", self.window.mode_status_label.text())
         devboard = replace(self.snapshot, profile="esp32-devboard", capabilities=replace(
             self.snapshot.capabilities, supports_test_mode=True))
         self.status(devboard)
         self.assertTrue(self.window.test_mode_checkbox.isEnabled())
+        self.assertFalse(self.window.test_mode_checkbox.isHidden())
+        self.status(replace(devboard, test_mode=True))
+        self.assertTrue(self.window.test_mode_checkbox.isChecked())
+        self.assertIn("ESP link test only", self.window.mode_status_label.text())
 
     def test_error_disables_modes_and_saved_file_actions(self):
         self.status(replace(self.snapshot, connection_state=ConnectionState.ERROR))

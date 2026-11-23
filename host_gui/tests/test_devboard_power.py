@@ -226,16 +226,10 @@ class DevboardPowerTests(unittest.TestCase):
         self.assertEqual(self.backend._snapshot.telemetry.battery_percent,50)
         self.assertTrue(self.backend._snapshot.capabilities.supports_battery_percent)
 
-    def test_stale_gauge_blocks_new_rf_but_standby_remains_available(self):
+    def test_stale_gauge_allows_rx_and_standby(self):
         window=self.window();self.gauge(state="Standby",test_mode=False,
             battery_state="stale",battery_age_ms=20000)
-        self.assertFalse(window.rx_button.isEnabled())
         self.assertTrue(window.standby_button.isEnabled())
-        with patch("rf3_gui.ui.main_window.QMessageBox.warning") as warning:
-            self.backend.enter_rx()
-            self.assertTrue(self.backend._write_queue.empty())
-            warning.assert_called_once()
-        self.gauge(state="Standby",test_mode=False)
         self.assertTrue(window.rx_button.isEnabled())
         self.backend.enter_rx();self.assertEqual(self.backend._write_queue.get_nowait(),"RX")
 
@@ -259,7 +253,7 @@ class DevboardPowerTests(unittest.TestCase):
                 self.assertIsNone(self.backend._snapshot.telemetry.battery_estimated_mv)
                 self.assertEqual(self.backend._snapshot.telemetry.battery_mv,23100)
 
-    def test_cutoff_event_warns_once_and_does_not_invent_output_levels(self):
+    def test_cutoff_event_updates_status_without_a_popup(self):
         window=self.window();self.gauge()
         event="BATTERY SHUTOFF turn_physical_power_boot_switch_OFF_connect_charged_replacement_source"
         self.backend._handle_line(event)
@@ -273,37 +267,12 @@ class DevboardPowerTests(unittest.TestCase):
         self.assertIn("awaiting output confirmation",window.battery_status_value.text())
         self.assertNotIn("ERROR",window.battery_status_value.text())
         self.assertNotIn("failed",window.battery_status_value.text())
-        notice=window._battery_cutoff_notice
-        self.assertIsNotNone(notice)
-        self.assertFalse(notice.isModal())
-        self.assertIn("physical power switch OFF",notice.text())
-        self.backend._handle_line(event)
-        self.assertIs(window._battery_cutoff_notice,notice)
-        self.backend.disconnect_from_device()
-        self.assertTrue(window._battery_cutoff_notified)
-        self.assertIs(window._battery_cutoff_notice,notice)
-        self.assertTrue(notice.isVisible())
+        from PySide6.QtWidgets import QMessageBox
+        self.assertFalse(window.findChildren(QMessageBox))
 
-    def test_warning_rearms_only_after_confirmed_recovery(self):
-        window=self.window()
-        self.gauge(battery_cutoff=True,battery_state="cutoff")
-        first=window._battery_cutoff_notice
-        self.gauge(battery_cutoff=False,battery_state="startup")
-        self.assertTrue(window._battery_cutoff_notified)
-        self.gauge()
-        self.assertFalse(window._battery_cutoff_notified)
-        self.assertIsNone(window._battery_cutoff_notice)
-        self.gauge(battery_cutoff=True,battery_state="cutoff")
-        self.assertIsNot(window._battery_cutoff_notice,first)
-
-    def test_gui_and_backend_use_sensed_20400_boundary(self):
+    def test_low_sensed_voltage_alone_does_not_block_rx(self):
         window=self.window()
         self.gauge(state="Standby",test_mode=False,battery_mv=20399,battery_estimated_mv=23000)
-        self.assertFalse(window.rx_button.isEnabled())
-        with patch("rf3_gui.ui.main_window.QMessageBox.warning"):
-            self.backend.enter_rx()
-        self.assertTrue(self.backend._write_queue.empty())
-        self.gauge(state="Standby",test_mode=False,battery_mv=20400,battery_estimated_mv=20300)
         self.assertTrue(window.rx_button.isEnabled())
         self.backend.enter_rx()
         self.assertEqual(self.backend._write_queue.get_nowait(),"RX")
@@ -316,16 +285,13 @@ class DevboardPowerTests(unittest.TestCase):
         self.backend.reset_battery_cutoff()
         self.assertEqual(self.backend._write_queue.get_nowait(),"BATTERY RESET")
 
-    def test_new_sampling_states_are_labeled_and_block_rf(self):
+    def test_new_sampling_states_are_labeled_and_allow_requests(self):
         window=self.window()
         for state,expected in (("startup","10 s"),("averaging","4 s")):
             with self.subTest(state=state):
                 self.gauge(state="Standby",test_mode=False,battery_state=state)
                 self.assertIn(expected,window.battery_status_value.text())
-                self.assertFalse(window.rx_button.isEnabled())
-                with patch("rf3_gui.ui.main_window.QMessageBox.warning"):
-                    self.backend.enter_rx()
-                self.assertTrue(self.backend._write_queue.empty())
+                self.assertTrue(window.rx_button.isEnabled())
 
     def test_console_status_reports_separate_protection_and_estimated_voltage(self):
         self.backend._handle_line("profile=esp32-devboard State=Standby board_power=enabled "

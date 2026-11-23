@@ -5,7 +5,7 @@ a = Analysis(
     ['host_gui/run_gui.py'],
     pathex=[SPECPATH + '/host_gui'],
     binaries=[],
-    datas=[],
+    datas=[(SPECPATH + '/host_gui/rf3_gui/app/tx_profiles.csv', 'rf3_gui/app')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
