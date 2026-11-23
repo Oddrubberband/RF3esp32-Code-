@@ -62,6 +62,7 @@
 #include "esp32_nrf24_hal.hpp"
 #include "file_transfer_service.hpp"
 #include "no_ack_transfer.hpp"
+#include "delivery_meter.hpp"
 #include "hardware_profile.hpp"
 #include "morse.hpp"
 #include "nrf24.hpp"
@@ -372,6 +373,8 @@ struct HostDownloadStorage {
 };
 
 struct ProtocolTransferReport {
+    int direct_sent = 0;
+    int direct_acked = 0;
     bool no_ack = false;
     ReliableTransferV2::SenderState state = ReliableTransferV2::SenderState::Idle;
     ProtocolV2::ErrorCode error = ProtocolV2::ErrorCode::None;
@@ -1019,7 +1022,7 @@ bool sendDataFileNoAck(RadioManager& manager, const char* path,
             frame[2]=pos.repair?'P':'G';
             if(!manager.sendPayload(frame.data(),frame.size(),false))
                 return finish(ReliableTransferV2::SenderState::Failed,ProtocolV2::ErrorCode::TransportFailure);
-            if(round==0 && !pos.repair){next.bytes_transferred+=pkt.payload_length; ++next.current_sequence;}
+            if(round==0 && !pos.repair){next.bytes_transferred+=pkt.payload_length; ++next.current_sequence; next.direct_sent = next.current_sequence;}
             next.radio=manager.status();publishTransferReport(*report,next);
             delayAtLeastMs(NoAckTransfer::kDataGapMs);
         }
@@ -1028,6 +1031,12 @@ bool sendDataFileNoAck(RadioManager& manager, const char* path,
         ProtocolV2::Frame tail{};NoAckTransfer::encode(end,tail);tail[2]='G';
         if(!manager.sendPayload(tail.data(),tail.size(),false))
             return finish(ReliableTransferV2::SenderState::Failed,ProtocolV2::ErrorCode::TransportFailure);
+        // Optional one-way observation boundary. Older receivers ignore this magic.
+        if (round == 0 || round + 1 == passes) {
+            tail[2] = 'M';
+            tail[21] = (round == 0 ? 1 : 0) | (round + 1 == passes ? 2 : 0);
+            (void)manager.sendPayload(tail.data(), tail.size(), false);
+        }
     }
     ESP_LOGI(TAG, "NO ACK: sent locally, delivery unconfirmed id=%08lX bytes=%lu",
              static_cast<unsigned long>(next.transfer_id), static_cast<unsigned long>(next.bytes_transferred));
@@ -1106,6 +1115,7 @@ bool sendDataFile(RadioManager& manager,
              static_cast<unsigned long>(sender.totalPackets()),
              static_cast<unsigned long>(sender.crc32()));
 
+    Delivery::Bits sent_ids(sender.totalPackets()), ack_ids(sender.totalPackets());
     bool cancellation_started = false;
     while (!sender.terminal()) {
         if (battery_check && !battery_check(battery_context)) {
@@ -1140,7 +1150,10 @@ bool sendDataFile(RadioManager& manager,
         }
         const int64_t send_start_us = esp_timer_get_time();
         const uint64_t send_time_ms = monotonicMilliseconds();
-        if (!manager.sendPayloadAndListen(outbound.data(), outbound.size())) {
+        const bool listening = manager.sendPayloadAndListen(outbound.data(), outbound.size());
+        if (outbound_packet.type == ProtocolV2::PacketType::Data &&
+            (listening || manager.lastFrameTransmitted())) sent_ids.add(outbound_packet.sequence);
+        if (!listening) {
             (void)sender.onTransportFailure(send_time_ms);
             updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
             delayAtLeastMs(2);
@@ -1187,9 +1200,11 @@ bool sendDataFile(RadioManager& manager,
                     event == ReliableTransferV2::SenderEvent::OutboundReady) {
                     ProtocolV2::Packet response_packet{};
                     if (ProtocolV2::decode(incoming.data(), incoming_length, response_packet) == ProtocolV2::DecodeStatus::Ok &&
-                        response_packet.type == ProtocolV2::PacketType::Ack)
+                        response_packet.type == ProtocolV2::PacketType::Ack) {
+                        ack_ids.add(outbound_packet.sequence);
                         RuntimeDiagnostics::global().ack_wait.record(
                             static_cast<uint64_t>(esp_timer_get_time() - send_start_us));
+                    }
                 }
                 leave_wait = event == ReliableTransferV2::SenderEvent::OutboundReady ||
                              event == ReliableTransferV2::SenderEvent::Completed ||
@@ -1216,6 +1231,12 @@ bool sendDataFile(RadioManager& manager,
     }
 
     updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
+    if (report) {
+        auto result = copyTransferReport(*report);
+        result.direct_sent = sent_ids.count();
+        result.direct_acked = ack_ids.count();
+        publishTransferReport(*report, result);
+    }
     std::fclose(file);
     if (sender.state() == ReliableTransferV2::SenderState::Completed &&
         sender.peerComplete()) {
@@ -4278,11 +4299,14 @@ private:
         }
 
         bool sent = ensureStandbyLocked();
-        const uint16_t message_id = static_cast<uint16_t>((esp_random() & 0xFFFFu) | 1u);
+        static uint16_t sequence = static_cast<uint16_t>(esp_random());
+        if (++sequence == 0) ++sequence;
+        const uint16_t message_id = sequence;
         const size_t chunk_count =
             (text.size() + StreamSync::kTextChunkMaxBytes - 1) /
             StreamSync::kTextChunkMaxBytes;
 
+        int text_sent = 0, retries = 0;
         bool listening = true;
         for (size_t chunk_index = 0; sent && listening && chunk_index < chunk_count; ++chunk_index) {
             const size_t offset = chunk_index * StreamSync::kTextChunkMaxBytes;
@@ -4303,10 +4327,13 @@ private:
                 packet_len);
             if (sent) {
                 // Count a confirmed TX exactly once, even if rearming RX fails afterward.
+                int attempts = 0;
                 sent = TxHelpers::sendWithRetry([&]() {
+                    if (attempts++) ++retries;
                     listening = manager_.sendPayloadAndListen(packet, packet_len);
                     return listening || manager_.lastFrameTransmitted();
                 }, [](uint32_t ms) { delayAtLeastMs(ms); });
+                if (sent) ++text_sent;
                 if (!listening && chunk_index + 1 < chunk_count) sent = false;
             }
             if (sent && chunk_index + 1 < chunk_count) {
@@ -4325,6 +4352,12 @@ private:
         const RadioStatus status = manager_.status();
         giveRadio();
 
+        Delivery::Row row("TX", "text", message_id, chunk_count);
+        row.sent = text_sent;
+        row.retries = retries;
+        row.result = !sent ? "Incomplete" : listening ? "SentUnconfirmed" : "SentRearmFailed";
+        row.closed = true;
+        emitDelivery(row);
         if (!sent) {
             std::printf("ERR TEXT transmit_incomplete state=%s fault=%d\n",
                         RadioManager::stateName(status.state),
@@ -5051,6 +5084,10 @@ private:
         queued = copyTransferReport(last_tx_report_);
         queued.no_ack = loop.no_ack;
         publishTransferReport(last_tx_report_, queued);
+        Delivery::Row tx_row("TX", loop.no_ack ? "noack" : "ack", queued.transfer_id,
+                             (queued.total_bytes + ProtocolV2::kDataPayloadCapacity - 1) / ProtocolV2::kDataPayloadCapacity);
+        tx_row.sent = 0;
+        emitDelivery(tx_row);
         const bool cutoff = power_.battery(monotonicMilliseconds()).cutoff;
         bool ok = !cutoff && power_.radioAvailable() && ensureStandbyLocked();
         RadioStatus status = manager_.status();
@@ -5072,7 +5109,18 @@ private:
             failed.radio_valid = true;
             publishTransferReport(last_tx_report_, failed);
         }
+        const auto tx_result = copyTransferReport(last_tx_report_);
         giveRadio();
+        tx_row.id = tx_result.transfer_id;
+        if (tx_result.total_packets) tx_row.planned = tx_result.total_packets;
+        tx_row.sent = tx_result.direct_sent;
+        if (!tx_result.no_ack && tx_row.sent > 0 && tx_result.direct_acked == tx_row.sent)
+            tx_row.received = tx_row.sent;
+        tx_row.retries = tx_result.retry_count;
+        tx_row.verified = tx_result.peer_complete;
+        tx_row.result = transferReportStateName(tx_result);
+        tx_row.closed = true;
+        emitDelivery(tx_row);
 
         bool stopped = false;
         bool restore_rx = false;
@@ -5291,10 +5339,29 @@ private:
         return sent && resumed;
     }
 
+    void emitDelivery(const Delivery::Row& row)
+    {
+        const std::string line = row.line("Devboard");
+        std::printf("\n%s", line.c_str());
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+        (void)sendBluetoothText(line);
+#endif
+    }
+
     void processRxPayload(const uint8_t* payload, size_t len)
     {
         ProtocolV2::Frame adapted{}; ProtocolV2::Packet one_way{};
         bool parity=false;
+        if (rx_no_ack_mode_ && len == adapted.size() && payload[2] == 'M') {
+            std::copy_n(payload, len, adapted.data());
+            const unsigned flags = adapted[21];
+            adapted[21] = 0; adapted[2] = 'N';
+            if (flags >= 1 && flags <= 3 && NoAckTransfer::decode(adapted.data(), len, one_way, adapted)
+                && one_way.type == ProtocolV2::PacketType::End) {
+                file_meter_.boundary(one_way.transfer_id, one_way.total_packets, flags, pending_delivery_);
+            }
+            return;
+        }
         if (rx_no_ack_mode_) {
             if(len!=adapted.size() || (payload[2]!='G' && payload[2]!='P')) {++raw_rx_packet_count_;return;}
             parity=payload[2]=='P';
@@ -5312,6 +5379,10 @@ private:
         receiver_.setResumeEnabled(!rx_no_ack_mode_);
         const ReliableTransferV2::ReceiverEvent event = rx_no_ack_mode_ ? receiver_.onGapPacket(one_way,parity,now_ms,response) : receiver_.onFrame(
             payload, len, now_ms, response);
+
+        if (decoded_status == ProtocolV2::DecodeStatus::Ok) {
+            file_meter_.file(incoming, parity, rx_no_ack_mode_, event, now_ms, pending_delivery_);
+        }
 
         if (decoded_status == ProtocolV2::DecodeStatus::Ok &&
             incoming.type == ProtocolV2::PacketType::Start &&
@@ -5581,6 +5652,12 @@ private:
                                         payload.data(), out_len, completed_text);
                                 if (text_action !=
                                     StreamSync::TextMessageAssembler::Action::NotText) {
+                                    StreamSync::TextChunk chunk{};
+                                    if (StreamSync::decodeTextChunk(payload.data(), out_len, chunk)) {
+                                        text_meter_.text(chunk.message_id, chunk.chunk_count, chunk.chunk_index,
+                                            text_action == StreamSync::TextMessageAssembler::Action::Complete,
+                                            monotonicMilliseconds(), pending_delivery_);
+                                    }
                                     if (text_action ==
                                         StreamSync::TextMessageAssembler::Action::Complete) {
                                         received_texts.emplace_back(
@@ -5629,6 +5706,7 @@ private:
                 ProtocolV2::Frame timeout_response{};
                 if (receiver_.tick(monotonicMilliseconds(), timeout_response) ==
                     ReliableTransferV2::ReceiverEvent::TimedOut) {
+                    file_meter_.end(receiver_.transferId(), "TimedOut", pending_delivery_);
                     transfer_service_.reportReceiveFailed(
                         receiver_.transferId(),
                         receiver_.error(),
@@ -5641,8 +5719,12 @@ private:
                              static_cast<unsigned long>(receiver_.timeoutMs()),
                              receiver_.cleanupFailed() ? "true" : "false");
                 }
+                file_meter_.poll(monotonicMilliseconds(), false, pending_delivery_);
+                text_meter_.poll(monotonicMilliseconds(), true, pending_delivery_);
                 giveRadio();
             }
+            for (const auto& row : pending_delivery_) emitDelivery(row);
+            pending_delivery_.clear();
 
             if (!remote_command.empty()) {
                 ESP_LOGI(TAG, "RX remote command: %s", remote_command.c_str());
@@ -6086,6 +6168,8 @@ private:
     bool last_carrier_detected_ = false;      // Edge detector for RPD logging while in RX.
     uint32_t carrier_event_count_ = 0;        // Number of distinct RPD-high events seen while listening.
     IncomingFileStorage incoming_file_{};     // SPIFFS adapter state for the current RX partial file.
+    Delivery::Rx file_meter_, text_meter_;
+    std::vector<Delivery::Row> pending_delivery_;
     bool rx_no_ack_requested_ = false;
     bool rx_no_ack_mode_ = false;
     ReliableTransferV2::ReceiverSession receiver_;  // Verified Protocol v2 RX session.

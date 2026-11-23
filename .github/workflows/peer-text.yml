@@ -1,7 +1,7 @@
-name: Build peer text bench pair
+name: Build packet delivery reporting pair
 on:
   push:
-    branches: [test/peer-text-r1-20261123]
+    branches: [test/delivery-report-r18]
     paths: ['bench/**', '.github/workflows/peer-text.yml']
 permissions:
   contents: read
@@ -25,7 +25,7 @@ jobs:
         run: python make_bench_zip.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: RF3-Peer-Text-R1-Board-Pair
+          name: RF3-Delivery-R18-Board-Pair
           path: bench/flash-kit/
           if-no-files-found: error
           retention-days: 90

@@ -8,7 +8,7 @@
 
 namespace RuntimeDiagnostics {
 #if RF3_USB_EBYTE
-inline constexpr const char* kBuild = "RF3-P2P-E1-20261123";
+inline constexpr const char* kBuild = "RF3-LOSS-E1-20261123";
 #elif RF3_AUTOMATIC_FEM
 inline constexpr const char* kBuild = "RF3-NFEM-R4";
 #else

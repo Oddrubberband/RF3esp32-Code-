@@ -34,7 +34,7 @@ if (-not $Port) { $Port = Read-Host 'Board USB programming COM port (not Bluetoo
 if ($Port -notmatch '^COM[1-9][0-9]*$') { throw 'Enter a Windows COM port, for example COM5.' }
 Write-Host "Version: $Version | Board: $Board | USB port: $Port"
 Write-Host "Verified images: $imageDirectory"
-Write-Host 'EBYTE devboard: 4 MB; CE27 / CSN5 / IRQ26. Expected build RF3-P2P-E1-20261123.'
+Write-Host 'EBYTE devboard: 4 MB; CE27 / CSN5 / IRQ26. Expected build RF3-LOSS-E1-20261123.'
 Write-Host 'Disconnect this board in its GUI and close its serial monitor.'
 Write-Host 'Hold BOOT. Tap EN at Connecting; release BOOT when Writing starts.'
 $null = Read-Host 'Press Enter to start the manual upload'

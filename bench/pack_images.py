@@ -9,8 +9,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parent
 TARGETS = (
-    ("custom-pcb-usb-bench","rf3_custom_usb_bench","RF3-P2P-C1-20261123"),
-    ("devboard-ebyte","rf3_usb_ebyte","RF3-P2P-E1-20261123"),
+    ("custom-pcb-usb-bench","rf3_custom_usb_bench","RF3-LOSS-C1-20261123"),
+    ("devboard-ebyte","rf3_usb_ebyte","RF3-LOSS-E1-20261123"),
 )
 def main():
     parser = argparse.ArgumentParser()
