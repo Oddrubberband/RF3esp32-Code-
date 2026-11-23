@@ -1,0 +1,6190 @@
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <cctype>
+#include <charconv>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <dirent.h>
+#include <string>
+#include <string_view>
+#include <sys/stat.h>
+#include <utility>
+#include <type_traits>
+#include <vector>
+
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
+#include "esp_err.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_log.h"
+#include "esp_event.h"
+#include "esp_http_server.h"
+#include "esp_netif.h"
+#include "esp_netif_ip_addr.h"
+#include "esp_random.h"
+#include "esp_spiffs.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+#include "esp_bt.h"
+#include "esp_bt_device.h"
+#include "esp_bt_main.h"
+#include "esp_gap_bt_api.h"
+#include "esp_spp_api.h"
+#endif
+
+#include "audio_packet.hpp"
+#include "devboard_power.hpp"
+#include "bluetooth_tx_flow.hpp"
+#include "host_upload_publish.hpp"
+#include "host_transfer_guard.hpp"
+#include "host_connection_protocol.hpp"
+#include "host_storage_protocol.hpp"
+#include "host_transfer_protocol.hpp"
+#include "host_status_protocol.hpp"
+#include "host_rx_command_guard.hpp"
+#include "esp32_nrf24_hal.hpp"
+#include "file_transfer_service.hpp"
+#include "no_ack_transfer.hpp"
+#include "hardware_profile.hpp"
+#include "morse.hpp"
+#include "nrf24.hpp"
+#include "protocol_v2.hpp"
+#include "radio_manager.hpp"
+#include "reliable_transfer_v2.hpp"
+#include "rx_drain.hpp"
+#include "runtime_diagnostics.hpp"
+#include "task_timing.hpp"
+#include "tx_helpers.hpp"
+#include "transfer_rate_limiter.hpp"
+#include "validation.hpp"
+#include "stream_sync.hpp"
+#include "wifi_control_config.hpp"
+
+#ifndef WIRELESS_CONTROL_ENABLED
+#define WIRELESS_CONTROL_ENABLED 0
+#endif
+
+#ifndef WIRELESS_CONTROL_AUTO_RX
+#define WIRELESS_CONTROL_AUTO_RX 0
+#endif
+
+#ifndef RF3_WIFI_CONTROL_ENABLED
+#define RF3_WIFI_CONTROL_ENABLED 0
+#endif
+
+#ifndef RF3_BLUETOOTH_CONTROL_ENABLED
+#define RF3_BLUETOOTH_CONTROL_ENABLED 0
+#endif
+
+#ifndef RF3_BLUETOOTH_REQUIRE_PAIRING
+#define RF3_BLUETOOTH_REQUIRE_PAIRING 0
+#endif
+
+#ifndef RF3_TRANSFER_RATE_LIMIT_BPS
+#define RF3_TRANSFER_RATE_LIMIT_BPS 0
+#endif
+
+#ifndef RF3_VERBOSE_RX_LOG
+#define RF3_VERBOSE_RX_LOG 0
+#endif
+
+// main.cpp owns the top-level demo flow:
+// - mount the Serial Peripheral Interface Flash File System (SPIFFS) partition
+//   that stores staged data files
+// - initialize the nRF24 radio
+// - expose a serial-console command loop
+// - run a small background task that polls receive (RX) mode
+//
+// Most of the project's user-visible behavior lives here, while lower-level
+// files keep packet formatting and radio access focused and testable.
+namespace {
+constexpr const char* TAG = "APP";
+#if RF3_AUTOMATIC_FEM
+constexpr unsigned kMaxRadioChannel = 83;
+#else
+constexpr unsigned kMaxRadioChannel = 125;
+#endif
+
+class DevboardPowerIo final : public DevboardPower::Io {
+public:
+    bool output(int pin, bool high) override
+    {
+        const auto gpio = static_cast<gpio_num_t>(pin);
+        // ESP-IDF GPIO latch-before-direction sequence avoids a software LOW
+        // pulse at enable. Reset/strapping levels remain a hardware contract.
+        return gpio_set_level(gpio, high ? 1 : 0) == ESP_OK &&
+               gpio_set_direction(gpio, GPIO_MODE_OUTPUT) == ESP_OK;
+    }
+
+    bool beginAdc(int gpio) override
+    {
+        // ESP32 ADC1 oneshot + line-fitting calibration per ESP-IDF ADC API.
+        // ADC1 stays available alongside Classic SPP and optional Wi-Fi.
+        adc_unit_t unit;
+        if (adc_oneshot_io_to_channel(gpio, &unit, &channel_) != ESP_OK ||
+            unit != ADC_UNIT_1) return false;
+        adc_oneshot_unit_init_cfg_t unit_config{};
+        unit_config.unit_id = unit;
+        if (adc_oneshot_new_unit(&unit_config, &adc_) != ESP_OK) return false;
+        adc_oneshot_chan_cfg_t channel_config{};
+        channel_config.atten = ADC_ATTEN_DB_12;
+        channel_config.bitwidth = ADC_BITWIDTH_12;
+        if (adc_oneshot_config_channel(adc_, channel_, &channel_config) != ESP_OK) {
+            (void)adc_oneshot_del_unit(adc_);
+            adc_ = nullptr;
+            return false;
+        }
+        adc_cali_line_fitting_efuse_val_t source;
+        calibrated_ = adc_cali_scheme_line_fitting_check_efuse(&source) == ESP_OK &&
+            source != ADC_CALI_LINE_FITTING_EFUSE_VAL_DEFAULT_VREF;
+        adc_cali_line_fitting_config_t calibration{};
+        calibration.unit_id = unit;
+        calibration.atten = channel_config.atten;
+        calibration.bitwidth = channel_config.bitwidth;
+        calibration.default_vref = 1100; // Explicitly labeled estimated without eFuse.
+        if (adc_cali_create_scheme_line_fitting(&calibration, &calibration_) == ESP_OK) {
+            adc_mutex_ = xSemaphoreCreateMutex();
+            if (adc_mutex_) return true;
+            (void)adc_cali_delete_scheme_line_fitting(calibration_);
+            calibration_ = nullptr;
+        }
+        (void)adc_oneshot_del_unit(adc_);
+        adc_ = nullptr;
+        return false;
+    }
+
+    bool loadCutoff(bool& latched) override
+    {
+        // Never erase NVS to recover this safety latch. GPIO15 is not actively
+        // asserted before it is read; a stored trip survives application resets.
+        if (nvs_flash_init() != ESP_OK || nvs_open("rf3_batt", NVS_READWRITE, &battery_nvs_) != ESP_OK)
+            return false;
+        uint8_t value=0;
+        const esp_err_t result=nvs_get_u8(battery_nvs_, "cutoff", &value);
+        latched=value!=0;
+        return result==ESP_OK || result==ESP_ERR_NVS_NOT_FOUND;
+    }
+
+    bool storeCutoff(bool latched) override
+    {
+        return battery_nvs_ && nvs_set_u8(battery_nvs_, "cutoff", latched ? 1 : 0)==ESP_OK &&
+            nvs_commit(battery_nvs_)==ESP_OK;
+    }
+
+    DevboardPower::Reading readAdc() override
+    {
+        DevboardPower::Reading result;
+        // Calibration handles are shared by USB/SPP and optional HTTP STATUS.
+        // Serialize the whole sample, bounded to 50 ms when another poll owns it.
+        if (!adc_mutex_ || xSemaphoreTake(adc_mutex_, pdMS_TO_TICKS(50)) != pdTRUE) return result;
+        std::array<int,64> raw_values{}, mv_values{};
+        for (size_t i=0; i<raw_values.size(); ++i) {
+            int raw=0, mv=0;
+            if (adc_oneshot_read(adc_,channel_,&raw)!=ESP_OK ||
+                adc_cali_raw_to_voltage(calibration_,raw,&mv)!=ESP_OK) {
+                xSemaphoreGive(adc_mutex_);
+                return DevboardPower::Reading{};
+            }
+            raw_values[i]=raw; mv_values[i]=mv;
+            result.saturated=result.saturated || raw==4095;
+        }
+        std::sort(raw_values.begin(),raw_values.end());
+        std::sort(mv_values.begin(),mv_values.end());
+        int sum_raw=0, sum_mv=0;
+        // Trim the eight highest/lowest samples, average the central 48.
+        for (size_t i=8; i<56; ++i) { sum_raw+=raw_values[i]; sum_mv+=mv_values[i]; }
+        result.raw=(sum_raw+24)/48;
+        result.microvolts=(sum_mv * 1000 + 24)/48;
+        result.millivolts=(result.microvolts + 500)/1000;
+        result.calibrated=calibrated_;
+        result.noisy=mv_values[55]-mv_values[8]>100;
+        xSemaphoreGive(adc_mutex_);
+        return result;
+    }
+
+private:
+    adc_oneshot_unit_handle_t adc_ = nullptr;
+    adc_cali_handle_t calibration_ = nullptr;
+    adc_channel_t channel_ = ADC_CHANNEL_6;
+    bool calibrated_ = false;
+    SemaphoreHandle_t adc_mutex_ = nullptr;
+    nvs_handle_t battery_nvs_ = 0;
+};
+
+constexpr const char* kSpiffsRoot = "/spiffs";
+constexpr const char* kDefaultFile = "payload.bin";
+constexpr uint16_t kMaxReceivedFileCollisionIndex = 999;
+constexpr uint32_t kDefaultMorseDotMs = 120;
+constexpr uint8_t kDefaultMorsePowerLevel = 3;
+constexpr TickType_t kLoopWorkerPeriod = pdMS_TO_TICKS(20);
+constexpr TickType_t kLoopStopPollPeriod = pdMS_TO_TICKS(20);
+// Eleven 500 ms cancellation waits plus local TX/recovery overhead fit in
+// this bounded stop window; keep it below the GUI command-response deadline.
+constexpr TickType_t kLoopStopTimeout = pdMS_TO_TICKS(8000);
+constexpr TickType_t kWifiControlPollPeriod = pdMS_TO_TICKS(100);
+// The nRF24 RX FIFO is only three packets deep, so polling much slower than
+// the packet cadence will overrun the queue during live data transfer.
+constexpr TickType_t kRxPollPeriod = TaskTiming::nonzeroTicks(2, configTICK_RATE_HZ);
+static_assert(configTICK_RATE_HZ == 1000 && pdMS_TO_TICKS(2) == 2,
+              "RX diagnostics firmware requires CONFIG_FREERTOS_HZ=1000 for 2 ms service");
+constexpr TickType_t kWifiConnectTimeout = pdMS_TO_TICKS(15000);
+constexpr size_t kConsoleLineBytes = HostTransferProtocol::kConsoleLineBytes;
+constexpr size_t kHostTransferChunkBytes = HostTransferProtocol::kMaxChunkBytes;
+// SPIFFS reserves one byte for its leading slash and one for the terminator
+// within CONFIG_SPIFFS_OBJ_NAME_LEN=32.
+constexpr size_t kHostFilenameMaxBytes = 30;
+constexpr char kHostUploadPartialName[] = "host_upload.part";
+constexpr size_t kBluetoothCommandQueueDepth = 8;
+constexpr size_t kBluetoothTxQueueDepth = 8;
+constexpr size_t kBluetoothTxMessageBytes = 2048;
+// RF3 STATUS JSON + CRLF remains one bounded Bluetooth SIG SPP message.
+static_assert(HostStatusProtocol::kMaxResponseBytes + 2 <= kBluetoothTxMessageBytes);
+constexpr int64_t kBluetoothWriteTimeoutUs = 8000000;
+constexpr uint32_t kBluetoothDisconnectRetryMs = 250;
+constexpr int64_t kHostSessionTimeoutUs = 60000000;
+constexpr bool kWirelessControlEnabled = WIRELESS_CONTROL_ENABLED != 0;
+constexpr bool kWirelessControlAutoRx = WIRELESS_CONTROL_AUTO_RX != 0;
+constexpr bool kWifiControlEnabled = RF3_WIFI_CONTROL_ENABLED != 0;
+constexpr bool kBluetoothControlEnabled = RF3_BLUETOOTH_CONTROL_ENABLED != 0;
+constexpr bool kBluetoothRequirePairing = RF3_BLUETOOTH_REQUIRE_PAIRING != 0;
+constexpr uint32_t kTransferRateLimitBytesPerSecond = RF3_TRANSFER_RATE_LIMIT_BPS;
+constexpr EventBits_t kWifiConnectedBit = BIT0;
+constexpr char kWifiPlaceholderSsid[] = "YOUR_WIFI_SSID";
+constexpr char kWifiPlaceholderPassword[] = "YOUR_WIFI_PASSWORD";
+constexpr char kBluetoothSppServiceName[] = "RF3-SPP";
+
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+constexpr esp_spp_sec_t kBluetoothSppSecurity =
+    kBluetoothRequirePairing ? ESP_SPP_SEC_AUTHENTICATE : ESP_SPP_SEC_NONE;
+#endif
+
+// These compile-time checks keep the packetized transfer settings aligned with
+// nRF24 hardware limits instead of failing later at runtime.
+static_assert(ProtocolV2::kFrameSize == AudioPacket::kPacketBytes,
+              "Protocol v2 and nRF24 frame widths differ");
+
+struct FileInfo {
+    std::string name;
+    size_t bytes = 0;
+};
+
+enum class LoopMode {
+    None,
+    Tx,
+    Cw,
+    Morse
+};
+
+enum class CommandOrigin {
+    Local,
+    Remote,
+    Http,
+    Bluetooth
+};
+
+struct BluetoothCommandMessage {
+    char line[kConsoleLineBytes] = {};
+    uint32_t epoch = 0;
+};
+
+struct BluetoothTxMessage {
+    uint32_t handle = 0;
+    uint32_t epoch = 0;
+    uint16_t length = 0;
+    char bytes[kBluetoothTxMessageBytes] = {};
+};
+
+struct LoopConfig {
+    bool no_ack = false;
+    LoopMode mode = LoopMode::None;
+    bool active = false;
+    bool infinite = false;
+    bool restore_rx_after_completion = false;
+    uint32_t remaining_iterations = 0;
+    uint32_t completed_iterations = 0;
+    std::string file_name;
+    std::string morse_text;
+    uint32_t cw_on_ms = 0;
+    uint32_t cw_off_ms = 0;
+    uint32_t cw_report_every = 0;
+    uint8_t channel = 76;
+    uint8_t power_level = 3;
+};
+
+using HttpStatusSnapshot = HostStatusProtocol::Snapshot;
+
+struct IncomingFileStorage {
+    uint32_t transfer_id = 0;
+    std::string final_name;
+    std::string partial_name;
+    std::FILE* file = nullptr;
+};
+
+struct HostUploadStorage {
+    bool active = false;
+    size_t chunk_bytes = HostTransferProtocol::kLegacyChunkBytes;
+    std::string final_name;
+    std::FILE* file = nullptr;
+    uint32_t expected_size = 0;
+    uint32_t received_size = 0;
+    uint32_t expected_crc32 = 0;
+    uint32_t next_sequence = 0;
+    ProtocolV2::Crc32 crc;
+    CommandOrigin owner = CommandOrigin::Local;
+    uint32_t epoch = 0;
+    int64_t last_activity_us = 0;
+    std::array<uint8_t, kHostTransferChunkBytes> last_chunk{};
+    size_t last_chunk_size = 0;
+};
+
+struct HostDownloadStorage {
+    bool active = false;
+    bool encoded_name = false;
+    size_t chunk_bytes = HostTransferProtocol::kLegacyChunkBytes;
+    std::string name;
+    std::FILE* file = nullptr;
+    uint32_t total_size = 0;
+    uint32_t sent_size = 0;
+    uint32_t crc32 = 0;
+    uint32_t next_sequence = 0;
+    CommandOrigin owner = CommandOrigin::Local;
+    uint32_t epoch = 0;
+    int64_t last_activity_us = 0;
+    std::array<uint8_t, kHostTransferChunkBytes> last_chunk{};
+    size_t last_chunk_size = 0;
+};
+
+struct ProtocolTransferReport {
+    bool no_ack = false;
+    ReliableTransferV2::SenderState state = ReliableTransferV2::SenderState::Idle;
+    ProtocolV2::ErrorCode error = ProtocolV2::ErrorCode::None;
+    uint32_t transfer_id = 0;
+    uint32_t bytes_transferred = 0;
+    uint32_t total_bytes = 0;
+    uint32_t current_sequence = 0;
+    uint32_t total_packets = 0;
+    uint32_t retry_count = 0;
+    uint32_t crc32 = 0;
+    bool peer_complete = false;
+    char file_name[HostStorageProtocol::kFilenameMaxBytes + 1]{};
+    RadioStatus radio{};
+    bool radio_valid = false;
+};
+
+// The sender owns the radio mutex for the whole RF transfer. Publish only a
+// small trivially copied record here so STATUS can observe progress without
+// borrowing the hardware lock or racing the sender. No allocation in this lock.
+static_assert(std::is_trivially_copyable_v<ProtocolTransferReport>, "Published progress must not allocate in a critical section");
+portMUX_TYPE transfer_report_mux = portMUX_INITIALIZER_UNLOCKED;
+ProtocolTransferReport copyTransferReport(const ProtocolTransferReport& source)
+{
+    portENTER_CRITICAL(&transfer_report_mux);
+    const ProtocolTransferReport copy = source;
+    portEXIT_CRITICAL(&transfer_report_mux);
+    return copy;
+}
+void publishTransferReport(ProtocolTransferReport& destination, const ProtocolTransferReport& source)
+{
+    portENTER_CRITICAL(&transfer_report_mux);
+    destination = source;
+    portEXIT_CRITICAL(&transfer_report_mux);
+}
+void prepareTransferReport(ProtocolTransferReport& destination, const FileInfo& file,
+                           const RadioStatus& radio, uint32_t id)
+{
+    ProtocolTransferReport next;
+    next.transfer_id = id;
+    next.state = ReliableTransferV2::SenderState::Preparing;
+    next.total_bytes = static_cast<uint32_t>(file.bytes);
+    std::snprintf(next.file_name, sizeof(next.file_name), "%s", file.name.c_str());
+    next.radio = radio;
+    next.radio_valid = true;
+    publishTransferReport(destination, next);
+}
+
+const char* transferReportStateName(const ProtocolTransferReport& report)
+{
+    if (report.no_ack && report.state == ReliableTransferV2::SenderState::Completed) return "SentUnconfirmed";
+    return ReliableTransferV2::senderStateName(report.state);
+}
+
+const char* loopModeName(LoopMode mode)
+{
+    switch (mode) {
+        case LoopMode::Tx: return "TxLoop";
+        case LoopMode::Cw: return "CwLoop";
+        case LoopMode::Morse: return "Morse";
+        case LoopMode::None:
+        default:
+            return "None";
+    }
+}
+
+// ---- small string and parsing helpers ------------------------------------
+
+std::string trimAscii(std::string value)
+{
+    // Command parsing is intentionally American Standard Code for Information
+    // Interchange (ASCII)-centric because all console commands and filenames
+    // in this project are plain ASCII tokens.
+    const auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
+    while (!value.empty() && is_space(static_cast<unsigned char>(value.front()))) {
+        value.erase(value.begin());
+    }
+    while (!value.empty() && is_space(static_cast<unsigned char>(value.back()))) {
+        value.pop_back();
+    }
+    return value;
+}
+
+std::string uppercaseCopy(std::string_view text)
+{
+    // Commands are matched case-insensitively by normalizing once up front.
+    std::string out(text);
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::toupper(ch));
+    });
+    return out;
+}
+
+std::vector<std::string> splitWords(const std::string& line)
+{
+    // The console syntax is intentionally simple: tokens are whitespace
+    // separated, with no quoting or escaping rules.
+    std::vector<std::string> words;
+    std::string current;
+
+    for (char ch : line) {
+        if (std::isspace(static_cast<unsigned char>(ch))) {
+            if (!current.empty()) {
+                words.push_back(current);
+                current.clear();
+            }
+            continue;
+        }
+        current.push_back(ch);
+    }
+
+    if (!current.empty()) {
+        words.push_back(current);
+    }
+
+    return words;
+}
+
+bool parseUint8Arg(std::string_view text, uint8_t minimum, uint8_t maximum, uint8_t& out)
+{
+    // Many console commands take one byte-sized numeric argument such as a
+    // channel or power level, so this helper centralizes the range checking.
+    if (text.empty()) {
+        return false;
+    }
+
+    char* end = nullptr;
+    const std::string value(text);
+    const long parsed = std::strtol(value.c_str(), &end, 10);
+    if (!end || *end != '\0' || parsed < minimum || parsed > maximum) {
+        return false;
+    }
+
+    out = static_cast<uint8_t>(parsed);
+    return true;
+}
+
+bool parseUnsignedArg(std::string_view text, int base, uint32_t minimum, uint32_t maximum, uint32_t& out)
+{
+    if (!text.empty() && text.front() == '+') text.remove_prefix(1);
+    if (base == 16 && (text.substr(0, 2) == "0x" || text.substr(0, 2) == "0X")) {
+        text.remove_prefix(2);
+    }
+    if (text.empty()) return false;
+    uint32_t value = 0;
+    const char* end = text.data() + text.size();
+    const auto result = std::from_chars(text.data(), end, value, base);
+    if (result.ec != std::errc{} || result.ptr != end || value < minimum || value > maximum) {
+        return false;
+    }
+    out = value;
+    return true;
+}
+
+bool parseUint32Arg(std::string_view text, uint32_t minimum, uint32_t maximum, uint32_t& out)
+{
+    return parseUnsignedArg(text, 10, minimum, maximum, out);
+}
+
+bool parseHexUint32Arg(std::string_view text, uint32_t& out)
+{
+    return text.size() <= 8 && parseUnsignedArg(text, 16, 0, UINT32_MAX, out);
+}
+
+bool isValidHostFilename(std::string_view name)
+{
+    if (name.empty() || name.size() > kHostFilenameMaxBytes || name == "." || name == ".." ||
+        ReliableTransferV2::isInternalTransferName(name)) {
+        return false;
+    }
+
+    return std::all_of(name.begin(), name.end(), [](unsigned char ch) {
+        return std::isalnum(ch) != 0 || ch == '.' || ch == '_' || ch == '-';
+    });
+}
+
+bool decodeHex(std::string_view encoded, std::vector<uint8_t>& out)
+{
+    if (encoded.empty() || (encoded.size() % 2) != 0 ||
+        encoded.size() > kHostTransferChunkBytes * 2) {
+        return false;
+    }
+
+    const auto nibble = [](char ch, uint8_t& value) {
+        if (ch >= '0' && ch <= '9') {
+            value = static_cast<uint8_t>(ch - '0');
+            return true;
+        }
+        if (ch >= 'a' && ch <= 'f') {
+            value = static_cast<uint8_t>(ch - 'a' + 10);
+            return true;
+        }
+        if (ch >= 'A' && ch <= 'F') {
+            value = static_cast<uint8_t>(ch - 'A' + 10);
+            return true;
+        }
+        return false;
+    };
+
+    out.clear();
+    out.reserve(encoded.size() / 2);
+    for (size_t index = 0; index < encoded.size(); index += 2) {
+        uint8_t high = 0;
+        uint8_t low = 0;
+        if (!nibble(encoded[index], high) || !nibble(encoded[index + 1], low)) {
+            out.clear();
+            return false;
+        }
+        out.push_back(static_cast<uint8_t>((high << 4) | low));
+    }
+    return true;
+}
+
+std::string encodeHex(const uint8_t* data, size_t length)
+{
+    static constexpr char kHexDigits[] = "0123456789ABCDEF";
+    std::string encoded;
+    encoded.resize(length * 2);
+    for (size_t index = 0; index < length; ++index) {
+        encoded[index * 2] = kHexDigits[(data[index] >> 4) & 0x0Fu];
+        encoded[index * 2 + 1] = kHexDigits[data[index] & 0x0Fu];
+    }
+    return encoded;
+}
+
+bool parseLoopCountToken(std::string_view text, bool& infinite, uint32_t& count)
+{
+    const std::string upper = uppercaseCopy(text);
+    if (upper == "INF" || upper == "FOREVER") {
+        infinite = true;
+        count = 0;
+        return true;
+    }
+
+    uint32_t parsed = 0;
+    if (!parseUint32Arg(text, 1, UINT32_MAX, parsed)) {
+        return false;
+    }
+
+    infinite = false;
+    count = parsed;
+    return true;
+}
+
+bool statFileSize(const std::string& path, size_t& bytes)
+{
+    // SPIFFS directory listings only provide file names. stat() is used to get
+    // an accurate byte count for user-interface (UI) output and file
+    // selection.
+    struct stat info {};
+    if (::stat(path.c_str(), &info) != 0) {
+        return false;
+    }
+    if ((info.st_mode & S_IFREG) == 0) {
+        return false;
+    }
+    bytes = static_cast<size_t>(info.st_size);
+    return true;
+}
+
+uint64_t monotonicMilliseconds()
+{
+    const int64_t microseconds = esp_timer_get_time();
+    return microseconds > 0 ? static_cast<uint64_t>(microseconds) / 1000u : 0u;
+}
+
+void delayAtLeastMs(uint32_t duration_ms)
+{
+    vTaskDelay(TaskTiming::nonzeroTicks(duration_ms, configTICK_RATE_HZ));
+}
+
+bool initializeNvsFlash(const char* owner)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        if (HardwareProfile::kSelectedId == HardwareProfile::Id::CustomPcb || HardwareProfile::kSelectedBatteryPower != HardwareProfile::BatteryPower::None) {
+            ESP_LOGE(TAG,"Refusing to erase persistent battery cutoff state for %s",owner);
+            return false;
+        }
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS init failed for %s: %s", owner, esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
+bool sendPayloadWithRetry(RadioManager& manager, const uint8_t* payload, size_t len)
+{
+    return TxHelpers::sendWithRetry(
+        [&manager, payload, len]() {
+            return manager.sendPayload(payload, len);
+        },
+        [](uint32_t delay_ms) {
+            delayAtLeastMs(delay_ms);
+        });
+}
+
+void appendFormat(std::string& out, const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+
+    va_list copy;
+    va_copy(copy, args);
+    const int needed = std::vsnprintf(nullptr, 0, format, copy);
+    va_end(copy);
+
+    if (needed > 0) {
+        const size_t start = out.size();
+        out.resize(start + static_cast<size_t>(needed));
+        std::vsnprintf(out.data() + start,
+                       static_cast<size_t>(needed) + 1,
+                       format,
+                       args);
+    }
+
+    va_end(args);
+}
+
+// ---- SPIFFS file discovery helpers ---------------------------------------
+
+std::string buildFilePath(std::string_view name)
+{
+    // Accept either a bare file name or an already-qualified /spiffs path so
+    // higher-level code can stay flexible.
+    if (name.rfind("/spiffs/", 0) == 0) {
+        return std::string(name);
+    }
+    return std::string(kSpiffsRoot) + "/" + std::string(name);
+}
+
+std::string buildReceivedFileName(uint32_t transfer_id,
+                                  bool partial,
+                                  uint16_t collision_index = 0,
+                                  std::string_view extension = {})
+{
+    return FileTypeMetadata::receivedName(transfer_id, partial, collision_index, extension);
+}
+
+bool resolveFile(std::string request, FileInfo& out)
+{
+    request = trimAscii(request);
+    if (request.empty()) {
+        return false;
+    }
+    if (request.rfind("/spiffs/", 0) == 0) {
+        request.erase(0, std::strlen("/spiffs/"));
+    }
+    if (request.find('/') != std::string::npos || request.find('\\') != std::string::npos) {
+        return false;
+    }
+    if (ReliableTransferV2::isInternalTransferName(request)) {
+        return false;
+    }
+
+    size_t bytes = 0;
+    if (statFileSize(buildFilePath(request), bytes)) {
+        out.name = request;
+        out.bytes = bytes;
+        return true;
+    }
+
+    return false;
+}
+
+std::vector<FileInfo> listFiles()
+{
+    std::vector<FileInfo> files;
+    DIR* dir = opendir(kSpiffsRoot);
+    if (!dir) {
+        return files;
+    }
+
+    while (dirent* entry = readdir(dir)) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+
+        const std::string name(entry->d_name);
+        if (ReliableTransferV2::isInternalTransferName(name)) {
+            continue;
+        }
+
+        size_t bytes = 0;
+        if (!statFileSize(buildFilePath(name), bytes)) {
+            continue;
+        }
+
+        files.push_back({name, bytes});
+    }
+
+    closedir(dir);
+    std::sort(files.begin(), files.end(), [](const FileInfo& lhs, const FileInfo& rhs) {
+        return lhs.name < rhs.name;
+    });
+    return files;
+}
+
+void cleanupStaleIncomingFiles()
+{
+    DIR* dir = opendir(kSpiffsRoot);
+    if (!dir) {
+        ESP_LOGW(TAG, "Could not inspect SPIFFS for stale RX partial files: errno=%d", errno);
+        return;
+    }
+
+    while (dirent* entry = readdir(dir)) {
+        const std::string name(entry->d_name);
+        if (name == HostUploadPublish::kJournal || name == HostUploadPublish::kBackup) {
+            continue;
+        }
+        if (!ReliableTransferV2::isInternalTransferName(name)) {
+            continue;
+        }
+
+        const std::string path = buildFilePath(name);
+        errno = 0;
+        if (std::remove(path.c_str()) == 0 || errno == ENOENT) {
+            ESP_LOGI(TAG, "Removed stale RX partial file %s", name.c_str());
+        } else {
+            ESP_LOGW(TAG,
+                     "Could not remove stale RX partial file %s: errno=%d",
+                     name.c_str(),
+                     errno);
+        }
+    }
+
+    closedir(dir);
+}
+
+struct HostPublishOps {
+    bool exists(const std::string& name) const
+    {
+        struct stat info {};
+        return ::stat(buildFilePath(name).c_str(), &info) == 0;
+    }
+    bool remove(const std::string& name) const
+    {
+        return std::remove(buildFilePath(name).c_str()) == 0 || errno == ENOENT;
+    }
+    bool rename(const std::string& from, const std::string& to) const
+    {
+        return std::rename(buildFilePath(from).c_str(), buildFilePath(to).c_str()) == 0;
+    }
+    bool writeJournal(const std::string& destination) const
+    {
+        std::FILE* file = std::fopen(buildFilePath(HostUploadPublish::kJournal).c_str(), "wb");
+        if (!file) return false;
+        ProtocolV2::Crc32 crc;
+        crc.update(reinterpret_cast<const uint8_t*>(destination.data()), destination.size());
+        const int written = std::fprintf(file, "%s %08lX\n", destination.c_str(),
+                                         static_cast<unsigned long>(crc.value()));
+        const int flushed = std::fflush(file);
+        const int closed = std::fclose(file);
+        if (written <= 0 || flushed != 0 || closed != 0) {
+            remove(HostUploadPublish::kJournal);
+            return false;
+        }
+        return true;
+    }
+    bool readJournal(std::string& destination) const
+    {
+        std::FILE* file = std::fopen(buildFilePath(HostUploadPublish::kJournal).c_str(), "rb");
+        if (!file) return false;
+        char name[kHostFilenameMaxBytes + 1]{};
+        unsigned long expected_crc = 0;
+        const int parsed = std::fscanf(file, "%30s %lx", name, &expected_crc);
+        std::fclose(file);
+        if (parsed != 2 || !isValidHostFilename(name)) return false;
+        destination = name;
+        ProtocolV2::Crc32 crc;
+        crc.update(reinterpret_cast<const uint8_t*>(destination.data()), destination.size());
+        return expected_crc == crc.value();
+    }
+};
+
+void printFileTable(const std::vector<FileInfo>& files, std::string_view selected_file)
+{
+    if (files.empty()) {
+        std::printf("No staged files are available in SPIFFS.\n");
+        return;
+    }
+
+    std::printf("Files in SPIFFS:\n");
+    for (const FileInfo& file : files) {
+        const char* marker = file.name == selected_file ? "*" : " ";
+        std::printf(" %s %s (%u bytes)\n",
+                    marker,
+                    file.name.c_str(),
+                    static_cast<unsigned>(file.bytes));
+    }
+}
+
+// ---- startup helpers ------------------------------------------------------
+
+bool mountFileSystem()
+{
+    // The app expects a prebuilt SPIFFS image containing staged data files. It
+    // does not auto-format on failure because an empty partition is more
+    // likely a missing upload than genuine corruption.
+    esp_vfs_spiffs_conf_t conf{};
+    conf.base_path = kSpiffsRoot;
+    conf.partition_label = nullptr;
+    conf.max_files = 8;
+    conf.format_if_mount_failed = false;
+
+    const esp_err_t err = esp_vfs_spiffs_register(&conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount SPIFFS: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    size_t total = 0;
+    size_t used = 0;
+    if (esp_spiffs_info(nullptr, &total, &used) == ESP_OK) {
+        ESP_LOGI(TAG, "SPIFFS mounted: used=%u total=%u",
+                 static_cast<unsigned>(used),
+                 static_cast<unsigned>(total));
+    }
+
+    return true;
+}
+
+bool resetFileSource(void* context)
+{
+    std::FILE* file = static_cast<std::FILE*>(context);
+    if (!file) {
+        return false;
+    }
+    std::clearerr(file);
+    return std::fseek(file, 0, SEEK_SET) == 0;
+}
+
+ReliableTransferV2::ReadResult readFileSource(void* context,
+                                              uint8_t* out,
+                                              size_t capacity)
+{
+    std::FILE* file = static_cast<std::FILE*>(context);
+    if (!file || !out || capacity == 0) {
+        return {0, ReliableTransferV2::ReadState::Error};
+    }
+    const size_t bytes_read = std::fread(out, 1, capacity, file);
+    if (std::ferror(file)) {
+        return {bytes_read, ReliableTransferV2::ReadState::Error};
+    }
+    return {bytes_read,
+            std::feof(file) ? ReliableTransferV2::ReadState::EndOfFile
+                            : ReliableTransferV2::ReadState::MoreDataMayFollow};
+}
+
+uint32_t nextTransferId()
+{
+    static uint32_t previous = 0;
+    uint32_t candidate = 0;
+    do {
+        candidate = esp_random();
+    } while (candidate == 0 || candidate == previous);
+    previous = candidate;
+    return candidate;
+}
+
+void updateTransferReport(ProtocolTransferReport* report,
+                          const RadioManager& manager,
+                          FileTransfer::Service& service,
+                          uint64_t now_ms)
+{
+    service.refreshSenderStatus(now_ms);
+    if (!report) {
+        return;
+    }
+    const ReliableTransferV2::SenderSession& sender = service.transportSender();
+    ProtocolTransferReport next = copyTransferReport(*report);
+    next.state = sender.state();
+    next.error = sender.error();
+    next.transfer_id = sender.transferId();
+    next.bytes_transferred = sender.acknowledgedBytes();
+    next.total_bytes = sender.totalSize();
+    next.current_sequence = sender.currentSequence();
+    next.total_packets = sender.totalPackets();
+    next.retry_count = sender.totalRetries();
+    next.crc32 = sender.crc32();
+    next.peer_complete = sender.peerComplete();
+    next.radio = manager.status();
+    next.radio_valid = true;
+    publishTransferReport(*report, next);
+}
+
+using TxBatteryCheck = bool (*)(void*);
+
+bool sendDataFileNoAck(RadioManager& manager, const char* path,
+                       const std::atomic_bool* stop_requested,
+                       ProtocolTransferReport* report,
+                       TxBatteryCheck battery_check = nullptr, void* battery_context = nullptr, uint32_t pass = 0, uint32_t passes = 1)
+{
+    ProtocolTransferReport next = copyTransferReport(*report);
+    next.no_ack = true;
+    next.peer_complete = false;
+    std::FILE* file = std::fopen(path, "rb");
+    const auto finish = [&](ReliableTransferV2::SenderState state, ProtocolV2::ErrorCode error) {
+        next.state = state; next.error = error; next.radio = manager.status();
+        next.radio_valid = true; publishTransferReport(*report, next);
+        if (file) std::fclose(file);
+        return state == ReliableTransferV2::SenderState::Completed;
+    };
+    if (!file) return finish(ReliableTransferV2::SenderState::Failed, ProtocolV2::ErrorCode::SourceRead);
+    if (!manager.disableAutoAck())
+        return finish(ReliableTransferV2::SenderState::Failed, ProtocolV2::ErrorCode::TransportFailure);
+    NoAckTransfer::Sender sender(file, {&resetFileSource, &readFileSource});
+    const char* name = std::strrchr(path, '/');
+    if (!sender.begin(next.transfer_id, name ? name + 1 : path))
+        return finish(ReliableTransferV2::SenderState::Failed, sender.error());
+    next.total_bytes = sender.metadata().total_size;
+    next.total_packets = sender.metadata().total_packets;
+    next.crc32 = sender.metadata().crc32;
+    next.state = ReliableTransferV2::SenderState::SendingData;
+    publishTransferReport(*report, next);
+    ProtocolV2::Frame start{};
+    if(!sender.frame(start)) return finish(ReliableTransferV2::SenderState::Failed, sender.error());
+    start[2]='G';
+    const uint32_t symbols=next.total_packets+8*((next.total_packets+15)/16);
+    for(uint32_t round=0;round<passes;++round) {
+        for(uint32_t slot=0;slot<=symbols;++slot) {
+            if (battery_check && !battery_check(battery_context))
+                return finish(ReliableTransferV2::SenderState::Cancelled, ProtocolV2::ErrorCode::Cancelled);
+            if (stop_requested && stop_requested->load()) {
+                ProtocolV2::Packet cancel{}; cancel.type = ProtocolV2::PacketType::Cancel;
+                cancel.transfer_id = next.transfer_id; cancel.error = ProtocolV2::ErrorCode::Cancelled;
+                ProtocolV2::Frame frame{};
+                if (NoAckTransfer::encode(cancel, frame)) { frame[2]='G'; (void)manager.sendPayload(frame.data(), frame.size(), false); }
+                return finish(ReliableTransferV2::SenderState::Cancelled, ProtocolV2::ErrorCode::Cancelled);
+            }
+            if(slot==0 || (slot<symbols && slot%32==0)) {
+                if(!manager.sendPayload(start.data(),start.size(),false))
+                    return finish(ReliableTransferV2::SenderState::Failed,ProtocolV2::ErrorCode::TransportFailure);
+                delayAtLeastMs(slot==0?NoAckTransfer::kStartGuardMs:NoAckTransfer::kDataGapMs);
+            }
+            if(slot==symbols) break;
+            auto pos=GapFile::position(next.total_packets,slot,pass+round);
+            ProtocolV2::Packet pkt{};pkt.transfer_id=next.transfer_id;
+            ProtocolV2::Frame frame{};
+            if(!GapFile::payload(file,next.total_bytes,pos,pkt) || !NoAckTransfer::encode(pkt,frame))
+                return finish(ReliableTransferV2::SenderState::Failed,ProtocolV2::ErrorCode::SourceRead);
+            frame[2]=pos.repair?'P':'G';
+            if(!manager.sendPayload(frame.data(),frame.size(),false))
+                return finish(ReliableTransferV2::SenderState::Failed,ProtocolV2::ErrorCode::TransportFailure);
+            if(round==0 && !pos.repair){next.bytes_transferred+=pkt.payload_length; ++next.current_sequence;}
+            next.radio=manager.status();publishTransferReport(*report,next);
+            delayAtLeastMs(NoAckTransfer::kDataGapMs);
+        }
+        ProtocolV2::Packet end{};end.type=ProtocolV2::PacketType::End;end.transfer_id=next.transfer_id;
+        end.total_size=next.total_bytes;end.total_packets=next.total_packets;end.crc32=next.crc32;
+        ProtocolV2::Frame tail{};NoAckTransfer::encode(end,tail);tail[2]='G';
+        if(!manager.sendPayload(tail.data(),tail.size(),false))
+            return finish(ReliableTransferV2::SenderState::Failed,ProtocolV2::ErrorCode::TransportFailure);
+    }
+    ESP_LOGI(TAG, "NO ACK: sent locally, delivery unconfirmed id=%08lX bytes=%lu",
+             static_cast<unsigned long>(next.transfer_id), static_cast<unsigned long>(next.bytes_transferred));
+    return finish(ReliableTransferV2::SenderState::Completed, ProtocolV2::ErrorCode::None);
+}
+
+bool sendDataFile(RadioManager& manager,
+                  FileTransfer::Service& transfer_service,
+                  const char* path,
+                  const std::atomic_bool* stop_requested = nullptr,
+                  ProtocolTransferReport* report = nullptr,
+                  TxBatteryCheck battery_check = nullptr, void* battery_context = nullptr)
+{
+    std::FILE* file = std::fopen(path, "rb");
+    if (!file) {
+        ESP_LOGE(TAG, "Could not open %s for reliable transfer: errno=%d", path, errno);
+        if (report) {
+            ProtocolTransferReport failed = copyTransferReport(*report);
+            failed.state = ReliableTransferV2::SenderState::Failed;
+            failed.error = ProtocolV2::ErrorCode::SourceRead;
+            failed.radio = manager.status();
+            publishTransferReport(*report, failed);
+        }
+        return false;
+    }
+
+    FileTransfer::StreamingDataSource source(
+        file, {&resetFileSource, &readFileSource});
+    FileTransfer::TransferMetadata metadata{};
+    const char* separator = std::strrchr(path, '/');
+    (void)metadata.logical_filename.set(separator ? separator + 1 : path);
+    const std::string_view file_name = metadata.logical_filename.c_str();
+    (void)metadata.media_type.set(
+        file_name.size() >= 3 && file_name.substr(file_name.size() - 3) == ".u8"
+            ? "audio/x-unsigned-8bit-pcm" : "application/octet-stream");
+    struct stat source_info {};
+    if (::stat(path, &source_info) == 0 && source_info.st_size >= 0 &&
+        static_cast<uint64_t>(source_info.st_size) <= UINT32_MAX) {
+        metadata.has_expected_length = true;
+        metadata.expected_length = static_cast<uint32_t>(source_info.st_size);
+    }
+
+    const uint64_t start_ms = monotonicMilliseconds();
+    const FileTransfer::StartResult started =
+        transfer_service.startTransfer(source, metadata, start_ms);
+    if (!started) {
+        if (report) {
+            ProtocolTransferReport failed = copyTransferReport(*report);
+            failed.state = ReliableTransferV2::SenderState::Failed;
+            failed.error = started.code == FileTransfer::StartCode::UnsupportedSize
+                ? ProtocolV2::ErrorCode::UnsupportedSize
+                : started.code == FileTransfer::StartCode::ReadFailed || started.code == FileTransfer::StartCode::InvalidSource
+                ? ProtocolV2::ErrorCode::SourceRead
+                : started.code == FileTransfer::StartCode::Busy
+                ? ProtocolV2::ErrorCode::Busy : ProtocolV2::ErrorCode::InvalidMetadata;
+            failed.radio = manager.status();
+            publishTransferReport(*report, failed);
+        }
+        std::fclose(file);
+        ESP_LOGE(TAG,
+                 "Protocol v2 source preparation failed for %s result=%u max_bytes=%lu",
+                 path,
+                 static_cast<unsigned>(started.code),
+                 static_cast<unsigned long>(ProtocolV2::kMaxFileSize));
+        return false;
+    }
+
+    updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
+    const uint32_t transfer_id = started.transfer_id;
+    ReliableTransferV2::SenderSession& sender = transfer_service.transportSender();
+
+    ESP_LOGI(TAG,
+             "Protocol v2 TX start id=%08lX bytes=%lu packets=%lu crc32=%08lX",
+             static_cast<unsigned long>(transfer_id),
+             static_cast<unsigned long>(sender.totalSize()),
+             static_cast<unsigned long>(sender.totalPackets()),
+             static_cast<unsigned long>(sender.crc32()));
+
+    bool cancellation_started = false;
+    while (!sender.terminal()) {
+        if (battery_check && !battery_check(battery_context)) {
+            sender.cancelLocally();
+            break;
+        }
+        if (stop_requested && stop_requested->load() && !cancellation_started) {
+            cancellation_started = true;
+            (void)transfer_service.cancelTransfer(transfer_id, monotonicMilliseconds());
+        }
+
+        ProtocolV2::Frame outbound{};
+        if (!sender.outboundFrame(outbound)) {
+            (void)sender.tick(monotonicMilliseconds());
+            updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
+            delayAtLeastMs(2);
+            continue;
+        }
+
+        const ProtocolV2::Packet outbound_packet = [&]() {
+            ProtocolV2::Packet packet{};
+            (void)ProtocolV2::decode(outbound.data(), outbound.size(), packet);
+            return packet;
+        }();
+
+        if (outbound_packet.type == ProtocolV2::PacketType::Data) {
+            const uint32_t rate_delay_ms = TransferRateLimiter::delayMilliseconds(
+                outbound_packet.payload_length, kTransferRateLimitBytesPerSecond);
+            if (rate_delay_ms > 0) {
+                delayAtLeastMs(rate_delay_ms);
+            }
+        }
+        const int64_t send_start_us = esp_timer_get_time();
+        const uint64_t send_time_ms = monotonicMilliseconds();
+        if (!manager.sendPayloadAndListen(outbound.data(), outbound.size())) {
+            (void)sender.onTransportFailure(send_time_ms);
+            updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
+            delayAtLeastMs(2);
+            continue;
+        }
+        if (!sender.noteFrameSent(send_time_ms)) {
+            break;
+        }
+
+        if (!manager.enterRx()) {
+            (void)sender.onTransportFailure(monotonicMilliseconds());
+            updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
+            continue;
+        }
+
+        if (outbound_packet.type == ProtocolV2::PacketType::End) {
+            ESP_LOGI(TAG,
+                     "Protocol v2 local DATA acknowledged id=%08lX; awaiting remote verification",
+                     static_cast<unsigned long>(transfer_id));
+        }
+
+        bool leave_wait = false;
+        while (!leave_wait && !sender.terminal()) {
+            const uint64_t now_ms = monotonicMilliseconds();
+            if (stop_requested && stop_requested->load() && !cancellation_started) {
+                cancellation_started = true;
+                (void)transfer_service.cancelTransfer(transfer_id, now_ms);
+                leave_wait = true;
+                break;
+            }
+
+            if (manager.hasPendingRx()) {
+                ProtocolV2::Frame incoming{};
+                size_t incoming_length = 0;
+                if (!manager.receivePayload(
+                        incoming.data(), incoming.size(), incoming_length)) {
+                    (void)sender.onTransportFailure(now_ms);
+                    leave_wait = true;
+                    break;
+                }
+                const ReliableTransferV2::SenderEvent event = sender.onFrame(
+                    incoming.data(), incoming_length, now_ms);
+                if (outbound_packet.type == ProtocolV2::PacketType::Data &&
+                    event == ReliableTransferV2::SenderEvent::OutboundReady) {
+                    ProtocolV2::Packet response_packet{};
+                    if (ProtocolV2::decode(incoming.data(), incoming_length, response_packet) == ProtocolV2::DecodeStatus::Ok &&
+                        response_packet.type == ProtocolV2::PacketType::Ack)
+                        RuntimeDiagnostics::global().ack_wait.record(
+                            static_cast<uint64_t>(esp_timer_get_time() - send_start_us));
+                }
+                leave_wait = event == ReliableTransferV2::SenderEvent::OutboundReady ||
+                             event == ReliableTransferV2::SenderEvent::Completed ||
+                             event == ReliableTransferV2::SenderEvent::Cancelled ||
+                             event == ReliableTransferV2::SenderEvent::Failed;
+            }
+
+            if (!leave_wait) {
+                const ReliableTransferV2::SenderEvent event = sender.tick(now_ms);
+                leave_wait = event == ReliableTransferV2::SenderEvent::OutboundReady ||
+                             event == ReliableTransferV2::SenderEvent::Completed ||
+                             event == ReliableTransferV2::SenderEvent::Cancelled ||
+                             event == ReliableTransferV2::SenderEvent::Failed;
+            }
+            if (!leave_wait) {
+                delayAtLeastMs(2);
+            }
+        }
+
+        if (manager.status().state == RadioState::RxListening && !manager.leaveRx()) {
+            (void)sender.onTransportFailure(monotonicMilliseconds());
+        }
+        updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
+    }
+
+    updateTransferReport(report, manager, transfer_service, monotonicMilliseconds());
+    std::fclose(file);
+    if (sender.state() == ReliableTransferV2::SenderState::Completed &&
+        sender.peerComplete()) {
+        ESP_LOGI(TAG,
+                 "Protocol v2 remote receiver verified and published id=%08lX bytes=%lu packets=%lu crc32=%08lX retries=%lu",
+                 static_cast<unsigned long>(sender.transferId()),
+                 static_cast<unsigned long>(sender.acknowledgedBytes()),
+                 static_cast<unsigned long>(sender.acknowledgedPackets()),
+                 static_cast<unsigned long>(sender.crc32()),
+                 static_cast<unsigned long>(sender.totalRetries()));
+        return true;
+    }
+
+    ESP_LOGE(TAG,
+             "Protocol v2 transfer did not complete id=%08lX state=%s error=%s bytes=%lu/%lu seq=%lu retries=%lu",
+             static_cast<unsigned long>(sender.transferId()),
+             ReliableTransferV2::senderStateName(sender.state()),
+             ProtocolV2::errorName(sender.error()),
+             static_cast<unsigned long>(sender.acknowledgedBytes()),
+             static_cast<unsigned long>(sender.totalSize()),
+             static_cast<unsigned long>(sender.currentSequence()),
+             static_cast<unsigned long>(sender.totalRetries()));
+    return false;
+}
+
+class DemoConsoleApp {
+public:
+    explicit DemoConsoleApp(RadioManager& manager, DevboardPower::Controller& power,
+                            Esp32Nrf24Hal& hal)
+        : manager_(manager), power_(power), hal_(hal),
+          transfer_service_(&DemoConsoleApp::queuedTransferIdEntry, this),
+          receiver_(this, incomingStorageCallbacks())
+    {
+        transfer_service_.registerReceiveHandler(
+            &DemoConsoleApp::receiveCompletionEntry, this);
+    }
+
+    bool initialize()
+    {
+        // Initialization wires together every subsystem needed before the
+        // interactive console can start:
+        // - create a mutex that serializes all radio access
+        // - disable stdio buffering so the serial console feels live
+        // - mount SPIFFS and verify the selected file exists
+        // - boot the radio
+        // - start the background receive (RX) polling task
+        radio_mutex_ = xSemaphoreCreateMutex();
+        if (!radio_mutex_) {
+            ESP_LOGE(TAG, "Failed to allocate radio mutex");
+            return false;
+        }
+
+        loop_mutex_ = xSemaphoreCreateMutex();
+        if (!loop_mutex_) {
+            ESP_LOGE(TAG, "Failed to allocate loop mutex");
+            return false;
+        }
+
+        status_mutex_ = xSemaphoreCreateMutex();
+        if (!status_mutex_) {
+            ESP_LOGE(TAG, "Failed to allocate status mutex");
+            return false;
+        }
+        setSelectedFile(selected_file_);
+        command_mutex_ = xSemaphoreCreateMutex();
+        if (!command_mutex_) {
+            ESP_LOGE(TAG, "Failed to allocate command mutex");
+            return false;
+        }
+
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+        if (kBluetoothControlEnabled) {
+            bluetooth_command_queue_ =
+                xQueueCreate(kBluetoothCommandQueueDepth, sizeof(BluetoothCommandMessage));
+            if (!bluetooth_command_queue_) {
+                ESP_LOGE(TAG, "Failed to allocate Bluetooth command queue");
+                return false;
+            }
+        }
+#endif
+
+        // Hex-encoded negotiated upload chunks exceed the UART hardware FIFO.
+        // Keep receiving while command processing and diagnostics run.
+#if CONFIG_ESP_CONSOLE_UART
+        constexpr uart_port_t console_uart = static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM);
+        ESP_ERROR_CHECK(uart_driver_install(console_uart, 4096, 0, 0, nullptr, 0));
+        uart_vfs_dev_use_driver(console_uart);
+#endif
+        std::setvbuf(stdin, nullptr, _IONBF, 0);
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+        filesystem_ready_ = mountFileSystem();
+        if (!filesystem_ready_) {
+            ESP_LOGE(TAG,
+                     "SPIFFS unavailable. Upload a filesystem image; the serial console will remain available for diagnostics.");
+        } else {
+            HostPublishOps publication;
+            if (!HostUploadPublish::recover(publication)) {
+                ESP_LOGE(TAG, "Upload replacement recovery pending; preserving backup and journal");
+            }
+            cleanupStaleIncomingFiles();
+        }
+
+        if (!takeRadio()) {
+            ESP_LOGE(TAG, "Could not acquire radio mutex during init");
+            return false;
+        }
+
+        // Channel 76 is used as the demo default, but the console can
+        // reinitialize on another channel later.
+        const bool boot_ok = power_.radioAvailable() && manager_.boot(76);
+        if (!power_.radioAvailable()) (void)manager_.powerDown();
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        if (!boot_ok) {
+            ESP_LOGW(TAG, "Radio boot failed, state=%s fault=%d",
+                     RadioManager::stateName(status.state),
+                     status.last_fault);
+            ESP_LOGW(TAG, "Probe snapshot: STATUS=0x%02X", static_cast<unsigned>(status.last_status));
+            if (status.last_status == 0x00) {
+                ESP_LOGW(TAG, "STATUS=0x00 usually means the nRF24 is unpowered, MISO is held low, or CSN/SCK/MOSI/MISO wiring is not reaching the chip.");
+            } else if (status.last_status == 0xFF) {
+                ESP_LOGW(TAG, "STATUS=0xFF usually means CSN is not selecting the radio or MISO is floating high.");
+            }
+            ESP_LOGW(TAG, "Continuing without radio so SPIFFS and the serial console remain testable.");
+        }
+
+        // If the configured default file is missing, fall back to the first
+        // available SPIFFS file so the transmit (TX) command still has a sane
+        // default.
+        const std::vector<FileInfo> files = listFiles();
+        if (!files.empty()) {
+            FileInfo selected{};
+            if (!resolveFile(selected_file_, selected)) {
+                setSelectedFile(files.front().name);
+            }
+        }
+
+        if (xTaskCreate(&DemoConsoleApp::rxTaskEntry, "radio_rx", 6144, this, 4, &rx_task_) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start RX polling task");
+            return false;
+        }
+
+        if (xTaskCreate(&DemoConsoleApp::loopTaskEntry, "radio_loop", 6144, this, 4, &loop_task_) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start loop task");
+            return false;
+        }
+
+        if (power_.supported() && xTaskCreate(&DemoConsoleApp::batteryTaskEntry,
+                "battery",4096,this,2,nullptr)!=pdPASS) {
+            ESP_LOGE(TAG,"Failed to start autonomous battery protection task");
+            (void)hal_.setSignalOutputsEnabled(false);
+            (void)power_.applyCutoff(monotonicMilliseconds());
+            return false;
+        }
+
+        if (boot_ok) {
+            ESP_LOGI(TAG, "Radio boot OK, state=%s", RadioManager::stateName(status.state));
+        } else {
+            ESP_LOGI(TAG, "Radio unavailable, console running in filesystem-only mode.");
+        }
+
+        if (boot_ok && kWirelessControlEnabled && kWirelessControlAutoRx) {
+            tryResumeWirelessRx("Wireless control armed");
+        }
+
+        if (kWifiControlEnabled) {
+            if (!startWifiControlPlane()) {
+                ESP_LOGW(TAG, "Wi-Fi control plane not available. Serial console remains active.");
+            }
+        } else {
+            ESP_LOGI(TAG, "Wi-Fi control plane disabled for this build.");
+        }
+
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+        if (kBluetoothControlEnabled) {
+            if (!startBluetoothControlPlane()) {
+                ESP_LOGW(TAG, "Bluetooth SPP control plane not available. Serial console remains active.");
+            }
+        }
+#else
+        ESP_LOGI(TAG, "Bluetooth SPP control plane disabled for this build.");
+#endif
+
+        ESP_LOGI(TAG,
+                 "Reliable file protocol v%u: frame=%u data=%u max_file=%lu retries=%u",
+                 static_cast<unsigned>(ProtocolV2::kVersion),
+                 static_cast<unsigned>(ProtocolV2::kFrameSize),
+                 static_cast<unsigned>(ProtocolV2::kDataPayloadCapacity),
+                 static_cast<unsigned long>(ProtocolV2::kMaxFileSize),
+                 static_cast<unsigned>(ProtocolV2::kMaximumRetries));
+        ESP_LOGI(TAG,
+                 "Build profile=%s filesystem=%s HTTP-control=%s BT-control=%s transfer-rate-limit=%lu B/s",
+                 HardwareProfile::kSelectedName,
+                 filesystem_ready_ ? "ready" : "unavailable",
+                 kWifiControlEnabled ? "enabled" : "disabled",
+                 kBluetoothControlEnabled ? "enabled" : "disabled",
+                 static_cast<unsigned long>(kTransferRateLimitBytesPerSecond));
+        printHelp();
+        printFileTable(files, selected_file_);
+        printStatus();
+        if (xTaskCreate(&DemoConsoleApp::hostMaintenanceTaskEntry, "host_cleanup", 3072,
+                        this, 2, nullptr) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start host transfer cleanup task");
+            return false;
+        }
+        return true;
+    }
+
+    void run()
+    {
+        // UART-backed stdin may deliver one character at a time depending on
+        // the host monitor. Accumulate characters locally so commands are only
+        // dispatched after Enter is pressed.
+        std::string pending_line;
+        pending_line.reserve(kConsoleLineBytes);
+        bool prompt_visible = false;
+        bool swallow_lf_after_cr = false;
+        bool line_overflow = false;
+
+        while (true) {
+            if (!prompt_visible) {
+                printPrompt();
+                prompt_visible = true;
+            }
+
+            const int raw = std::fgetc(stdin);
+            if (raw == EOF) {
+                clearerr(stdin);
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+
+            char ch = static_cast<char>(raw);
+            const unsigned char byte = static_cast<unsigned char>(ch);
+            if (ch == '\n' && swallow_lf_after_cr) {
+                swallow_lf_after_cr = false;
+                continue;
+            }
+
+            if (ch == '\r' || ch == '\n') {
+                swallow_lf_after_cr = ch == '\r';
+                std::printf("\n");
+                std::fflush(stdout);
+                const std::string command_line = trimAscii(pending_line);
+                pending_line.clear();
+                if (line_overflow) {
+                    std::printf("ERR command line too long\n");
+                    line_overflow = false;
+                } else if (!command_line.empty()) {
+                    dispatchCommand(command_line, CommandOrigin::Local);
+                }
+                prompt_visible = false;
+                continue;
+            }
+
+            if (line_overflow) continue;
+
+            if (ch == '\b' || byte == 0x7F) {
+                swallow_lf_after_cr = false;
+                if (!pending_line.empty()) {
+                    pending_line.pop_back();
+                    std::printf("\b \b");
+                    std::fflush(stdout);
+                }
+                continue;
+            }
+
+            if (ch == '\t') {
+                ch = ' ';
+            } else if (byte < 0x20 || byte > 0x7E) {
+                continue;
+            }
+
+            swallow_lf_after_cr = false;
+
+            if (pending_line.size() + 1 < kConsoleLineBytes) {
+                pending_line.push_back(ch);
+                std::printf("%c", ch);
+                std::fflush(stdout);
+            } else {
+                line_overflow = true;
+            }
+        }
+    }
+
+private:
+    static void receiveCompletionEntry(
+        void* context,
+        const FileTransfer::ReceiveCompletion& completion)
+    {
+        static_cast<DemoConsoleApp*>(context)->onReceiveCompletion(completion);
+    }
+
+    void onReceiveCompletion(const FileTransfer::ReceiveCompletion& completion)
+    {
+        ESP_LOGI(TAG,
+                 "Subsystem RX completion callback task=%s id=%08lX bytes=%lu path=%s",
+                 pcTaskGetName(nullptr),
+                 static_cast<unsigned long>(completion.status.transfer_id),
+                 static_cast<unsigned long>(completion.status.bytes_transferred),
+                 completion.status.final_published_path.c_str());
+    }
+
+    static void rxTaskEntry(void* ctx)
+    {
+        // Free Real-Time Operating System (FreeRTOS) tasks must start from a
+        // plain C-style entry point, so this static trampoline forwards to the
+        // class instance.
+        static_cast<DemoConsoleApp*>(ctx)->rxTask();
+    }
+
+    static void batteryTaskEntry(void* ctx)
+    {
+        auto* app=static_cast<DemoConsoleApp*>(ctx);
+        while (true) {
+            app->serviceBatteryOnce();
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
+    }
+
+    static void loopTaskEntry(void* ctx)
+    {
+        static_cast<DemoConsoleApp*>(ctx)->loopTask();
+    }
+
+    static void wifiControlTaskEntry(void* ctx)
+    {
+        static_cast<DemoConsoleApp*>(ctx)->wifiControlTask();
+    }
+
+    static void hostMaintenanceTaskEntry(void* ctx)
+    {
+        auto* app = static_cast<DemoConsoleApp*>(ctx);
+        while (true) {
+            if (app->takeCommand(pdMS_TO_TICKS(10))) {
+                app->expireHostSessions();
+                app->giveCommand();
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    static void wifiEventHandlerEntry(void* arg,
+                                      esp_event_base_t event_base,
+                                      int32_t event_id,
+                                      void* event_data)
+    {
+        static_cast<DemoConsoleApp*>(arg)->handleWifiEvent(event_base, event_id, event_data);
+    }
+
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+    static void bluetoothCommandTaskEntry(void* ctx)
+    {
+        static_cast<DemoConsoleApp*>(ctx)->bluetoothCommandTask();
+    }
+
+    static void bluetoothTxTaskEntry(void* ctx)
+    {
+        static_cast<DemoConsoleApp*>(ctx)->bluetoothTxTask();
+    }
+
+    static void sppCallbackEntry(esp_spp_cb_event_t event, esp_spp_cb_param_t* param)
+    {
+        if (bluetooth_app_) {
+            bluetooth_app_->handleSppEvent(event, param);
+        }
+    }
+
+    static void gapCallbackEntry(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* param)
+    {
+        if (bluetooth_app_) {
+            bluetooth_app_->handleGapEvent(event, param);
+        }
+    }
+
+    bool startBluetoothControlPlane()
+    {
+        bluetooth_tx_queue_ = xQueueCreate(kBluetoothTxQueueDepth, sizeof(BluetoothTxMessage));
+        if (!bluetooth_tx_queue_ ||
+            xTaskCreate(&DemoConsoleApp::bluetoothTxTaskEntry, "bt_tx", 6144,
+                        this, 4, nullptr) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start Bluetooth TX queue/task");
+            return false;
+        }
+        if (!initializeNvsFlash("Bluetooth")) {
+            return false;
+        }
+
+        esp_err_t err = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Could not release BLE memory: %s", esp_err_to_name(err));
+        }
+
+        esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+        err = esp_bt_controller_init(&bt_cfg);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "Bluetooth controller init failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "Bluetooth controller enable failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        err = esp_bluedroid_init();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "Bluedroid init failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        err = esp_bluedroid_enable();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "Bluedroid enable failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        bluetooth_app_ = this;
+
+        err = esp_bt_gap_register_callback(&DemoConsoleApp::gapCallbackEntry);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Bluetooth GAP callback register failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        err = esp_spp_register_callback(&DemoConsoleApp::sppCallbackEntry);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Bluetooth SPP callback register failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        esp_spp_cfg_t spp_cfg{};
+        spp_cfg.mode = ESP_SPP_MODE_CB;
+        spp_cfg.enable_l2cap_ertm = true;
+        spp_cfg.tx_buffer_size = 0;
+        err = esp_spp_enhanced_init(&spp_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Bluetooth SPP init failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        esp_bt_io_cap_t io_capability = ESP_BT_IO_CAP_NONE;
+        (void)esp_bt_gap_set_security_param(
+            ESP_BT_SP_IOCAP_MODE, &io_capability, sizeof(io_capability));
+
+        esp_bt_pin_type_t pin_type = ESP_BT_PIN_TYPE_VARIABLE;
+        esp_bt_pin_code_t pin_code{};
+        (void)esp_bt_gap_set_pin(pin_type, 0, pin_code);
+
+        if (!bluetooth_command_task_) {
+            if (xTaskCreate(&DemoConsoleApp::bluetoothCommandTaskEntry,
+                            "bt_cmd",
+                            6144,
+                            this,
+                            4,
+                            &bluetooth_command_task_) != pdPASS) {
+                ESP_LOGE(TAG, "Failed to start Bluetooth command task");
+                return false;
+            }
+        }
+
+        ESP_LOGI(TAG, "Bluetooth SPP control plane starting");
+        return true;
+    }
+
+    void handleSppEvent(esp_spp_cb_event_t event, esp_spp_cb_param_t* param)
+    {
+        switch (event) {
+            case ESP_SPP_INIT_EVT:
+                if (param->init.status == ESP_SPP_SUCCESS) {
+                    const esp_err_t err = esp_spp_start_srv(
+                        kBluetoothSppSecurity,
+                        ESP_SPP_ROLE_SLAVE,
+                        0,
+                        kBluetoothSppServiceName);
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "Bluetooth SPP server start request failed: %s",
+                                 esp_err_to_name(err));
+                    }
+                } else {
+                    ESP_LOGE(TAG, "Bluetooth SPP init event failed: status=%d",
+                             static_cast<int>(param->init.status));
+                }
+                break;
+
+            case ESP_SPP_START_EVT:
+                if (param->start.status == ESP_SPP_SUCCESS) {
+                    std::string device_name = "RF3-";
+                    device_name += WifiControlConfig::kNodeName;
+                    esp_bt_gap_set_device_name(device_name.c_str());
+                    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
+                                             ESP_BT_GENERAL_DISCOVERABLE);
+                    ESP_LOGI(TAG,
+                             "Bluetooth SPP discoverable as '%s' service '%s' security=%s",
+                             device_name.c_str(),
+                             kBluetoothSppServiceName,
+                             kBluetoothRequirePairing ? "authenticate" : "none");
+                } else {
+                    ESP_LOGE(TAG, "Bluetooth SPP start failed: status=%d",
+                             static_cast<int>(param->start.status));
+                }
+                break;
+
+            case ESP_SPP_SRV_OPEN_EVT:
+                if (param->srv_open.status == ESP_SPP_SUCCESS) {
+                    // A failed link retains its slot until the stack confirms CLOSE.
+                    if (bluetooth_spp_handle_.load() != 0) {
+                        esp_spp_disconnect(param->srv_open.handle);
+                        break;
+                    }
+                    xQueueReset(bluetooth_command_queue_);
+                    xQueueReset(bluetooth_tx_queue_);
+                    portENTER_CRITICAL(&bluetooth_session_mux_);
+                    const uint32_t epoch = bluetooth_epoch_.fetch_add(1) + 1;
+                    bluetooth_tx_flow_.reset(param->srv_open.handle, epoch);
+                    bluetooth_spp_handle_.store(param->srv_open.handle);
+                    bluetooth_client_connected_.store(true);
+                    bluetooth_close_received_ = false;
+                    bluetooth_retry_handle_ = 0;
+                    portEXIT_CRITICAL(&bluetooth_session_mux_);
+                    bluetooth_rx_line_.clear();
+                    bluetooth_rx_overflow_ = false;
+                    ESP_LOGI(TAG,
+                             "Bluetooth SPP client connected handle=%lu",
+                             static_cast<unsigned long>(param->srv_open.handle));
+                    sendBluetoothText("RF3 Bluetooth SPP connected\r\n");
+                }
+                break;
+
+            case ESP_SPP_CLOSE_EVT:
+                if (param->close.handle == bluetooth_spp_handle_.load()) {
+                    portENTER_CRITICAL(&bluetooth_session_mux_);
+                    bluetooth_client_connected_.store(false);
+                    const uint32_t epoch = bluetooth_epoch_.fetch_add(1) + 1;
+                    bluetooth_tx_flow_.reset(0, epoch);
+                    bluetooth_retry_handle_ = 0;
+                    portEXIT_CRITICAL(&bluetooth_session_mux_);
+                    xQueueReset(bluetooth_command_queue_);
+                    xQueueReset(bluetooth_tx_queue_);
+                    bluetooth_rx_line_.clear();
+                    bluetooth_rx_overflow_ = false;
+                    portENTER_CRITICAL(&bluetooth_session_mux_);
+                    // Keep the handle reserved until any disconnect API call
+                    // returns, so a recycled handle cannot target a new peer.
+                    bluetooth_close_received_ = true;
+                    if (!bluetooth_disconnect_pending_) bluetooth_spp_handle_.store(0);
+                    portEXIT_CRITICAL(&bluetooth_session_mux_);
+                }
+                ESP_LOGI(TAG,
+                         "Bluetooth SPP client closed handle=%lu",
+                         static_cast<unsigned long>(param->close.handle));
+                break;
+
+            case ESP_SPP_DATA_IND_EVT:
+                if (bluetooth_client_connected_.load() &&
+                    param->data_ind.handle == bluetooth_spp_handle_.load()) {
+                    handleBluetoothData(param->data_ind.data, param->data_ind.len);
+                }
+                break;
+
+            case ESP_SPP_WRITE_EVT:
+                bluetooth_tx_flow_.complete(param->write.handle,
+                    param->write.status == ESP_SPP_SUCCESS, param->write.cong);
+                break;
+
+            case ESP_SPP_CONG_EVT:
+                bluetooth_tx_flow_.congestion(param->cong.handle, param->cong.cong);
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    void handleGapEvent(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* param)
+    {
+        switch (event) {
+            case ESP_BT_GAP_PIN_REQ_EVT: {
+                esp_bt_pin_code_t pin_code{};
+                pin_code[0] = '1';
+                pin_code[1] = '2';
+                pin_code[2] = '3';
+                pin_code[3] = '4';
+                esp_bt_gap_pin_reply(param->pin_req.bda, true, 4, pin_code);
+                ESP_LOGI(TAG, "Bluetooth legacy pairing PIN requested; replying with 1234");
+                break;
+            }
+
+            case ESP_BT_GAP_CFM_REQ_EVT:
+                esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+                ESP_LOGI(TAG,
+                         "Bluetooth SSP confirmation auto-accepted passkey=%06lu",
+                         static_cast<unsigned long>(param->cfm_req.num_val));
+                break;
+
+            case ESP_BT_GAP_AUTH_CMPL_EVT:
+                if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+                    ESP_LOGI(TAG, "Bluetooth pairing succeeded: %s",
+                             reinterpret_cast<const char*>(param->auth_cmpl.device_name));
+                } else {
+                    ESP_LOGW(TAG, "Bluetooth pairing failed status=%d",
+                             static_cast<int>(param->auth_cmpl.stat));
+                }
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    void handleBluetoothData(const uint8_t* data, uint16_t len)
+    {
+        for (uint16_t i = 0; i < len; ++i) {
+            const char ch = static_cast<char>(data[i]);
+            const unsigned char byte = static_cast<unsigned char>(ch);
+
+            if (ch == '\r' || ch == '\n') {
+                const std::string command_line = trimAscii(bluetooth_rx_line_);
+                bluetooth_rx_line_.clear();
+                if (bluetooth_rx_overflow_) {
+                    bluetooth_rx_overflow_ = false;
+                    continue;
+                }
+                if (!command_line.empty()) {
+                    enqueueBluetoothCommand(command_line);
+                }
+                continue;
+            }
+
+            if (ch == '\t') {
+                appendBluetoothCommandChar(' ');
+            } else if (byte >= 0x20 && byte <= 0x7E) {
+                appendBluetoothCommandChar(ch);
+            }
+        }
+    }
+
+    void appendBluetoothCommandChar(char ch)
+    {
+        if (bluetooth_rx_overflow_) return;
+        if (bluetooth_rx_line_.size() + 1 < kConsoleLineBytes) {
+            bluetooth_rx_line_.push_back(ch);
+            return;
+        }
+
+        bluetooth_rx_line_.clear();
+        bluetooth_rx_overflow_ = true;
+        sendBluetoothText("ERR command line too long\r\n");
+    }
+
+    void enqueueBluetoothCommand(const std::string& line)
+    {
+        if (!bluetooth_command_queue_) {
+            sendBluetoothText("ERR Bluetooth command queue unavailable\r\n");
+            return;
+        }
+
+        BluetoothCommandMessage message{};
+        message.epoch = bluetooth_epoch_.load();
+        std::snprintf(message.line, sizeof(message.line), "%s", line.c_str());
+        if (xQueueSend(bluetooth_command_queue_, &message, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "Bluetooth command queue full; dropping '%s'", line.c_str());
+            sendBluetoothText("ERR command queue full\r\n");
+        }
+    }
+
+    void bluetoothCommandTask()
+    {
+        BluetoothCommandMessage message{};
+        while (true) {
+            if (xQueueReceive(bluetooth_command_queue_, &message, portMAX_DELAY) != pdTRUE) {
+                continue;
+            }
+
+            const std::string line = trimAscii(message.line);
+            if (line.empty()) {
+                continue;
+            }
+
+            ESP_LOGI(TAG, "Bluetooth command: %s", line.c_str());
+            if (!bluetooth_client_connected_.load() || message.epoch != bluetooth_epoch_.load()) {
+                continue;
+            }
+            const bool ok = dispatchCommand(line, CommandOrigin::Bluetooth, message.epoch);
+            if (bluetooth_client_connected_.load() && message.epoch == bluetooth_epoch_.load()) {
+                sendBluetoothCommandResponse(line, ok, message.epoch);
+            }
+        }
+    }
+
+    void sendBluetoothCommandResponse(const std::string& command, bool accepted, uint32_t epoch)
+    {
+        const bool host_file_command =
+            command.rfind("UPLOAD ", 0) == 0 || command.rfind("DOWNLOAD ", 0) == 0;
+        const auto response_words = splitWords(command);
+        const bool host_echo_command = !response_words.empty() &&
+            uppercaseCopy(response_words.front()) == "ECHO";
+        const bool host_hello_command = response_words.size() == 1 &&
+            (uppercaseCopy(response_words.front()) == "HELLO" ||
+             uppercaseCopy(response_words.front()) == "DIAG");
+        const bool host_storage_command = !response_words.empty() &&
+            (uppercaseCopy(response_words.front()) == "STORAGE" ||
+             uppercaseCopy(response_words.front()) == "SELECTHEX" ||
+             (uppercaseCopy(response_words.front()) == "TXHEX" || uppercaseCopy(response_words.front()) == "TXNOACKHEX"));
+        if (host_file_command || host_echo_command || host_hello_command || host_storage_command) {
+            // These handlers emit their own structured response. HELLO must
+            // not acquire a radio snapshot through the generic STATUS reply.
+            return;
+        }
+
+        std::string response;
+        appendFormat(response,
+                     "%s %s\r\n",
+                     accepted ? "OK" : "ERR",
+                     command.c_str());
+        // ACK and complete JSON have independent framing/size budgets. Combining
+        // an arbitrary console command echo with JSON could overflow one queue item.
+        if (sendBluetoothText(response, epoch))
+            sendBluetoothText(buildStatusJson() + "\r\n", epoch);
+    }
+
+    bool sendBluetoothText(std::string_view text, uint32_t expected_epoch = 0)
+    {
+        if (!bluetooth_client_connected_.load()) {
+            return false;
+        }
+
+        const uint32_t handle = bluetooth_spp_handle_.load();
+        if (handle == 0) {
+            return false;
+        }
+
+        BluetoothTxMessage message{};
+        message.handle = handle;
+        message.epoch = expected_epoch ? expected_epoch : bluetooth_epoch_.load();
+        if (!bluetooth_tx_flow_.matches(handle, message.epoch)) return false;
+        if (text.size() <= sizeof(message.bytes)) {
+            message.length = static_cast<uint16_t>(text.size());
+            std::memcpy(message.bytes, text.data(), text.size());
+            // Command replies can briefly outrun SPP during congestion. Apply
+            // bounded backpressure in the command task while GAP/SPP callbacks
+            // and asynchronous radio notifications remain nonblocking.
+            const bool can_wait = xTaskGetCurrentTaskHandle() == bluetooth_command_task_;
+            const int64_t deadline = esp_timer_get_time() + kBluetoothWriteTimeoutUs;
+            do {
+                if (!bluetooth_client_connected_.load() ||
+                    !bluetooth_tx_flow_.matches(handle, message.epoch)) return false;
+                if (xQueueSend(bluetooth_tx_queue_, &message, 0) == pdTRUE) return true;
+                if (!can_wait || esp_timer_get_time() >= deadline) break;
+                delayAtLeastMs(2);
+            } while (true);
+        }
+        // A dropped fragment would corrupt framing. Close the link so the
+        // host gets an explicit failure rather than continuing with bad data.
+        ESP_LOGW(TAG, "Bluetooth TX queue full or response too large; closing link");
+        failBluetoothLink(handle, message.epoch);
+        return false;
+    }
+
+    void failBluetoothLink(uint32_t handle, uint32_t epoch)
+    {
+        // Serialize the generation check and mutation with callback CLOSE/OPEN.
+        // An old TX failure must never clear a replacement session's state.
+        const int64_t now = esp_timer_get_time();
+        bool disconnect = false;
+        portENTER_CRITICAL(&bluetooth_session_mux_);
+        const bool retry_due = bluetooth_retry_handle_ == handle &&
+            bluetooth_retry_epoch_ == epoch && now >= bluetooth_retry_at_us_;
+        if (!bluetooth_disconnect_pending_ && bluetooth_tx_flow_.matches(handle, epoch) &&
+            (bluetooth_client_connected_.load() || retry_due)) {
+            bluetooth_client_connected_.store(false);
+            bluetooth_disconnect_pending_ = true;
+            bluetooth_retry_handle_ = 0;
+            disconnect = true;
+        }
+        portEXIT_CRITICAL(&bluetooth_session_mux_);
+        if (!disconnect) return;
+
+        const esp_err_t result = esp_spp_disconnect(handle);
+        const int64_t retry_at = esp_timer_get_time() + 1000LL * kBluetoothDisconnectRetryMs;
+        portENTER_CRITICAL(&bluetooth_session_mux_);
+        bluetooth_disconnect_pending_ = false;
+        if (bluetooth_close_received_) {
+            bluetooth_spp_handle_.store(0);
+        } else if (result != ESP_OK && bluetooth_tx_flow_.matches(handle, epoch)) {
+            bluetooth_retry_epoch_ = epoch;
+            bluetooth_retry_at_us_ = retry_at;
+            bluetooth_retry_handle_ = handle;
+        }
+        portEXIT_CRITICAL(&bluetooth_session_mux_);
+    }
+
+    void bluetoothTxTask()
+    {
+        BluetoothTxMessage message{};
+        while (true) {
+            portENTER_CRITICAL(&bluetooth_session_mux_);
+            const uint32_t retry_handle = bluetooth_retry_handle_;
+            const uint32_t retry_epoch = bluetooth_retry_epoch_;
+            portEXIT_CRITICAL(&bluetooth_session_mux_);
+            if (retry_handle != 0) failBluetoothLink(retry_handle, retry_epoch);
+            if (xQueueReceive(bluetooth_tx_queue_, &message, pdMS_TO_TICKS(kBluetoothDisconnectRetryMs)) != pdTRUE) continue;
+            size_t offset = 0;
+            while (offset < message.length && bluetooth_client_connected_.load() &&
+                   bluetooth_tx_flow_.matches(message.handle, message.epoch)) {
+                const int64_t deadline = esp_timer_get_time() + kBluetoothWriteTimeoutUs;
+                while (bluetooth_tx_flow_.congested() && esp_timer_get_time() < deadline &&
+                       bluetooth_client_connected_.load() &&
+                       bluetooth_tx_flow_.matches(message.handle, message.epoch)) {
+                    delayAtLeastMs(2);
+                }
+                if (!bluetooth_client_connected_.load() ||
+                    !bluetooth_tx_flow_.matches(message.handle, message.epoch)) break;
+                if (!bluetooth_tx_flow_.begin(message.handle, message.epoch)) {
+                    failBluetoothLink(message.handle, message.epoch);
+                    break;
+                }
+                const int chunk = static_cast<int>(std::min<size_t>(128, message.length - offset));
+                const esp_err_t err = esp_spp_write(message.handle, chunk,
+                    reinterpret_cast<uint8_t*>(message.bytes + offset));
+                if (err != ESP_OK) {
+                    ESP_LOGW(TAG, "Bluetooth write failed: %s", esp_err_to_name(err));
+                    failBluetoothLink(message.handle, message.epoch);
+                    break;
+                }
+                while (bluetooth_tx_flow_.pending() && esp_timer_get_time() < deadline &&
+                       bluetooth_client_connected_.load() &&
+                       bluetooth_tx_flow_.matches(message.handle, message.epoch)) {
+                    delayAtLeastMs(2);
+                }
+                if (bluetooth_tx_flow_.pending() || bluetooth_tx_flow_.failed()) {
+                    ESP_LOGW(TAG, "Bluetooth write acknowledgement failed/timed out");
+                    failBluetoothLink(message.handle, message.epoch);
+                    break;
+                }
+                offset += static_cast<size_t>(chunk);
+            }
+        }
+    }
+#endif
+
+    static esp_err_t httpStatusHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpStatus(req);
+    }
+
+    static esp_err_t httpRxStartHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpRxStart(req);
+    }
+
+    static esp_err_t httpTxStartHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpTxStart(req);
+    }
+
+    static esp_err_t httpStopHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpStop(req);
+    }
+
+    static esp_err_t httpChannelHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpChannel(req);
+    }
+
+    static esp_err_t httpPowerHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpPower(req);
+    }
+
+    static esp_err_t httpCommandHandlerEntry(httpd_req_t* req)
+    {
+        return static_cast<DemoConsoleApp*>(req->user_ctx)->handleHttpCommand(req);
+    }
+
+    esp_err_t sendHttpJson(httpd_req_t* req,
+                           const std::string& json,
+                           const char* status = "200 OK") const
+    {
+        httpd_resp_set_status(req, status);
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_send(req, json.c_str(), HTTPD_RESP_USE_STRLEN);
+    }
+
+    esp_err_t sendHttpStatusResponse(httpd_req_t* req, const char* status = "200 OK")
+    {
+        const std::string json = buildStatusJson();
+        return sendHttpJson(req, json, status);
+    }
+
+    bool tryReadHttpCommandText(httpd_req_t* req, std::string& out)
+    {
+        out.clear();
+
+        const size_t query_len = httpd_req_get_url_query_len(req);
+        if (query_len > 0) {
+            std::string query(query_len + 1, '\0');
+            if (httpd_req_get_url_query_str(req, query.data(), query.size()) != ESP_OK) {
+                return false;
+            }
+
+            std::array<char, kConsoleLineBytes> value_buf{};
+            if (httpd_query_key_value(query.c_str(), "value", value_buf.data(), value_buf.size()) == ESP_OK ||
+                httpd_query_key_value(query.c_str(), "command", value_buf.data(), value_buf.size()) == ESP_OK) {
+                out = trimAscii(value_buf.data());
+                return !out.empty();
+            }
+        }
+
+        if (req->content_len <= 0 || req->content_len >= static_cast<int>(kConsoleLineBytes)) {
+            return false;
+        }
+
+        std::string body(static_cast<size_t>(req->content_len), '\0');
+        int offset = 0;
+        while (offset < req->content_len) {
+            const int received =
+                httpd_req_recv(req, body.data() + offset, req->content_len - offset);
+            if (received <= 0) {
+                return false;
+            }
+            offset += received;
+        }
+
+        out = trimAscii(body);
+        return !out.empty();
+    }
+
+    bool startHttpServer()
+    {
+        if (http_server_) {
+            return true;
+        }
+
+        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+        config.server_port = WifiControlConfig::kHttpPort;
+
+        esp_err_t err = httpd_start(&http_server_, &config);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "HTTP server start failed: %s", esp_err_to_name(err));
+            http_server_ = nullptr;
+            return false;
+        }
+
+        httpd_uri_t status_uri{};
+        status_uri.uri = "/status";
+        status_uri.method = HTTP_GET;
+        status_uri.handler = &DemoConsoleApp::httpStatusHandlerEntry;
+        status_uri.user_ctx = this;
+
+        httpd_uri_t rx_uri{};
+        rx_uri.uri = "/rx/start";
+        rx_uri.method = HTTP_POST;
+        rx_uri.handler = &DemoConsoleApp::httpRxStartHandlerEntry;
+        rx_uri.user_ctx = this;
+
+        httpd_uri_t tx_uri{};
+        tx_uri.uri = "/tx/start";
+        tx_uri.method = HTTP_POST;
+        tx_uri.handler = &DemoConsoleApp::httpTxStartHandlerEntry;
+        tx_uri.user_ctx = this;
+
+        httpd_uri_t stop_uri{};
+        stop_uri.uri = "/stop";
+        stop_uri.method = HTTP_POST;
+        stop_uri.handler = &DemoConsoleApp::httpStopHandlerEntry;
+        stop_uri.user_ctx = this;
+
+        httpd_uri_t channel_uri{};
+        channel_uri.uri = "/channel";
+        channel_uri.method = HTTP_POST;
+        channel_uri.handler = &DemoConsoleApp::httpChannelHandlerEntry;
+        channel_uri.user_ctx = this;
+
+        httpd_uri_t power_uri{};
+        power_uri.uri = "/power";
+        power_uri.method = HTTP_POST;
+        power_uri.handler = &DemoConsoleApp::httpPowerHandlerEntry;
+        power_uri.user_ctx = this;
+
+        httpd_uri_t command_uri{};
+        command_uri.uri = "/command";
+        command_uri.method = HTTP_POST;
+        command_uri.handler = &DemoConsoleApp::httpCommandHandlerEntry;
+        command_uri.user_ctx = this;
+
+        err = httpd_register_uri_handler(http_server_, &status_uri);
+        if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &rx_uri);
+        if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &tx_uri);
+        if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &stop_uri);
+        if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &channel_uri);
+        if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &power_uri);
+        if (err == ESP_OK) err = httpd_register_uri_handler(http_server_, &command_uri);
+
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "HTTP route registration failed: %s", esp_err_to_name(err));
+            httpd_stop(http_server_);
+            http_server_ = nullptr;
+            return false;
+        }
+
+        ESP_LOGI(TAG, "HTTP control server listening on port %u",
+                 static_cast<unsigned>(WifiControlConfig::kHttpPort));
+        return true;
+    }
+
+    bool startWifiControlPlane()
+    {
+        if (std::strcmp(WifiControlConfig::kSsid, kWifiPlaceholderSsid) == 0 ||
+            std::strcmp(WifiControlConfig::kPassword, kWifiPlaceholderPassword) == 0 ||
+            WifiControlConfig::kSsid[0] == '\0') {
+            ESP_LOGW(TAG,
+                     "Wi-Fi credentials are not configured. Use ignored include/wifi_control_config.local.hpp or RF3_WIFI_SSID/RF3_WIFI_PASSWORD build macros.");
+            return false;
+        }
+
+        if (!initializeNvsFlash("Wi-Fi")) {
+            return false;
+        }
+
+        esp_err_t err = esp_netif_init();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        err = esp_event_loop_create_default();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "esp_event_loop_create_default failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        wifi_event_group_ = xEventGroupCreate();
+        if (!wifi_event_group_) {
+            ESP_LOGE(TAG, "Could not allocate Wi-Fi event group");
+            return false;
+        }
+
+        if (!wifi_control_task_) {
+            if (xTaskCreate(&DemoConsoleApp::wifiControlTaskEntry,
+                            "wifi_ctrl",
+                            4096,
+                            this,
+                            4,
+                            &wifi_control_task_) != pdPASS) {
+                ESP_LOGE(TAG, "Failed to start Wi-Fi control task");
+                return false;
+            }
+        }
+
+        wifi_netif_ = esp_netif_create_default_wifi_sta();
+        if (!wifi_netif_) {
+            ESP_LOGE(TAG, "Could not create default Wi-Fi station interface");
+            return false;
+        }
+
+        err = esp_netif_set_hostname(wifi_netif_, WifiControlConfig::kNodeName);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Could not set hostname '%s': %s",
+                     WifiControlConfig::kNodeName,
+                     esp_err_to_name(err));
+        }
+
+        wifi_init_config_t wifi_init = WIFI_INIT_CONFIG_DEFAULT();
+        err = esp_wifi_init(&wifi_init);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        err = esp_event_handler_instance_register(WIFI_EVENT,
+                                                  ESP_EVENT_ANY_ID,
+                                                  &DemoConsoleApp::wifiEventHandlerEntry,
+                                                  this,
+                                                  &wifi_event_handler_);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Wi-Fi event handler register failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        err = esp_event_handler_instance_register(IP_EVENT,
+                                                  IP_EVENT_STA_GOT_IP,
+                                                  &DemoConsoleApp::wifiEventHandlerEntry,
+                                                  this,
+                                                  &ip_event_handler_);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "IP event handler register failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        wifi_config_t wifi_config{};
+        std::snprintf(reinterpret_cast<char*>(wifi_config.sta.ssid),
+                      sizeof(wifi_config.sta.ssid),
+                      "%s",
+                      WifiControlConfig::kSsid);
+        std::snprintf(reinterpret_cast<char*>(wifi_config.sta.password),
+                      sizeof(wifi_config.sta.password),
+                      "%s",
+                      WifiControlConfig::kPassword);
+        wifi_config.sta.pmf_cfg.capable = true;
+        wifi_config.sta.pmf_cfg.required = false;
+
+        err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (err == ESP_OK) {
+            err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+        }
+        if (err == ESP_OK) {
+            err = esp_wifi_start();
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Wi-Fi start failed: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        const EventBits_t bits = xEventGroupWaitBits(wifi_event_group_,
+                                                     kWifiConnectedBit,
+                                                     pdFALSE,
+                                                     pdFALSE,
+                                                     kWifiConnectTimeout);
+        if ((bits & kWifiConnectedBit) == 0) {
+            ESP_LOGW(TAG,
+                     "Wi-Fi did not connect within %u ms for hostname=%s",
+                     static_cast<unsigned>(pdTICKS_TO_MS(kWifiConnectTimeout)),
+                     WifiControlConfig::kNodeName);
+        }
+
+        return true;
+    }
+
+    void handleWifiEvent(esp_event_base_t event_base, int32_t event_id, void* event_data)
+    {
+        if (event_base == WIFI_EVENT) {
+            if (event_id == WIFI_EVENT_STA_START) {
+                ESP_LOGI(TAG, "Wi-Fi STA starting, hostname=%s", WifiControlConfig::kNodeName);
+                (void)esp_wifi_connect();
+                return;
+            }
+
+            if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+                xEventGroupClearBits(wifi_event_group_, kWifiConnectedBit);
+                wifi_connected_ = false;
+                const auto* disconnected = static_cast<wifi_event_sta_disconnected_t*>(event_data);
+                ESP_LOGW(TAG,
+                         "Wi-Fi disconnected: reason=%u, retrying...",
+                         disconnected ? static_cast<unsigned>(disconnected->reason) : 0u);
+                (void)esp_wifi_connect();
+                return;
+            }
+        }
+
+        if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+            const auto* got_ip = static_cast<ip_event_got_ip_t*>(event_data);
+            xEventGroupSetBits(wifi_event_group_, kWifiConnectedBit);
+            wifi_connected_ = true;
+            ESP_LOGI(TAG,
+                     "Wi-Fi connected: hostname=%s ip=" IPSTR,
+                     WifiControlConfig::kNodeName,
+                     IP2STR(&got_ip->ip_info.ip));
+        }
+    }
+
+    void wifiControlTask()
+    {
+        const EventBits_t bits = xEventGroupWaitBits(wifi_event_group_,
+                                                     kWifiConnectedBit,
+                                                     pdFALSE,
+                                                     pdFALSE,
+                                                     portMAX_DELAY);
+
+        if ((bits & kWifiConnectedBit) != 0 && !http_server_) {
+            (void)startHttpServer();
+        }
+
+        wifi_control_task_ = nullptr;
+        vTaskDelete(nullptr);
+    }
+
+    esp_err_t handleHttpStatus(httpd_req_t* req)
+    {
+        return sendHttpStatusResponse(req);
+    }
+
+    esp_err_t handleHttpRxStart(httpd_req_t* req)
+    {
+        const bool ok = dispatchHttpCommand("RX");
+        return sendHttpStatusResponse(req, ok ? "200 OK" : "500 Internal Server Error");
+    }
+
+    esp_err_t handleHttpTxStart(httpd_req_t* req)
+    {
+        const bool ok = dispatchHttpCommand("TX");
+        return sendHttpStatusResponse(req, ok ? "200 OK" : "500 Internal Server Error");
+    }
+
+    esp_err_t handleHttpStop(httpd_req_t* req)
+    {
+        const bool ok = dispatchHttpCommand("STOP");
+        return sendHttpStatusResponse(req, ok ? "200 OK" : "500 Internal Server Error");
+    }
+
+    esp_err_t handleHttpChannel(httpd_req_t* req)
+    {
+        const size_t query_len = httpd_req_get_url_query_len(req);
+        if (query_len == 0) {
+            return sendHttpJson(req, "{\"error\":\"missing_value\"}", "400 Bad Request");
+        }
+
+        std::string query(query_len + 1, '\0');
+        if (httpd_req_get_url_query_str(req, query.data(), query.size()) != ESP_OK) {
+            return sendHttpJson(req, "{\"error\":\"invalid_query\"}", "400 Bad Request");
+        }
+
+        char value_buf[8] = {};
+        if (httpd_query_key_value(query.c_str(), "value", value_buf, sizeof(value_buf)) != ESP_OK) {
+            return sendHttpJson(req, "{\"error\":\"missing_value\"}", "400 Bad Request");
+        }
+
+        uint8_t channel = 0;
+        if (!parseUint8Arg(value_buf, 0, kMaxRadioChannel, channel)) {
+            return sendHttpJson(req, "{\"error\":\"invalid_channel\"}", "400 Bad Request");
+        }
+
+        std::string command = "CHANNEL ";
+        command += value_buf;
+        const bool ok = dispatchHttpCommand(command);
+        return sendHttpStatusResponse(req, ok ? "200 OK" : "500 Internal Server Error");
+    }
+
+    esp_err_t handleHttpPower(httpd_req_t* req)
+    {
+        const size_t query_len = httpd_req_get_url_query_len(req);
+        if (query_len == 0) {
+            return sendHttpJson(req, "{\"error\":\"missing_value\"}", "400 Bad Request");
+        }
+
+        std::string query(query_len + 1, '\0');
+        if (httpd_req_get_url_query_str(req, query.data(), query.size()) != ESP_OK) {
+            return sendHttpJson(req, "{\"error\":\"invalid_query\"}", "400 Bad Request");
+        }
+
+        char value_buf[8] = {};
+        if (httpd_query_key_value(query.c_str(), "value", value_buf, sizeof(value_buf)) != ESP_OK) {
+            return sendHttpJson(req, "{\"error\":\"missing_value\"}", "400 Bad Request");
+        }
+
+        uint8_t power_level = 0;
+        if (!parseUint8Arg(value_buf, 0, 3, power_level)) {
+            return sendHttpJson(req, "{\"error\":\"invalid_power\"}", "400 Bad Request");
+        }
+
+        std::string command = "POWER ";
+        command += value_buf;
+        const bool ok = dispatchHttpCommand(command);
+        return sendHttpStatusResponse(req, ok ? "200 OK" : "500 Internal Server Error");
+    }
+
+    esp_err_t handleHttpCommand(httpd_req_t* req)
+    {
+        std::string command;
+        if (!tryReadHttpCommandText(req, command)) {
+            return sendHttpJson(req, "{\"error\":\"missing_command\"}", "400 Bad Request");
+        }
+
+        const bool ok = dispatchHttpCommand(command);
+        if (ok) {
+            return sendHttpJson(req,
+                                "{\"accepted\":true,\"command\":\"queued\"}",
+                                "200 OK");
+        }
+
+        return sendHttpJson(req,
+                            "{\"accepted\":false,\"command\":\"failed\"}",
+                            "500 Internal Server Error");
+    }
+
+    void printPrompt() const
+    {
+        std::printf("\nrf24> ");
+        std::fflush(stdout);
+    }
+
+    void printHelp() const
+    {
+        // Keep the runtime help text close to the command handlers so the
+        // console stays self-documenting as commands evolve.
+        std::printf(
+            "\nCommands:\n"
+            "  HELP                 Show this command list\n"
+            "  HELLO                Identify the host link without accessing the radio\n"
+            "  DIAG                 Read build identity and lifetime timing/counters (host only)\n"
+            "  STORAGE LIST <offset>  List visible SPIFFS files (host JSON pages)\n"
+            "  STORAGE DELETE <hex>   Delete one idle visible file (host only)\n"
+            "  STATUS               Show radio state and selected file\n"
+            "  FEM LNA GAIN|BYPASS  Select receive gain while in standby (FEM boards)\n"
+            "  FEM ANT <1|2>        Select the custom FEM antenna while in standby\n"
+            "  STOP                 Stop any active TX/CW/Morse/RX and return to standby\n"
+            "  FILES                List staged files in SPIFFS\n"
+            "  SELECT <file>        Choose which staged file TX will send\n"
+            "  SELECTHEX <UTF8hex>  Select exact SPIFFS filename (host only)\n"
+            "  TXHEX <UTF8hex>      Transmit exact SPIFFS filename (host only)\n"
+            "  TXNOACKHEX <hex>     One-way file TX, delivery unconfirmed\n"
+            "  RXNOACK              Silent one-way file receiver\n"
+            "  TX [file]            Start sending the selected or named file\n"
+            "  UPLOAD ...           Stage a host file using BEGIN/DATA/END/CANCEL\n"
+            "  DOWNLOAD ...         Export a SPIFFS file using BEGIN/DATA/END/CANCEL\n"
+            "  TESTMODE ON|OFF      Devboard-only, no-nRF24-TX test mode\n"
+            "  NRFRAIL ON|OFF       Devboard GPIO21 rail request (also in TESTMODE)\n"
+            "  BATTERY RESET        Clear latched cutoff after fresh quiet reading >=21V\n"
+            "  TESTTX <bytes>       Simulate TX acknowledgment (no nRF24 TX)\n"
+            "  TX LOOP [n|INF] [f]  Repeatedly send the selected or named file\n"
+            "  TEXT <message>       Send live text to a listening peer\n"
+            "  ECHO <message>       Devboard test-mode host text echo (no nRF24)\n"
+            "  MORSE <text>         Key A-Z/0-9/spaces as Morse; use STOP to abort\n"
+            "  RX                   Enter receive/listen mode\n"
+            "  STANDBY              Leave RX/CW/sleep and return to standby\n"
+            "  SLEEP                Put the radio into sleep mode\n"
+            "  WAKE                 Wake the radio back to standby\n"
+            "  POWER <0-3>          Set packet TX power level\n"
+            "  POWERDOWN            Fully power down the radio\n"
+            "  CHANNEL <0-125>      Reinitialize the radio on a new channel\n"
+            "  CW START [ch] [0-3]  Start a continuous-wave test on a channel/power level\n"
+            "  CW LOOP <on> <off>   Repeat CW bursts; optional [ch] [pwr] [EVERY <loops>]\n");
+
+        std::printf(
+            "\nStage a host file with the PlatformIO 'Stage Demo File' target\n"
+            "or by running: python tools/stage_demo_file.py <path-to-file>\n");
+    }
+
+    bool takeRadio(TickType_t timeout = portMAX_DELAY)
+    {
+        // All radio operations flow through one mutual exclusion lock (mutex)
+        // so the command handlers and the receive (RX) polling task never talk
+        // to the chip simultaneously.
+        return xSemaphoreTake(radio_mutex_, timeout) == pdTRUE;
+    }
+
+    void giveRadio()
+    {
+        xSemaphoreGive(radio_mutex_);
+    }
+
+    bool takeCommand(TickType_t timeout = portMAX_DELAY)
+    {
+        return xSemaphoreTake(command_mutex_, timeout) == pdTRUE;
+    }
+
+    void giveCommand()
+    {
+        xSemaphoreGive(command_mutex_);
+    }
+
+    bool takeLoop(TickType_t timeout = portMAX_DELAY)
+    {
+        return xSemaphoreTake(loop_mutex_, timeout) == pdTRUE;
+    }
+
+    void giveLoop()
+    {
+        xSemaphoreGive(loop_mutex_);
+    }
+
+    LoopConfig loopSnapshot()
+    {
+        LoopConfig snapshot;
+        if (!takeLoop(pdMS_TO_TICKS(50))) {
+            return snapshot;
+        }
+
+        snapshot = loop_config_;
+        giveLoop();
+        return snapshot;
+    }
+
+    void clearLoopLocked()
+    {
+        loop_config_ = LoopConfig{};
+        loop_owns_radio_.store(false);
+    }
+
+    static ReliableTransferV2::SinkPrepareResult prepareIncomingStorageEntry(
+        void* context,
+        uint32_t transfer_id,
+        uint32_t total_size)
+    {
+        return static_cast<DemoConsoleApp*>(context)->prepareIncomingStorage(
+            transfer_id, total_size);
+    }
+
+    static size_t writeIncomingStorageEntry(void* context,
+                                            const uint8_t* data,
+                                            size_t length)
+    {
+        return static_cast<DemoConsoleApp*>(context)->writeIncomingStorage(data, length);
+    }
+
+    static bool closeIncomingStorageEntry(void* context)
+    {
+        return static_cast<DemoConsoleApp*>(context)->closeIncomingStorage();
+    }
+
+    static bool publishIncomingStorageEntry(void* context)
+    {
+        return static_cast<DemoConsoleApp*>(context)->publishIncomingStorage();
+    }
+
+    static bool removeIncomingPartialEntry(void* context)
+    {
+        return static_cast<DemoConsoleApp*>(context)->removeIncomingPartial();
+    }
+
+    static bool resumeIncomingStorageEntry(void* context, uint32_t id,
+                                           uint32_t bytes, uint32_t crc)
+    {
+        return static_cast<DemoConsoleApp*>(context)->resumeIncomingStorage(id, bytes, crc);
+    }
+
+    static ReliableTransferV2::SinkCallbacks incomingStorageCallbacks()
+    {
+        return {
+            &DemoConsoleApp::prepareIncomingStorageEntry,
+            &DemoConsoleApp::writeIncomingStorageEntry,
+            &DemoConsoleApp::closeIncomingStorageEntry,
+            &DemoConsoleApp::publishIncomingStorageEntry,
+            &DemoConsoleApp::removeIncomingPartialEntry,
+            &DemoConsoleApp::resumeIncomingStorageEntry,
+            [](void* context,std::string& side)->FILE* {
+                auto* app=static_cast<DemoConsoleApp*>(context);
+                side=buildFilePath("rf3_gap_cache.part");
+                return app->incoming_file_.file;
+            },
+        };
+    }
+
+    bool selectAvailableFinalName(uint32_t transfer_id, std::string& out_name)
+    {
+        for (uint16_t collision = 0;
+             collision <= kMaxReceivedFileCollisionIndex;
+             ++collision) {
+            const std::string candidate = buildReceivedFileName(transfer_id, false, collision, receiver_.fileExtension());
+            if (candidate.empty()) return false;
+            const std::string path = buildFilePath(candidate);
+            struct stat info {};
+            errno = 0;
+            if (::stat(path.c_str(), &info) == 0) {
+                continue;
+            }
+            if (errno == ENOENT) {
+                out_name = candidate;
+                return true;
+            }
+
+            ESP_LOGE(TAG,
+                     "Could not inspect RX final path %s: errno=%d",
+                     path.c_str(),
+                     errno);
+            return false;
+        }
+
+        ESP_LOGE(TAG,
+                 "No collision-free RX final name is available for transfer %08lX",
+                 static_cast<unsigned long>(transfer_id));
+        return false;
+    }
+
+    ReliableTransferV2::SinkPrepareResult prepareIncomingStorage(
+        uint32_t transfer_id,
+        uint32_t total_size)
+    {
+        incoming_file_ = IncomingFileStorage{};
+        incoming_file_.transfer_id = transfer_id;
+        incoming_file_.partial_name = buildReceivedFileName(transfer_id, true);
+        if (!selectAvailableFinalName(transfer_id, incoming_file_.final_name)) {
+            return ReliableTransferV2::SinkPrepareResult::OpenFailed;
+        }
+
+        const std::string partial_path = buildFilePath(incoming_file_.partial_name);
+        struct stat info {};
+        errno = 0;
+        if (::stat(partial_path.c_str(), &info) == 0) {
+            if (std::remove(partial_path.c_str()) != 0) {
+                ESP_LOGE(TAG,
+                         "Could not remove stale RX partial %s: errno=%d",
+                         partial_path.c_str(),
+                         errno);
+                return ReliableTransferV2::SinkPrepareResult::CleanupFailed;
+            }
+        } else if (errno != ENOENT) {
+            ESP_LOGE(TAG,
+                     "Could not inspect RX partial %s: errno=%d",
+                     partial_path.c_str(),
+                     errno);
+            return ReliableTransferV2::SinkPrepareResult::CleanupFailed;
+        }
+
+        incoming_file_.file = std::fopen(partial_path.c_str(), rx_no_ack_mode_ ? "w+b" : "wb");
+        if (!incoming_file_.file) {
+            ESP_LOGE(TAG,
+                     "Could not open %s for RX transfer %08lX (%lu bytes): errno=%d",
+                     partial_path.c_str(),
+                     static_cast<unsigned long>(transfer_id),
+                     static_cast<unsigned long>(total_size),
+                     errno);
+            return ReliableTransferV2::SinkPrepareResult::OpenFailed;
+        }
+        return ReliableTransferV2::SinkPrepareResult::Ready;
+    }
+
+    size_t writeIncomingStorage(const uint8_t* data, size_t length)
+    {
+        if (!incoming_file_.file || !data || length == 0) {
+            return 0;
+        }
+        const int64_t start_us = esp_timer_get_time();
+        const size_t written = std::fwrite(data, 1, length, incoming_file_.file);
+        RuntimeDiagnostics::global().storage_write.record(
+            static_cast<uint64_t>(esp_timer_get_time() - start_us));
+        return written;
+    }
+
+    bool closeIncomingStorage()
+    {
+        if (!incoming_file_.file) {
+            return true;
+        }
+
+        std::FILE* file = incoming_file_.file;
+        incoming_file_.file = nullptr;
+        bool ok = true;
+        if (std::fflush(file) != 0) {
+            ESP_LOGE(TAG, "Could not flush RX partial file: errno=%d", errno);
+            ok = false;
+        }
+        if (std::fclose(file) != 0) {
+            ESP_LOGE(TAG, "Could not close RX partial file: errno=%d", errno);
+            ok = false;
+        }
+        return ok;
+    }
+
+    bool resumeIncomingStorage(uint32_t id, uint32_t bytes, uint32_t expected_crc)
+    {
+        if (incoming_file_.file) return false;
+        const bool published = incoming_file_.partial_name.empty();
+        const std::string name = published ? incoming_file_.final_name : incoming_file_.partial_name;
+        if (name.empty()) return false;
+        const std::string path = buildFilePath(name);
+        std::FILE* file = std::fopen(path.c_str(), published ? "rb" : "rb+");
+        if (!file) return false;
+        ProtocolV2::Crc32 crc;
+        std::array<uint8_t, 256> buffer{};
+        uint32_t count = 0;
+        bool valid = true;
+        while (count < bytes) {
+            const size_t wanted = std::min<size_t>(buffer.size(), bytes - count);
+            const size_t read = std::fread(buffer.data(), 1, wanted, file);
+            if (read != wanted) { valid = false; break; }
+            crc.update(buffer.data(), read);
+            count += static_cast<uint32_t>(read);
+        }
+        // Check EOF as well as the prefix; never append after unknown bytes.
+        if (std::fgetc(file) != EOF || std::ferror(file) || crc.value() != expected_crc)
+            valid = false;
+        if (published) {
+            const bool closed = std::fclose(file) == 0;
+            return valid && closed;
+        }
+        if (!valid || std::fseek(file, static_cast<long>(bytes), SEEK_SET) != 0) {
+            std::fclose(file);
+            return false;
+        }
+        incoming_file_.file = file;
+        incoming_file_.transfer_id = id;
+        return true;
+    }
+
+    bool publishIncomingStorage()
+    {
+        if (incoming_file_.file || incoming_file_.partial_name.empty()) {
+            return false;
+        }
+
+        if (!selectAvailableFinalName(incoming_file_.transfer_id,
+                                      incoming_file_.final_name)) {
+            return false;
+        }
+
+        const std::string partial_path = buildFilePath(incoming_file_.partial_name);
+        const std::string final_path = buildFilePath(incoming_file_.final_name);
+        if (std::rename(partial_path.c_str(), final_path.c_str()) != 0) {
+            ESP_LOGE(TAG,
+                     "Could not publish RX file %s -> %s for transfer %08lX: errno=%d",
+                     partial_path.c_str(),
+                     final_path.c_str(),
+                     static_cast<unsigned long>(incoming_file_.transfer_id),
+                     errno);
+            return false;
+        }
+
+        incoming_file_.partial_name.clear();
+        return true;
+    }
+
+    bool removeIncomingPartial()
+    {
+        bool ok = closeIncomingStorage();
+        if (incoming_file_.partial_name.empty()) {
+            return ok;
+        }
+
+        const std::string partial_path = buildFilePath(incoming_file_.partial_name);
+        errno = 0;
+        if (std::remove(partial_path.c_str()) != 0 && errno != ENOENT) {
+            ESP_LOGE(TAG,
+                     "Could not remove RX partial %s: errno=%d",
+                     partial_path.c_str(),
+                     errno);
+            return false;
+        }
+        incoming_file_.partial_name.clear();
+        return ok;
+    }
+
+    void discardIncomingFileTransfer(
+        const char* reason,
+        ProtocolV2::ErrorCode failure = ProtocolV2::ErrorCode::Cancelled)
+    {
+        if ((receiver_.active() ||
+             receiver_.state() == ReliableTransferV2::ReceiverState::Failed) &&
+            reason && *reason) {
+            ESP_LOGW(TAG,
+                     "%s transfer=%08lX file=%s bytes=%lu packets=%lu",
+                     reason,
+                     static_cast<unsigned long>(receiver_.transferId()),
+                     incoming_file_.partial_name.c_str(),
+                     static_cast<unsigned long>(receiver_.acceptedBytes()),
+                     static_cast<unsigned long>(receiver_.acceptedPackets()));
+        }
+
+        const bool had_incomplete_transfer =
+            receiver_.active() ||
+            receiver_.state() == ReliableTransferV2::ReceiverState::Failed;
+        if (had_incomplete_transfer) {
+            (void)receiver_.abort(failure);
+            transfer_service_.reportReceiveFailed(
+                receiver_.transferId(), receiver_.error(), monotonicMilliseconds());
+        }
+        // Keep Completed/Cancelled/Failed metadata for truthful terminal status.
+        // A new RX session explicitly resets it; merely leaving RX does not.
+        active_api_receive_id_ = 0;
+        if (receiver_.cleanupFailed()) {
+            ESP_LOGE(TAG,
+                     "RX partial cleanup failed transfer=%08lX file=%s",
+                     static_cast<unsigned long>(receiver_.transferId()),
+                     incoming_file_.partial_name.c_str());
+        }
+    }
+
+    void resetRxSession()
+    {
+        if (!receiver_.reset()) {
+            ESP_LOGE(TAG, "RX session reset could not remove its partial file");
+        }
+        active_api_receive_id_ = 0;
+        last_carrier_detected_ = false;
+        carrier_event_count_ = 0;
+        decoded_rx_packet_count_ = 0;
+        raw_rx_packet_count_ = 0;
+        missing_rx_packet_count_ = 0;
+        saved_rx_file_count_ = 0;
+        saved_rx_byte_count_ = 0;
+        last_saved_rx_file_.clear();
+        text_message_assembler_.reset();
+    }
+
+    bool isLoopActive() const
+    {
+        return loop_owns_radio_.load();
+    }
+
+    bool stopLoopAndWait(TickType_t timeout = kLoopStopTimeout)
+    {
+        const TickType_t start = xTaskGetTickCount();
+        loop_stop_requested_.store(true);
+        while (isLoopActive()) {
+            const TickType_t elapsed = xTaskGetTickCount() - start;
+            if (elapsed >= timeout) return false;
+            vTaskDelay(std::min(kLoopStopPollPeriod, static_cast<TickType_t>(timeout - elapsed)));
+        }
+        loop_stop_requested_.store(false);
+        return true;
+    }
+
+    bool waitForLoopStopOrTimeout(uint32_t duration_ms)
+    {
+        uint32_t remaining_ms = duration_ms;
+        while (remaining_ms > 0) {
+            if (loop_stop_requested_.load()) {
+                return false;
+            }
+
+            const uint32_t slice_ms = std::min<uint32_t>(remaining_ms, 20);
+            delayAtLeastMs(slice_ms);
+            remaining_ms -= slice_ms;
+        }
+
+        return !loop_stop_requested_.load();
+    }
+
+    bool stopCurrentCwIfNeeded()
+    {
+        if (!takeRadio(pdMS_TO_TICKS(100))) {
+            return false;
+        }
+
+        bool ok = true;
+        if (manager_.status().state == RadioState::CwTest) {
+            ok = manager_.stopCw();
+        }
+        giveRadio();
+        return ok;
+    }
+
+    bool ensureStandbyLocked()
+    {
+        // Many commands only make sense from standby. This helper coerces the
+        // current radio state back to standby while the mutex is already held.
+        //
+        // Examples:
+        // - a fresh fault or boot state triggers a full re-boot
+        // - continuous-wave (CW) mode is stopped
+        // - receive (RX) mode is exited
+        // - sleep/powerdown is woken back up
+        RadioStatus status = manager_.status();
+        if (status.state == RadioState::Fault || status.state == RadioState::Boot) {
+            return manager_.boot(status.channel);
+        }
+        if (status.state == RadioState::CwTest) {
+            if (!manager_.stopCw()) {
+                return false;
+            }
+            status = manager_.status();
+        }
+        if (status.state == RadioState::RxListening) {
+            if (!manager_.leaveRx()) {
+                return false;
+            }
+            discardIncomingFileTransfer("Discarding partial RX file while leaving RX");
+            status = manager_.status();
+        }
+        if (status.state == RadioState::Sleep || status.state == RadioState::PowerDown) {
+            if (!manager_.wake()) {
+                return false;
+            }
+        }
+        return manager_.status().state == RadioState::Standby;
+    }
+
+    bool startRxLocked()
+    {
+        bool ok = ensureStandbyLocked();
+        if (ok) {
+            ok = manager_.enterRx();
+        }
+        if (ok) {
+            resetRxSession();
+        }
+        return ok;
+    }
+
+    bool isRemoteCommandAllowed(const std::vector<std::string>& words) const
+    {
+        if (words.empty()) {
+            return false;
+        }
+
+        const std::string command = uppercaseCopy(words.front());
+        // Allow the full operator command set over the radio link, but keep
+        // REMOTE itself local-only so one board cannot recursively relay to
+        // another board (or back to itself).
+        return command != "REMOTE";
+    }
+
+    void tryResumeWirelessRx(const char* reason)
+    {
+        if (!power_.radioAvailable() || test_mode_ || !kWirelessControlEnabled || !kWirelessControlAutoRx || isLoopActive()) {
+            return;
+        }
+
+        if (!takeRadio(pdMS_TO_TICKS(100))) {
+            ESP_LOGW(TAG, "%s: radio busy, could not resume RX", reason);
+            return;
+        }
+
+        const RadioStatus before = manager_.status();
+        bool ok = true;
+        if (before.state == RadioState::Standby) {
+            ok = manager_.enterRx();
+            if (ok) {
+                resetRxSession();
+            }
+        }
+
+        const RadioStatus after = manager_.status();
+        giveRadio();
+
+        if (before.state == RadioState::Standby) {
+            if (ok) {
+                ESP_LOGI(TAG, "%s on channel %u",
+                         reason,
+                         static_cast<unsigned>(after.channel));
+            } else {
+                ESP_LOGW(TAG, "%s failed, state=%s fault=%d",
+                         reason,
+                         RadioManager::stateName(after.state),
+                         after.last_fault);
+            }
+        }
+    }
+
+    void printStatus()
+    {
+        // STATUS refreshes the live radio snapshot, then adds a live hasPendingRx()
+        // check when receive (RX) mode is active.
+        if (!takeRadio(pdMS_TO_TICKS(50))) {
+            std::printf("Status: radio snapshot busy; transfer snapshot follows.\n");
+            return;
+        }
+
+        if (power_.radioAvailable()) manager_.refreshSnapshot();
+        const bool rx_pending =
+            manager_.status().state == RadioState::RxListening ? manager_.hasPendingRx() : false;
+        const RadioStatus status = manager_.status();
+        const uint32_t carrier_events = carrier_event_count_;
+        const uint32_t decoded_packets = decoded_rx_packet_count_;
+        const uint32_t raw_packets = raw_rx_packet_count_;
+        const uint32_t missing_packets = missing_rx_packet_count_;
+        const ProtocolTransferReport tx_report = copyTransferReport(last_tx_report_);
+        const ReliableTransferV2::ReceiverState receiver_state = receiver_.state();
+        const ProtocolV2::ErrorCode receiver_error = receiver_.error();
+        const uint32_t receiver_id = receiver_.transferId();
+        const uint32_t receiver_bytes = receiver_.acceptedBytes();
+        const uint32_t receiver_total_bytes = receiver_.totalSize();
+        const uint32_t receiver_sequence = receiver_.expectedSequence();
+        const uint32_t receiver_packets = receiver_.totalPackets();
+        const uint32_t receiver_crc = receiver_.calculatedCrc32();
+        const bool receiver_no_ack = rx_no_ack_mode_;
+        giveRadio();
+        LoopConfig loop;
+        const bool loop_snapshot_available = takeLoop(pdMS_TO_TICKS(50));
+        if (loop_snapshot_available) {
+            loop = loop_config_;
+            giveLoop();
+        }
+        const char* irq_state =
+            !status.irq_connected ? "disabled" : (status.irq_asserted ? "low" : "high");
+        std::string selected_token;
+        HostConnectionProtocol::appendJsonString(selected_token, selected_file_);
+        std::string tx_file_token;
+        HostConnectionProtocol::appendJsonString(tx_file_token, tx_report.file_name);
+
+        std::printf("profile=%s filesystem=%s http_control=%s bt_control=%s test_mode=%s State=%s channel=%u ",
+                    HardwareProfile::kSelectedName,
+                    filesystem_ready_ ? "ready" : "unavailable",
+                    kWifiControlEnabled ? "enabled" : "disabled",
+                    kBluetoothControlEnabled ? "enabled" : "disabled",
+                    test_mode_ ? "on" : "off",
+                    RadioManager::stateName(status.state),
+                    static_cast<unsigned>(status.channel));
+        if (status.power_level >= 0) {
+            std::printf("power=%d ", status.power_level);
+        } else {
+            std::printf("power=unknown ");
+        }
+        std::printf("selected=%s last_status=0x%02X fifo=0x%02X observe=0x%02X irq=%s tx_irq_seen=%s tx_ok=%s tx_timeout=%s rx_len=%u rx_packets=%u rx_stream=%u rx_raw=%u rx_missing=%u rx_saved=%u rx_saved_bytes=%u carrier_events=%u fault=%d",
+                    selected_token.c_str(),
+                    static_cast<unsigned>(status.last_status),
+                    static_cast<unsigned>(status.last_fifo_status),
+                    static_cast<unsigned>(status.last_observe_tx),
+                    irq_state,
+                    status.last_tx_saw_irq ? "true" : "false",
+                    status.last_tx_ok ? "true" : "false",
+                    status.last_tx_timed_out ? "true" : "false",
+                    static_cast<unsigned>(status.last_rx_len),
+                    static_cast<unsigned>(status.rx_packets),
+                    static_cast<unsigned>(decoded_packets),
+                    static_cast<unsigned>(raw_packets),
+                    static_cast<unsigned>(missing_packets),
+                    static_cast<unsigned>(saved_rx_file_count_),
+                    static_cast<unsigned>(saved_rx_byte_count_),
+                    static_cast<unsigned>(carrier_events),
+                    status.last_fault);
+        std::printf(" protocol=%u tx_id=%08lX tx_state=%s tx_bytes=%lu/%lu tx_seq=%lu/%lu tx_retries=%lu tx_error=%s tx_crc32=%08lX peer_complete=%s tx_no_ack=%s rx_no_ack=%s no_ack_files=true rx_id=%08lX rx_state=%s rx_bytes=%lu/%lu rx_seq=%lu/%lu rx_error=%s rx_crc32=%08lX",
+                    static_cast<unsigned>(ProtocolV2::kVersion),
+                    static_cast<unsigned long>(tx_report.transfer_id),
+                    transferReportStateName(tx_report),
+                    static_cast<unsigned long>(tx_report.bytes_transferred),
+                    static_cast<unsigned long>(tx_report.total_bytes),
+                    static_cast<unsigned long>(tx_report.current_sequence),
+                    static_cast<unsigned long>(tx_report.total_packets),
+                    static_cast<unsigned long>(tx_report.retry_count),
+                    ProtocolV2::errorName(tx_report.error),
+                    static_cast<unsigned long>(tx_report.crc32),
+                    tx_report.peer_complete ? "true" : "false",
+                    tx_report.no_ack ? "true" : "false",
+                    receiver_no_ack ? "true" : "false",
+                    static_cast<unsigned long>(receiver_id),
+                    ReliableTransferV2::receiverStateName(receiver_state),
+                    static_cast<unsigned long>(receiver_bytes),
+                    static_cast<unsigned long>(receiver_total_bytes),
+                    static_cast<unsigned long>(receiver_sequence),
+                    static_cast<unsigned long>(receiver_packets),
+                    ProtocolV2::errorName(receiver_error),
+                    static_cast<unsigned long>(receiver_crc));
+        if (!last_saved_rx_file_.empty()) {
+            std::string rx_name_token;
+            std::string rx_path_token;
+            HostConnectionProtocol::appendJsonString(rx_name_token, last_saved_rx_file_);
+            HostConnectionProtocol::appendJsonString(rx_path_token, buildFilePath(last_saved_rx_file_));
+            std::printf(" rx_last=%s rx_last_path=%s", rx_name_token.c_str(), rx_path_token.c_str());
+        }
+#if RF3_AUTOMATIC_FEM
+        std::printf(" fem_antenna=%u", hal_.femAntenna());
+        if (const char* mode = hal_.femMode()) std::printf(" fem_mode=%s", mode);
+#endif
+        if (const char* lna = hal_.femLna()) std::printf(" fem_lna=%s", lna);
+        std::printf(" tx_file=%s test_mode_supported=%s host_stored_tx=%s",
+                    tx_file_token.c_str(),
+                    HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard ? "true" : "false",
+                    filesystem_ready_ ? "true" : "false");
+        std::printf(" test_tx_count=%lu test_tx_bytes=%lu test_tx_state=%s",
+                    static_cast<unsigned long>(test_tx_count_),
+                    static_cast<unsigned long>(test_tx_bytes_),
+                    test_tx_count_ ? "Completed" : "Idle");
+        std::printf(" text=enabled text_tx_count=%lu text_rx_count=%lu",
+                    static_cast<unsigned long>(text_tx_count_),
+                    static_cast<unsigned long>(text_rx_count_));
+        std::printf(" host_upload=%s host_download=%s host_retry=enabled host_storage=%s host_echo=%s host_chunk_max=%u",
+                    filesystem_ready_ ? "enabled" : "disabled",
+                    filesystem_ready_ ? "enabled" : "disabled",
+                    filesystem_ready_ ? "enabled" : "disabled",
+                    HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard ? "enabled" : "disabled",
+                    static_cast<unsigned>(HostTransferProtocol::kMaxChunkBytes));
+        if (kWirelessControlEnabled) {
+            std::printf(" remote=enabled");
+            if (kWirelessControlAutoRx) {
+                std::printf(" remote_auto_rx=true");
+            }
+        }
+        if (status.state == RadioState::RxListening) {
+            std::printf(" rx_pending=%s rpd=%s",
+                        rx_pending ? "true" : "false",
+                        status.carrier_detected ? "true" : "false");
+        }
+        if (!last_morse_text_.empty()) {
+            std::printf(" last_morse=\"%s\"", last_morse_text_.c_str());
+        }
+        if (!loop_snapshot_available) {
+            std::printf(" loop=Busy");
+        } else if (loop.active) {
+            std::printf(" loop=%s", loopModeName(loop.mode));
+            if (loop.mode == LoopMode::Tx) {
+                std::printf(" loop_file=%s", loop.file_name.c_str());
+                if (loop.infinite) {
+                    std::printf(" loop_remaining=inf");
+                } else {
+                    std::printf(" loop_remaining=%u", static_cast<unsigned>(loop.remaining_iterations));
+                }
+            } else if (loop.mode == LoopMode::Cw) {
+                std::printf(" loop_on_ms=%u loop_off_ms=%u loop_power=%u",
+                            static_cast<unsigned>(loop.cw_on_ms),
+                            static_cast<unsigned>(loop.cw_off_ms),
+                            static_cast<unsigned>(loop.power_level));
+                if (loop.cw_report_every > 0) {
+                    std::printf(" loop_report_every=%u",
+                                static_cast<unsigned>(loop.cw_report_every));
+                }
+            } else if (loop.mode == LoopMode::Morse) {
+                std::printf(" loop_text=%s", loop.morse_text.c_str());
+            }
+            std::printf(" loop_done=%u", static_cast<unsigned>(loop.completed_iterations));
+        } else {
+            std::printf(" loop=None");
+        }
+        if (power_.supported()) {
+            const auto reading = power_.sample();
+            std::printf(" board_power=enabled sense_raw=%d sense_mv=%d sense_calibrated=%s "
+                "sense_saturated=%s power_good=%s", reading.raw, reading.millivolts,
+                reading.calibrated ? "true" : "false", reading.saturated ? "true" : "false",
+                power_.powerGood() ? "true" : "false");
+            if (power_.hasNrfRailControl()) {
+                std::printf(" nrf_rail=%s", power_.nrfRail() ? "true" : "false");
+            }
+            const auto battery=power_.battery(monotonicMilliseconds());
+            std::printf(" sense_noisy=%s battery_profile=soikon_6s_3300 battery_mv=%d "
+                "battery_estimated_mv=%d battery_percent=%d battery_remaining_mah=%d "
+                "battery_age_ms=%d battery_state=%s battery_cutoff=%s battery_persisted=%s",
+                reading.noisy ? "true" : "false", battery.pack_mv, battery.estimated_mv,
+                battery.percent, battery.remaining_mah, battery.age_ms, battery.state,
+                battery.cutoff ? "true" : "false",battery.persisted ? "true" : "false");
+        }
+        std::printf("\n");
+    }
+
+    static uint32_t queuedTransferIdEntry(void* context)
+    {
+        const auto* app = static_cast<DemoConsoleApp*>(context);
+        const ProtocolTransferReport report = copyTransferReport(app->last_tx_report_);
+        return report.state == ReliableTransferV2::SenderState::Preparing && report.transfer_id
+            ? report.transfer_id : nextTransferId();
+    }
+
+    void setSelectedFile(const std::string& name)
+    {
+        selected_file_ = name;
+        char published[sizeof(selected_status_name_)]{};
+        std::snprintf(published, sizeof(published), "%s", name.c_str());
+        portENTER_CRITICAL(&transfer_report_mux);
+        std::memcpy(selected_status_name_, published, sizeof(published));
+        portEXIT_CRITICAL(&transfer_report_mux);
+    }
+
+    bool captureHttpStatus(HttpStatusSnapshot& out)
+    {
+        // Serialize string/cache ownership with an ordinary task mutex. The RF
+        // sender never takes it, so STATUS remains bounded while RF is active.
+        if (!status_mutex_ || xSemaphoreTake(status_mutex_, pdMS_TO_TICKS(50)) != pdTRUE)
+            return false;
+        out = cached_host_status_;
+        out.node_name = WifiControlConfig::kNodeName;
+        out.hostname = WifiControlConfig::kNodeName;
+        out.profile = HardwareProfile::kSelectedName;
+        out.filesystem_ready = filesystem_ready_;
+        out.test_mode_supported = HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard;
+        out.host_chunk_max = HostTransferProtocol::kMaxChunkBytes;
+        out.fem_antenna = hal_.femAntenna();
+        out.supports_remote = kWirelessControlEnabled;
+        out.remote_auto_rx = kWirelessControlAutoRx;
+        // Never hold radio while acquiring the loop lock: encoded commands use
+        // loop -> radio order. An unavailable loop snapshot fails closed as Busy.
+        out.loop_name = "Busy";
+        if (takeLoop(pdMS_TO_TICKS(50))) {
+            out.loop_name = loop_config_.active ? loopModeName(loop_config_.mode) : "None";
+            giveLoop();
+        }
+        out.test_mode = test_mode_.load();
+        out.test_tx_count = test_tx_count_.load();
+        out.test_tx_bytes = test_tx_bytes_.load();
+        char selected[sizeof(selected_status_name_)]{};
+        portENTER_CRITICAL(&transfer_report_mux);
+        std::memcpy(selected, selected_status_name_, sizeof(selected));
+        portEXIT_CRITICAL(&transfer_report_mux);
+        out.selected_name = selected;
+        ProtocolTransferReport tx_report{};
+        const bool acquired = takeRadio(pdMS_TO_TICKS(50));
+        if (acquired) {
+            if (power_.radioAvailable()) manager_.refreshSnapshot();
+            out.rx_pending = manager_.status().state == RadioState::RxListening
+                ? manager_.hasPendingRx() : false;
+            const RadioStatus status = manager_.status();
+            out.state_name = RadioManager::stateName(status.state);
+            out.channel = status.channel;
+            out.power_level = status.power_level;
+            out.tx_ok = status.last_tx_ok;
+            out.tx_timeout = status.last_tx_timed_out;
+            out.rx_packets = status.rx_packets;
+            out.rx_stream = decoded_rx_packet_count_;
+            out.rx_raw = raw_rx_packet_count_;
+            out.rx_missing = missing_rx_packet_count_;
+            out.rx_saved = saved_rx_file_count_;
+            out.rx_saved_bytes = saved_rx_byte_count_;
+            out.rx_last_name = last_saved_rx_file_;
+            out.rx_last_path = last_saved_rx_file_.empty() ? "" : buildFilePath(last_saved_rx_file_);
+            out.last_fault = status.last_fault;
+            out.rpd = status.carrier_detected;
+            out.rx.state_name = ReliableTransferV2::receiverStateName(receiver_.state());
+            out.rx.error_name = ProtocolV2::errorName(receiver_.error());
+            out.rx.id = receiver_.transferId();
+            out.rx.bytes = receiver_.acceptedBytes();
+            out.rx.total = receiver_.totalSize();
+            out.rx_no_ack = rx_no_ack_mode_;
+            out.rx.sequence = receiver_.expectedSequence();
+            out.rx.packets = receiver_.totalPackets();
+            out.rx.crc32 = receiver_.calculatedCrc32();
+            tx_report = copyTransferReport(last_tx_report_);
+            tx_report.radio = status;
+            tx_report.radio_valid = true;
+            publishTransferReport(last_tx_report_, tx_report);
+            giveRadio();
+        } else {
+            // Only the separately published report is read while the sender
+            // owns radio_mutex_. Cached RX metadata remains the last known RX
+            // snapshot; the live sender owns the radio during this interval.
+            tx_report = copyTransferReport(last_tx_report_);
+            const bool tx_active = tx_report.state == ReliableTransferV2::SenderState::Preparing ||
+                tx_report.state == ReliableTransferV2::SenderState::WaitingForReady ||
+                tx_report.state == ReliableTransferV2::SenderState::SendingData ||
+                tx_report.state == ReliableTransferV2::SenderState::WaitingForDataAck ||
+                tx_report.state == ReliableTransferV2::SenderState::WaitingForComplete ||
+                tx_report.state == ReliableTransferV2::SenderState::Cancelling;
+            if (tx_active && tx_report.radio_valid) {
+                out.state_name = "TxBusy";
+                out.channel = tx_report.radio.channel;
+                out.power_level = tx_report.radio.power_level;
+                out.last_fault = tx_report.radio.last_fault;
+                out.tx_ok = tx_report.radio.last_tx_ok;
+                out.tx_timeout = tx_report.radio.last_tx_timed_out;
+                out.rx_pending = false;
+            } else {
+                out.state_name = "Unavailable";
+            }
+        }
+        out.tx.state_name = transferReportStateName(tx_report);
+        out.tx.error_name = ProtocolV2::errorName(tx_report.error);
+        out.tx.id = tx_report.transfer_id;
+        out.tx.file_name = tx_report.file_name;
+        out.tx.bytes = tx_report.bytes_transferred;
+        out.tx.total = tx_report.total_bytes;
+        out.tx.sequence = tx_report.current_sequence;
+        out.tx.packets = tx_report.total_packets;
+        out.tx.retries = tx_report.retry_count;
+        out.tx.crc32 = tx_report.crc32;
+        out.tx.peer_complete = tx_report.peer_complete;
+        out.tx.no_ack = tx_report.no_ack;
+        out.fem_mode = hal_.femMode();
+        size_t selected_bytes = 0;
+        out.selected_bytes = statFileSize(buildFilePath(out.selected_name), selected_bytes)
+            ? static_cast<uint32_t>(selected_bytes) : 0;
+        out.fem_lna = hal_.femLna();
+        cached_host_status_ = out;
+        xSemaphoreGive(status_mutex_);
+        return true;
+    }
+
+    std::string buildStatusJson()
+    {
+        HttpStatusSnapshot snapshot{};
+        if (!captureHttpStatus(snapshot)) snapshot.state_name = "Unavailable";
+        snapshot.fem_mode = hal_.femMode();
+        snapshot.fem_lna = hal_.femLna();
+        snapshot.board_power = power_.supported();
+        snapshot.sense = power_.sample();
+        snapshot.power_good = power_.powerGood();
+        if (power_.hasNrfRailControl()) snapshot.nrf_rail = power_.nrfRail();
+        snapshot.battery = power_.battery(monotonicMilliseconds());
+        return HostStatusProtocol::json(snapshot);
+    }
+
+    bool dispatchHttpCommand(const std::string& line)
+    {
+        return dispatchCommand(line, CommandOrigin::Http);
+    }
+
+    void emitHostTransferResponse(CommandOrigin origin, const std::string& response)
+    {
+        std::printf("%s\n", response.c_str());
+        std::fflush(stdout);
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+        if (origin == CommandOrigin::Bluetooth) {
+            if (bluetooth_dispatch_epoch_ == bluetooth_epoch_.load()) {
+                sendBluetoothText(response + "\r\n", bluetooth_dispatch_epoch_);
+            }
+        }
+#else
+        (void)origin;
+#endif
+    }
+
+    void resetHostUpload(bool remove_partial)
+    {
+        if (host_upload_.file) {
+            std::fclose(host_upload_.file);
+            host_upload_.file = nullptr;
+        }
+        if (remove_partial && filesystem_ready_) {
+            const std::string partial_path = buildFilePath(kHostUploadPartialName);
+            errno = 0;
+            if (std::remove(partial_path.c_str()) != 0 && errno != ENOENT) {
+                ESP_LOGW(TAG, "Could not remove host upload partial: errno=%d", errno);
+            }
+        }
+        host_upload_ = HostUploadStorage{};
+        host_session_owns_rx_.store(host_download_.active);
+    }
+
+    void resetHostDownload()
+    {
+        if (host_download_.file) {
+            std::fclose(host_download_.file);
+            host_download_.file = nullptr;
+        }
+        host_download_ = HostDownloadStorage{};
+        host_session_owns_rx_.store(host_upload_.active);
+    }
+
+    uint32_t hostSessionEpoch(CommandOrigin origin) const
+    {
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+        if (origin == CommandOrigin::Bluetooth) return bluetooth_dispatch_epoch_;
+#else
+        (void)origin;
+#endif
+        return 0;
+    }
+
+    bool hostSessionAlive(CommandOrigin owner, uint32_t epoch, int64_t touched) const
+    {
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+        return HostTransferGuard::alive(owner == CommandOrigin::Bluetooth, epoch, touched,
+            esp_timer_get_time(), bluetooth_client_connected_.load(), bluetooth_epoch_.load(),
+            kHostSessionTimeoutUs);
+#else
+        (void)owner;
+        (void)epoch;
+        return HostTransferGuard::alive(false, 0, touched, esp_timer_get_time(), false, 0,
+                                        kHostSessionTimeoutUs);
+#endif
+    }
+
+    void expireHostSessions()
+    {
+        if (host_upload_.active && !hostSessionAlive(host_upload_.owner, host_upload_.epoch,
+                                                   host_upload_.last_activity_us)) {
+            ESP_LOGW(TAG, "Aborting disconnected/expired host upload");
+            resetHostUpload(true);
+        }
+        if (host_download_.active && !hostSessionAlive(host_download_.owner, host_download_.epoch,
+                                                     host_download_.last_activity_us)) {
+            ESP_LOGW(TAG, "Closing disconnected/expired host download");
+            resetHostDownload();
+        }
+    }
+
+    bool commandUpload(const std::vector<std::string>& words, CommandOrigin origin)
+    {
+        if ((origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth) ||
+            !filesystem_ready_) {
+            emitHostTransferResponse(origin, "UPLOAD ERROR unavailable");
+            return false;
+        }
+
+        expireHostSessions();
+        if (host_download_.active || (host_upload_.active &&
+            !HostTransferGuard::owns(static_cast<uint8_t>(host_upload_.owner), host_upload_.epoch,
+                static_cast<uint8_t>(origin), hostSessionEpoch(origin)))) {
+            emitHostTransferResponse(origin, "UPLOAD ERROR transfer_owned_by_another_session");
+            return false;
+        }
+
+        const std::string action = words.size() >= 2 ? uppercaseCopy(words[1]) : "";
+        if (action == "BEGIN") {
+            uint32_t expected_size = 0;
+            uint32_t expected_crc32 = 0;
+            size_t chunk_bytes = HostTransferProtocol::kLegacyChunkBytes;
+            const bool chunk_requested = words.size() == 6;
+            if ((words.size() != 5 && words.size() != 6) || !isValidHostFilename(words[2]) ||
+                !parseUint32Arg(words[3], 0, ProtocolV2::kMaxFileSize, expected_size) ||
+                !parseHexUint32Arg(words[4], expected_crc32) ||
+                !HostTransferProtocol::negotiateChunk(chunk_requested,
+                    chunk_requested ? std::string_view(words[5]) : std::string_view(), chunk_bytes)) {
+                emitHostTransferResponse(
+                    origin,
+                    "UPLOAD ERROR usage: UPLOAD BEGIN <name> <size> <crc32> [chunk64to256]");
+                return false;
+            }
+
+            if (!takeLoop(pdMS_TO_TICKS(50))) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR loop_busy_retry");
+                return false;
+            }
+            const LoopConfig loop = loop_config_;
+            giveLoop();
+            if (loop.active && loop.mode == LoopMode::Tx && loop.file_name == words[2]) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR file_in_use");
+                return false;
+            }
+            HostPublishOps publication;
+            if (!HostUploadPublish::recover(publication)) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR recovery_pending");
+                return false;
+            }
+            resetHostUpload(true);
+            size_t total = 0;
+            size_t used = 0;
+            constexpr size_t kMetadataReserve = 8192;
+            if (esp_spiffs_info(nullptr, &total, &used) != ESP_OK || used > total ||
+                static_cast<size_t>(expected_size) + kMetadataReserve > total - used) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR insufficient_storage");
+                return false;
+            }
+            const std::string partial_path = buildFilePath(kHostUploadPartialName);
+            std::FILE* file = std::fopen(partial_path.c_str(), "wb");
+            if (!file) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR could_not_open_partial");
+                return false;
+            }
+
+            host_upload_.active = true;
+            host_session_owns_rx_.store(true);
+            host_upload_.chunk_bytes = chunk_bytes;
+            host_upload_.final_name = words[2];
+            host_upload_.file = file;
+            host_upload_.expected_size = expected_size;
+            host_upload_.expected_crc32 = expected_crc32;
+            host_upload_.crc.reset();
+            host_upload_.owner = origin;
+            host_upload_.epoch = hostSessionEpoch(origin);
+            host_upload_.last_activity_us = esp_timer_get_time();
+
+            std::string response;
+            appendFormat(response,
+                         "UPLOAD READY %s %lu %08lX",
+                         host_upload_.final_name.c_str(),
+                         static_cast<unsigned long>(expected_size),
+                         static_cast<unsigned long>(expected_crc32));
+            HostTransferProtocol::appendReadyChunk(response, chunk_requested, chunk_bytes);
+            emitHostTransferResponse(origin, response);
+            return true;
+        }
+
+        if (action == "CANCEL") {
+            if (words.size() != 2) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR usage: UPLOAD CANCEL");
+                return false;
+            }
+            resetHostUpload(true);
+            emitHostTransferResponse(origin, "UPLOAD CANCELLED");
+            return true;
+        }
+
+        if (!host_upload_.active || !host_upload_.file) {
+            emitHostTransferResponse(origin, "UPLOAD ERROR no_active_upload");
+            return false;
+        }
+        host_upload_.last_activity_us = esp_timer_get_time();
+
+        if (action == "DATA") {
+            uint32_t sequence = 0;
+            std::vector<uint8_t> decoded;
+            if (words.size() != 4 ||
+                !parseUint32Arg(words[2], 0, UINT32_MAX, sequence) ||
+                !decodeHex(words[3], decoded)) {
+                emitHostTransferResponse(
+                    origin,
+                    "UPLOAD ERROR usage: UPLOAD DATA <sequence> <hex>");
+                return false;
+            }
+            if (!HostTransferProtocol::validChunkLength(decoded.size(), host_upload_.chunk_bytes)) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR exceeds_negotiated_chunk");
+                return false;
+            }
+            if (HostTransferProtocol::matchesPrevious(sequence, host_upload_.next_sequence,
+                    decoded.data(), decoded.size(), host_upload_.last_chunk.data(), host_upload_.last_chunk_size)) {
+                std::string response;
+                appendFormat(response, "UPLOAD ACK %lu %lu", static_cast<unsigned long>(sequence),
+                             static_cast<unsigned long>(host_upload_.received_size));
+                emitHostTransferResponse(origin, response);
+                return true;
+            }
+            if (sequence != host_upload_.next_sequence) {
+                std::string response;
+                appendFormat(response,
+                             "UPLOAD ERROR expected_sequence=%lu",
+                             static_cast<unsigned long>(host_upload_.next_sequence));
+                emitHostTransferResponse(origin, response);
+                return false;
+            }
+            if (decoded.size() > host_upload_.expected_size - host_upload_.received_size) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR exceeds_declared_size");
+                resetHostUpload(true);
+                return false;
+            }
+            if (std::fwrite(decoded.data(), 1, decoded.size(), host_upload_.file) != decoded.size()) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR write_failed");
+                resetHostUpload(true);
+                return false;
+            }
+
+            host_upload_.crc.update(decoded.data(), decoded.size());
+            host_upload_.received_size += static_cast<uint32_t>(decoded.size());
+            std::copy(decoded.begin(), decoded.end(), host_upload_.last_chunk.begin());
+            host_upload_.last_chunk_size = decoded.size();
+            ++host_upload_.next_sequence;
+
+            std::string response;
+            appendFormat(response,
+                         "UPLOAD ACK %lu %lu",
+                         static_cast<unsigned long>(sequence),
+                         static_cast<unsigned long>(host_upload_.received_size));
+            emitHostTransferResponse(origin, response);
+            return true;
+        }
+
+        if (action == "END") {
+            if (words.size() != 2) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR usage: UPLOAD END");
+                return false;
+            }
+
+            const uint32_t actual_crc32 = host_upload_.crc.value();
+            if (host_upload_.received_size != host_upload_.expected_size ||
+                actual_crc32 != host_upload_.expected_crc32) {
+                std::string response;
+                appendFormat(response,
+                             "UPLOAD ERROR verification_failed bytes=%lu/%lu crc32=%08lX/%08lX",
+                             static_cast<unsigned long>(host_upload_.received_size),
+                             static_cast<unsigned long>(host_upload_.expected_size),
+                             static_cast<unsigned long>(actual_crc32),
+                             static_cast<unsigned long>(host_upload_.expected_crc32));
+                emitHostTransferResponse(origin, response);
+                resetHostUpload(true);
+                return false;
+            }
+
+            const std::string final_name = host_upload_.final_name;
+            const uint32_t final_size = host_upload_.received_size;
+            const int flush_result = std::fflush(host_upload_.file);
+            const int close_result = std::fclose(host_upload_.file);
+            if (flush_result != 0 || close_result != 0) {
+                host_upload_.file = nullptr;
+                emitHostTransferResponse(origin, "UPLOAD ERROR close_failed");
+                resetHostUpload(true);
+                return false;
+            }
+            host_upload_.file = nullptr;
+
+            HostPublishOps publication;
+            if (!HostUploadPublish::publish(publication, kHostUploadPartialName, final_name)) {
+                emitHostTransferResponse(origin, "UPLOAD ERROR publish_failed");
+                resetHostUpload(true);
+                return false;
+            }
+
+            host_upload_ = HostUploadStorage{};
+            host_session_owns_rx_.store(host_download_.active);
+            setSelectedFile(final_name);
+            std::string response;
+            appendFormat(response,
+                         "UPLOAD COMPLETE %s %lu %08lX",
+                         final_name.c_str(),
+                         static_cast<unsigned long>(final_size),
+                         static_cast<unsigned long>(actual_crc32));
+            emitHostTransferResponse(origin, response);
+            return true;
+        }
+
+        emitHostTransferResponse(origin, "UPLOAD ERROR expected BEGIN, DATA, END, or CANCEL");
+        return false;
+    }
+
+    bool commandStorage(const std::vector<std::string>& words, CommandOrigin origin)
+    {
+        const auto fail = [&](const std::string& message) {
+            emitHostTransferResponse(origin, HostStorageProtocol::error(message));
+            return false;
+        };
+        if ((origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth) ||
+            !filesystem_ready_) return fail("storage_unavailable");
+        const std::string action = words.size() >= 2 ? uppercaseCopy(words[1]) : "";
+        if (action == "LIST") {
+            uint32_t offset = 0;
+            if (words.size() != 3 || !parseUint32Arg(words[2], 0, UINT32_MAX, offset)) {
+                return fail("usage_STORAGE_LIST_offset");
+            }
+            // RX publication/rename is protected by the radio mutex. Keep one
+            // consistent page snapshot, and report directory/stat failures.
+            if (!takeRadio(pdMS_TO_TICKS(100))) return fail("radio_busy_retry_list");
+            bool accepted = false;
+            const std::string response = [&]() {
+                size_t capacity = 0;
+                size_t used = 0;
+                if (esp_spiffs_info(nullptr, &capacity, &used) != ESP_OK || used > capacity) {
+                    return HostStorageProtocol::error("storage_info_failed");
+                }
+                DIR* directory = opendir(kSpiffsRoot);
+                if (!directory) return HostStorageProtocol::error("directory_open_failed_errno_" + std::to_string(errno));
+                std::vector<HostStorageProtocol::File> files;
+                std::string failure;
+                while (true) {
+                    errno = 0;
+                    const dirent* entry = readdir(directory);
+                    if (!entry) {
+                        if (errno) failure = "directory_read_failed_errno_" + std::to_string(errno);
+                        break;
+                    }
+                    const std::string name(entry->d_name);
+                    if (HostStorageProtocol::protectedName(name)) continue;
+                    if (!HostStorageProtocol::validFilename(name)) {
+                        failure = "unsupported_visible_filename";
+                        break;
+                    }
+                    struct stat info {};
+                    if (::stat(buildFilePath(name).c_str(), &info) != 0) {
+                        failure = "file_stat_failed_errno_" + std::to_string(errno);
+                        break;
+                    }
+                    if (!S_ISREG(info.st_mode) || info.st_size < 0) {
+                        failure = "unsupported_directory_entry";
+                        break;
+                    }
+                    files.push_back({name, static_cast<size_t>(info.st_size)});
+                }
+                if (closedir(directory) != 0 && failure.empty()) failure = "directory_close_failed_errno_" + std::to_string(errno);
+                if (!failure.empty()) return HostStorageProtocol::error(failure);
+                std::sort(files.begin(), files.end(), [](const auto& left, const auto& right) {
+                    return left.name < right.name;
+                });
+                accepted = offset <= files.size();
+                return HostStorageProtocol::listing(files, offset, used, capacity);
+            }();
+            giveRadio();
+            emitHostTransferResponse(origin, response);
+            return accepted;
+        }
+        if (action != "DELETE" || words.size() != 3) return fail("usage_STORAGE_LIST_offset_or_DELETE_hexname");
+        std::string name;
+        if (!HostStorageProtocol::decodeName(words[2], name)) return fail("invalid_or_protected_filename");
+        // The command mutex already protects host sessions. Fail closed if
+        // either activity lock is unavailable, then hold both through remove.
+        if (!takeLoop(pdMS_TO_TICKS(50))) return fail("loop_busy");
+        if (!takeRadio(pdMS_TO_TICKS(100))) {
+            giveLoop();
+            return fail("radio_busy_stop_first");
+        }
+        bool accepted = false;
+        const std::string response = [&]() {
+            HostStorageProtocol::DeleteGuards guards;
+            guards.host_transfer_active = host_upload_.active || host_download_.active;
+            guards.loop_active = loop_config_.active;
+            const RadioState radio_state = manager_.status().state;
+            guards.radio_active = radio_state == RadioState::TxBusy ||
+                radio_state == RadioState::RxListening || radio_state == RadioState::CwTest;
+            guards.receive_active = receiver_.active() || incoming_file_.file != nullptr || active_api_receive_id_ != 0;
+            for (const char* recovery_name : {HostUploadPublish::kJournal, HostUploadPublish::kBackup}) {
+                struct stat recovery {};
+                if (::stat(buildFilePath(recovery_name).c_str(), &recovery) == 0) {
+                    guards.recovery_pending = true;
+                } else if (errno != ENOENT) {
+                    return HostStorageProtocol::error("recovery_stat_failed_errno_" + std::to_string(errno));
+                }
+            }
+            if (const char* reason = HostStorageProtocol::deleteError(guards)) {
+                return HostStorageProtocol::error(reason);
+            }
+            struct stat info {};
+            const std::string path = buildFilePath(name);
+            if (::stat(path.c_str(), &info) != 0) return HostStorageProtocol::error("file_stat_failed_errno_" + std::to_string(errno));
+            if (!S_ISREG(info.st_mode)) return HostStorageProtocol::error("not_a_regular_file");
+            if (std::remove(path.c_str()) != 0) return HostStorageProtocol::error("delete_failed_errno_" + std::to_string(errno));
+            if (selected_file_ == name) {
+                setSelectedFile("");
+                const auto remaining = listFiles();
+                if (!remaining.empty()) setSelectedFile(remaining.front().name);
+            }
+            if (last_saved_rx_file_ == name) last_saved_rx_file_.clear();
+            accepted = true;
+            return HostStorageProtocol::deleted(name);
+        }();
+        giveRadio();
+        giveLoop();
+        emitHostTransferResponse(origin, response);
+        return accepted;
+    }
+
+    bool commandDownload(const std::vector<std::string>& words, CommandOrigin origin)
+    {
+        if ((origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth) ||
+            !filesystem_ready_) {
+            emitHostTransferResponse(origin, "DOWNLOAD ERROR unavailable");
+            return false;
+        }
+
+        expireHostSessions();
+        if (host_upload_.active || (host_download_.active &&
+            !HostTransferGuard::owns(static_cast<uint8_t>(host_download_.owner), host_download_.epoch,
+                static_cast<uint8_t>(origin), hostSessionEpoch(origin)))) {
+            emitHostTransferResponse(origin, "DOWNLOAD ERROR transfer_owned_by_another_session");
+            return false;
+        }
+
+        const std::string action = words.size() >= 2 ? uppercaseCopy(words[1]) : "";
+        if (action == "BEGIN" || action == "BEGINHEX") {
+            size_t chunk_bytes = HostTransferProtocol::kLegacyChunkBytes;
+            const bool chunk_requested = words.size() == 4;
+            if ((words.size() != 3 && words.size() != 4) ||
+                !HostTransferProtocol::negotiateChunk(chunk_requested,
+                    chunk_requested ? std::string_view(words[3]) : std::string_view(), chunk_bytes)) {
+                emitHostTransferResponse(origin, "DOWNLOAD ERROR usage: DOWNLOAD BEGIN <name> or BEGINHEX <utf8hex> [chunk64to256]");
+                return false;
+            }
+
+            FileInfo info{};
+            bool resolved = false;
+            if (action == "BEGINHEX") {
+                resolved = HostStorageProtocol::decodeName(words[2], info.name) &&
+                    statFileSize(buildFilePath(info.name), info.bytes);
+            } else {
+                resolved = resolveFile(words[2], info);
+            }
+            if (!resolved || info.bytes > ProtocolV2::kMaxFileSize) {
+                emitHostTransferResponse(origin, "DOWNLOAD ERROR file_not_found_or_too_large");
+                return false;
+            }
+
+            resetHostDownload();
+            std::FILE* file = std::fopen(buildFilePath(info.name).c_str(), "rb");
+            if (!file) {
+                emitHostTransferResponse(origin, "DOWNLOAD ERROR open_failed");
+                return false;
+            }
+
+            ProtocolV2::Crc32 crc;
+            std::array<uint8_t, 256> buffer{};
+            size_t inspected = 0;
+            while (inspected < info.bytes) {
+                const size_t wanted = std::min(buffer.size(), info.bytes - inspected);
+                const size_t read = std::fread(buffer.data(), 1, wanted, file);
+                if (read != wanted) {
+                    std::fclose(file);
+                    emitHostTransferResponse(origin, "DOWNLOAD ERROR inspect_failed");
+                    return false;
+                }
+                crc.update(buffer.data(), read);
+                inspected += read;
+            }
+            if (std::fseek(file, 0, SEEK_SET) != 0) {
+                std::fclose(file);
+                emitHostTransferResponse(origin, "DOWNLOAD ERROR rewind_failed");
+                return false;
+            }
+
+            host_download_.active = true;
+            host_session_owns_rx_.store(true);
+            host_download_.encoded_name = action == "BEGINHEX";
+            host_download_.chunk_bytes = chunk_bytes;
+            host_download_.name = info.name;
+            host_download_.file = file;
+            host_download_.total_size = static_cast<uint32_t>(info.bytes);
+            host_download_.crc32 = crc.value();
+            host_download_.owner = origin;
+            host_download_.epoch = hostSessionEpoch(origin);
+            host_download_.last_activity_us = esp_timer_get_time();
+
+            std::string response;
+            appendFormat(response,
+                         "DOWNLOAD %s %s %lu %08lX",
+                         host_download_.encoded_name ? "READYHEX" : "READY",
+                         (host_download_.encoded_name ? HostStorageProtocol::encodeName(info.name) : info.name).c_str(),
+                         static_cast<unsigned long>(host_download_.total_size),
+                         static_cast<unsigned long>(host_download_.crc32));
+            HostTransferProtocol::appendReadyChunk(response, chunk_requested, chunk_bytes);
+            emitHostTransferResponse(origin, response);
+            return true;
+        }
+
+        if (action == "CANCEL") {
+            if (words.size() != 2) {
+                emitHostTransferResponse(origin, "DOWNLOAD ERROR usage: DOWNLOAD CANCEL");
+                return false;
+            }
+            resetHostDownload();
+            emitHostTransferResponse(origin, "DOWNLOAD CANCELLED");
+            return true;
+        }
+
+        if (!host_download_.active || !host_download_.file) {
+            emitHostTransferResponse(origin, "DOWNLOAD ERROR no_active_download");
+            return false;
+        }
+        host_download_.last_activity_us = esp_timer_get_time();
+
+        if (action == "DATA") {
+            uint32_t sequence = 0;
+            if (words.size() != 3 ||
+                !parseUint32Arg(words[2], 0, UINT32_MAX, sequence)) {
+                emitHostTransferResponse(
+                    origin,
+                    "DOWNLOAD ERROR usage: DOWNLOAD DATA <sequence>");
+                return false;
+            }
+            if (host_download_.next_sequence > 0 && sequence == host_download_.next_sequence - 1) {
+                emitHostTransferResponse(origin, "DOWNLOAD DATA " + std::to_string(sequence) + " " +
+                    encodeHex(host_download_.last_chunk.data(), host_download_.last_chunk_size));
+                return true;
+            }
+            if (sequence != host_download_.next_sequence) {
+                std::string response;
+                appendFormat(response,
+                             "DOWNLOAD ERROR expected_sequence=%lu",
+                             static_cast<unsigned long>(host_download_.next_sequence));
+                emitHostTransferResponse(origin, response);
+                return false;
+            }
+            if (host_download_.sent_size >= host_download_.total_size) {
+                emitHostTransferResponse(origin, "DOWNLOAD ERROR no_more_data");
+                return false;
+            }
+
+            std::array<uint8_t, kHostTransferChunkBytes> buffer{};
+            const size_t wanted = HostTransferProtocol::downloadChunkSize(
+                host_download_.chunk_bytes,
+                static_cast<size_t>(host_download_.total_size - host_download_.sent_size));
+            const size_t read = std::fread(buffer.data(), 1, wanted, host_download_.file);
+            if (read != wanted) {
+                emitHostTransferResponse(origin, "DOWNLOAD ERROR read_failed");
+                resetHostDownload();
+                return false;
+            }
+
+            host_download_.sent_size += static_cast<uint32_t>(read);
+            host_download_.last_chunk = buffer;
+            host_download_.last_chunk_size = read;
+            ++host_download_.next_sequence;
+            emitHostTransferResponse(
+                origin,
+                "DOWNLOAD DATA " + std::to_string(sequence) + " " +
+                    encodeHex(buffer.data(), read));
+            return true;
+        }
+
+        if (action == "END") {
+            if (words.size() != 2 || host_download_.sent_size != host_download_.total_size) {
+                emitHostTransferResponse(origin, "DOWNLOAD ERROR incomplete");
+                return false;
+            }
+
+            const std::string name = host_download_.name;
+            const bool encoded_name = host_download_.encoded_name;
+            const uint32_t size = host_download_.total_size;
+            const uint32_t crc32 = host_download_.crc32;
+            resetHostDownload();
+            std::string response;
+            appendFormat(response,
+                         "DOWNLOAD %s %s %lu %08lX",
+                         encoded_name ? "COMPLETEHEX" : "COMPLETE",
+                         (encoded_name ? HostStorageProtocol::encodeName(name) : name).c_str(),
+                         static_cast<unsigned long>(size),
+                         static_cast<unsigned long>(crc32));
+            emitHostTransferResponse(origin, response);
+            return true;
+        }
+
+        emitHostTransferResponse(origin, "DOWNLOAD ERROR expected BEGIN, BEGINHEX, DATA, END, or CANCEL");
+        return false;
+    }
+
+    bool commandFiles()
+    {
+        printFileTable(listFiles(), selected_file_);
+        return true;
+    }
+
+    bool commandStoredName(const std::vector<std::string>& words, CommandOrigin origin)
+    {
+        const std::string command = uppercaseCopy(words.front());
+        const bool transmit = (command == "TXHEX" || command == "TXNOACKHEX");
+        const bool no_ack = command == "TXNOACKHEX";
+        const std::string echoed = command + (words.size() >= 2 ? " " + words[1] : "");
+        const auto finish = [&](bool accepted, const char* reason = nullptr) {
+            std::string response = (accepted ? "OK " : "ERR ") + echoed;
+            if (reason) response += " " + std::string(reason);
+            emitHostTransferResponse(origin, response);
+            return accepted;
+        };
+        if ((origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth) || !filesystem_ready_)
+            return finish(false, "host_storage_unavailable");
+        std::string name;
+        if (words.size() != 2 || !HostStorageProtocol::decodeName(words[1], name))
+            return finish(false, "invalid_or_protected_filename");
+        if (!takeLoop(pdMS_TO_TICKS(50))) return finish(false, "loop_busy_retry");
+        if (!takeRadio(pdMS_TO_TICKS(100))) {
+            giveLoop();
+            return finish(false, "radio_busy_retry");
+        }
+        const auto operation = [&]() -> const char* {
+            HostStorageProtocol::StoredGuards guards;
+            guards.host_transfer_active = host_upload_.active || host_download_.active;
+            guards.loop_active = loop_config_.active;
+            if (power_.radioAvailable()) manager_.refreshSnapshot();
+            const RadioStatus radio = manager_.status();
+            guards.radio_active = radio.state == RadioState::TxBusy || radio.state == RadioState::CwTest;
+            guards.receive_active = receiver_.active() || incoming_file_.file != nullptr || active_api_receive_id_ != 0;
+            guards.radio_ready = radio.state != RadioState::Boot && radio.state != RadioState::Fault && radio.power_level >= 0;
+            guards.test_mode = test_mode_.load();
+            for (const char* recovery_name : {HostUploadPublish::kJournal, HostUploadPublish::kBackup}) {
+                struct stat recovery {};
+                if (::stat(buildFilePath(recovery_name).c_str(), &recovery) == 0) guards.recovery_pending = true;
+                else if (errno != ENOENT) return "recovery_stat_failed";
+            }
+            if (const char* error = HostStorageProtocol::storedOperationError(guards, transmit)) return error;
+            struct stat info {};
+            if (::stat(buildFilePath(name).c_str(), &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0)
+                return "stored_file_not_found";
+            if (transmit && static_cast<uint64_t>(info.st_size) > ProtocolV2::kMaxFileSize)
+                return "unsupported_file_size";
+            FileTypeMetadata::Extension extension{};
+            if (transmit && !FileTypeMetadata::derive(name, extension))
+                return "unsupported_file_extension_max10_ASCII_alnum_underscore_hyphen";
+            if (transmit) {
+                if (!ensureStandbyLocked()) return "radio_not_ready";
+                loop_stop_requested_.store(false);
+                loop_config_ = LoopConfig{};
+                loop_config_.mode = LoopMode::Tx;
+                loop_config_.active = true;
+                loop_owns_radio_.store(true);
+                loop_config_.remaining_iterations = 1;
+                loop_config_.no_ack = no_ack;
+                loop_config_.file_name = name;
+                prepareTransferReport(last_tx_report_, FileInfo{name, static_cast<size_t>(info.st_size)},
+                                      manager_.status(), nextTransferId());
+                ProtocolTransferReport queued = copyTransferReport(last_tx_report_);
+                queued.no_ack = no_ack; publishTransferReport(last_tx_report_, queued);
+            }
+            setSelectedFile(name);
+            return nullptr;
+        };
+        const char* failure = operation();
+        giveRadio();
+        giveLoop();
+        return finish(failure == nullptr, failure);
+    }
+
+    bool commandSelect(const std::vector<std::string>& words)
+    {
+        // SELECT only changes the default file used by later transmit (TX)
+        // commands. It
+        // does not start transmission immediately.
+        if (words.size() < 2) {
+            std::printf("Usage: SELECT <file>\n");
+            return false;
+        }
+
+        FileInfo file{};
+        if (!resolveFile(words[1], file)) {
+            std::printf("File '%s' was not found in SPIFFS.\n", words[1].c_str());
+            return false;
+        }
+
+        setSelectedFile(file.name);
+        std::printf("Selected %s (%u bytes)\n",
+            selected_file_.c_str(),
+            static_cast<unsigned>(file.bytes));
+        return true;
+    }
+
+    bool commandTx(const std::vector<std::string>& words, CommandOrigin origin)
+    {
+        if (host_upload_.active || host_download_.active) {
+            emitHostTransferResponse(origin, "ERR TX host_transfer_active");
+            return false;
+        }
+        if (words.size() >= 2) {
+            const std::string action = uppercaseCopy(words[1]);
+            if (action == "STOP") {
+                std::printf("Use STOP to abort TX.\n");
+                return false;
+            }
+
+            if (action == "LOOP") {
+                if (words.size() > 4) {
+                    std::printf("Usage: TX LOOP [count|INF] [file]\n");
+                    return false;
+                }
+
+                bool infinite = true;
+                uint32_t loop_count = 0;
+                std::string request = selected_file_;
+
+                if (words.size() >= 3) {
+                    if (parseLoopCountToken(words[2], infinite, loop_count)) {
+                        if (words.size() >= 4) {
+                            request = words[3];
+                        }
+                    } else {
+                        request = words[2];
+                    }
+                }
+
+                FileInfo file{};
+                if (!resolveFile(request, file)) {
+                    std::printf("File '%s' was not found in SPIFFS.\n", request.c_str());
+                    return false;
+                }
+
+                FileTypeMetadata::Extension extension{};
+                if (!FileTypeMetadata::derive(file.name, extension)) {
+                    std::printf("ERR TX unsupported_file_extension_max10_ASCII_alnum_underscore_hyphen\n");
+                    return false;
+                }
+                if (!stopLoopAndWait()) {
+                    std::printf("Could not stop the current loop cleanly.\n");
+                    return false;
+                }
+
+                if (!takeLoop()) {
+                    std::printf("Could not start TX loop right now.\n");
+                    return false;
+                }
+
+                if (!takeRadio(pdMS_TO_TICKS(100))) {
+                    giveLoop();
+                    std::printf("Radio is busy; TX was not queued.\n");
+                    return false;
+                }
+                if (power_.radioAvailable()) manager_.refreshSnapshot();
+                setSelectedFile(file.name);
+                loop_stop_requested_.store(false);
+                loop_config_ = LoopConfig{};
+                loop_config_.mode = LoopMode::Tx;
+                loop_config_.active = true;
+                loop_owns_radio_.store(true);
+                loop_config_.infinite = infinite;
+                loop_config_.restore_rx_after_completion =
+                    origin == CommandOrigin::Remote && kWirelessControlEnabled && kWirelessControlAutoRx;
+                loop_config_.remaining_iterations = loop_count;
+                loop_config_.file_name = file.name;
+                prepareTransferReport(last_tx_report_, file, manager_.status(), nextTransferId());
+                giveRadio();
+                giveLoop();
+
+                if (infinite) {
+                    std::printf("TX loop active for %s (infinite)\n", file.name.c_str());
+                } else {
+                    std::printf("TX loop active for %s (%u passes)\n",
+                                file.name.c_str(),
+                                static_cast<unsigned>(loop_count));
+                }
+                return true;
+            }
+        }
+
+        // Transmit (TX) either uses the explicitly requested file or the
+        // currently selected default file.
+        const std::string request = words.size() >= 2 ? words[1] : selected_file_;
+        FileInfo file{};
+        if (!resolveFile(request, file)) {
+            std::printf("File '%s' was not found in SPIFFS.\n", request.c_str());
+            return false;
+        }
+
+        FileTypeMetadata::Extension extension{};
+        if (!FileTypeMetadata::derive(file.name, extension)) {
+            std::printf("ERR TX unsupported_file_extension_max10_ASCII_alnum_underscore_hyphen\n");
+            return false;
+        }
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        if (!takeLoop()) {
+            std::printf("Could not start TX right now.\n");
+            return false;
+        }
+
+        if (!takeRadio(pdMS_TO_TICKS(100))) {
+            giveLoop();
+            std::printf("Radio is busy; TX was not queued.\n");
+            return false;
+        }
+        if (power_.radioAvailable()) manager_.refreshSnapshot();
+        setSelectedFile(file.name);
+        loop_stop_requested_.store(false);
+        loop_config_ = LoopConfig{};
+        loop_config_.mode = LoopMode::Tx;
+        loop_config_.active = true;
+                loop_owns_radio_.store(true);
+        loop_config_.infinite = false;
+        loop_config_.restore_rx_after_completion =
+            origin == CommandOrigin::Remote && kWirelessControlEnabled && kWirelessControlAutoRx;
+        loop_config_.remaining_iterations = 1;
+        loop_config_.file_name = file.name;
+        prepareTransferReport(last_tx_report_, file, manager_.status(), nextTransferId());
+        giveRadio();
+        giveLoop();
+
+        std::printf("TX started for %s. Use STOP to abort.\n", file.name.c_str());
+        return true;
+    }
+
+    bool commandRemote(const std::string& line)
+    {
+        if (!kWirelessControlEnabled) {
+            std::printf("REMOTE is disabled in this build. Use the Wi-Fi HTTP endpoints instead.\n");
+            return false;
+        }
+
+        const size_t separator = line.find_first_of(" \t");
+        if (separator == std::string::npos) {
+            std::printf("Usage: REMOTE <command...>\n");
+            return false;
+        }
+
+        const std::string request = trimAscii(line.substr(separator + 1));
+        if (request.empty()) {
+            std::printf("Usage: REMOTE <command...>\n");
+            return false;
+        }
+
+        const std::vector<std::string> request_words = splitWords(request);
+        if (!isRemoteCommandAllowed(request_words)) {
+            std::printf("Remote commands support the full command set except REMOTE.\n");
+            return false;
+        }
+
+        uint8_t packet[AudioPacket::kPacketBytes] = {};
+        size_t packet_len = 0;
+        if (!StreamSync::encodeRemoteCommand(request.c_str(), request.size(), packet, packet_len) ||
+            packet_len != AudioPacket::kPacketBytes) {
+            std::printf("Remote command is too long or has non-ASCII bytes. Limit is %u characters.\n",
+                        static_cast<unsigned>(StreamSync::kRemoteCommandMaxBytes));
+            return false;
+        }
+
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+
+        bool ok = ensureStandbyLocked();
+        if (ok) {
+            ok = sendPayloadWithRetry(manager_, packet, AudioPacket::kPacketBytes);
+        }
+
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        if (!ok) {
+            std::printf("Could not send remote command. state=%s fault=%d\n",
+                        RadioManager::stateName(status.state),
+                        status.last_fault);
+            return false;
+        }
+
+        tryResumeWirelessRx("Remote command transmit complete");
+        std::printf("Sent remote command: %s\n", request.c_str());
+        return true;
+    }
+
+    bool commandText(const std::string& line)
+    {
+        const size_t separator = line.find_first_of(" \t");
+        if (separator == std::string::npos) {
+            std::printf("Usage: TEXT <message>\n");
+            return false;
+        }
+
+        const std::string text = trimAscii(line.substr(separator + 1));
+        if (text.empty() || text.size() > StreamSync::kTextMessageMaxBytes) {
+            std::printf("Text message must be 1-%u printable ASCII characters.\n",
+                        static_cast<unsigned>(StreamSync::kTextMessageMaxBytes));
+            return false;
+        }
+        for (const char ch : text) {
+            const uint8_t byte = static_cast<uint8_t>(ch);
+            if (byte < 0x20 || byte > 0x7E) {
+                std::printf("Text message must contain printable ASCII characters only.\n");
+                return false;
+            }
+        }
+
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+
+        bool sent = ensureStandbyLocked();
+        const uint16_t message_id = static_cast<uint16_t>((esp_random() & 0xFFFFu) | 1u);
+        const size_t chunk_count =
+            (text.size() + StreamSync::kTextChunkMaxBytes - 1) /
+            StreamSync::kTextChunkMaxBytes;
+
+        for (size_t chunk_index = 0; sent && chunk_index < chunk_count; ++chunk_index) {
+            const size_t offset = chunk_index * StreamSync::kTextChunkMaxBytes;
+            const size_t remaining = text.size() - offset;
+            const size_t chunk_len =
+                remaining < StreamSync::kTextChunkMaxBytes
+                    ? remaining
+                    : StreamSync::kTextChunkMaxBytes;
+            uint8_t packet[AudioPacket::kPacketBytes] = {};
+            size_t packet_len = 0;
+            sent = StreamSync::encodeTextChunk(
+                message_id,
+                static_cast<uint8_t>(chunk_index),
+                static_cast<uint8_t>(chunk_count),
+                text.data() + offset,
+                chunk_len,
+                packet,
+                packet_len);
+            if (sent) {
+                sent = sendPayloadWithRetry(manager_, packet, packet_len);
+            }
+            if (sent && chunk_index + 1 < chunk_count) {
+                delayAtLeastMs(3);
+            }
+        }
+
+        bool resumed = true;
+        if (sent && manager_.status().state == RadioState::Standby) {
+            resumed = manager_.enterRx();
+        }
+        if (sent) {
+            ++text_tx_count_;
+        }
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        if (!sent) {
+            std::printf("Could not send text message. state=%s fault=%d\n",
+                        RadioManager::stateName(status.state),
+                        status.last_fault);
+            return false;
+        }
+        if (!resumed) {
+            std::printf("Text was sent, but receive mode could not be restored.\n");
+        }
+        std::printf("TEXT TX: %s\n", text.c_str());
+        return true;
+    }
+
+    bool keyMorseEventsLocked(const std::vector<KeyEvent>& events,
+                              uint8_t channel,
+                              uint8_t power_level,
+                              const std::atomic_bool* stop_requested = nullptr,
+                              std::string_view live_render = {})
+    {
+        if (events.empty()) {
+            return false;
+        }
+
+        const uint8_t rf_power_bits = static_cast<uint8_t>(power_level << 1);
+        size_t render_cursor = 0;
+        const bool show_preview = !live_render.empty();
+        const auto flushPreviewSeparators = [&]() {
+            bool printed = false;
+            while (render_cursor < live_render.size()) {
+                const char ch = live_render[render_cursor];
+                if (ch != ' ' && ch != '/') {
+                    break;
+                }
+
+                std::putchar(ch);
+                ++render_cursor;
+                printed = true;
+            }
+
+            if (printed) {
+                std::fflush(stdout);
+            }
+        };
+        const auto flushPreviewSymbol = [&]() {
+            flushPreviewSeparators();
+            while (render_cursor < live_render.size()) {
+                const char ch = live_render[render_cursor];
+                if (ch != '.' && ch != '-') {
+                    ++render_cursor;
+                    continue;
+                }
+
+                std::putchar(ch);
+                ++render_cursor;
+                std::fflush(stdout);
+                return;
+            }
+        };
+        const auto finishPreview = [&]() {
+            if (!show_preview) {
+                return;
+            }
+
+            flushPreviewSeparators();
+            std::putchar('\n');
+            std::fflush(stdout);
+        };
+
+        if (show_preview) {
+            std::printf("Morse TX: ");
+            std::fflush(stdout);
+        }
+
+        for (const KeyEvent& event : events) {
+            if (stop_requested && stop_requested->load()) {
+                if (manager_.status().state == RadioState::CwTest) {
+                    manager_.stopCw();
+                }
+                finishPreview();
+                return false;
+            }
+
+            bool ok = true;
+
+            if (event.key_down) {
+                if (show_preview) {
+                    flushPreviewSymbol();
+                }
+                ok = manager_.startCw(channel, rf_power_bits);
+            } else if (manager_.status().state == RadioState::CwTest) {
+                if (show_preview) {
+                    flushPreviewSeparators();
+                }
+                ok = manager_.stopCw();
+            }
+
+            if (!ok) {
+                if (manager_.status().state == RadioState::CwTest) {
+                    manager_.stopCw();
+                }
+                finishPreview();
+                return false;
+            }
+
+            if (stop_requested) {
+                if (!waitForLoopStopOrTimeout(event.duration_ms)) {
+                    if (manager_.status().state == RadioState::CwTest) {
+                        manager_.stopCw();
+                    }
+                    finishPreview();
+                    return false;
+                }
+            } else {
+                delayAtLeastMs(event.duration_ms);
+            }
+        }
+
+        if (manager_.status().state == RadioState::CwTest) {
+            const bool ok = manager_.stopCw();
+            finishPreview();
+            return ok;
+        }
+
+        finishPreview();
+        return manager_.status().state == RadioState::Standby;
+    }
+
+    bool commandMorse(const std::string& line, CommandOrigin origin)
+    {
+        const size_t separator = line.find_first_of(" \t");
+        if (separator == std::string::npos) {
+            std::printf("Usage: MORSE <text>\n");
+            return false;
+        }
+
+        const std::string text = trimAscii(line.substr(separator + 1));
+        if (text.empty()) {
+            std::printf("Usage: MORSE <text>\n");
+            return false;
+        }
+
+        const ValidationResult dot_result = Validation::dotTimeMs(kDefaultMorseDotMs);
+        if (!dot_result.ok) {
+            std::printf("Morse timing error: %s\n", dot_result.message);
+            return false;
+        }
+
+        const std::vector<KeyEvent> events = Morse::encode(text, kDefaultMorseDotMs);
+        if (events.empty()) {
+            std::printf("Message had no Morse-supported characters. Use A-Z, 0-9, and spaces.\n");
+            return false;
+        }
+
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        uint8_t channel = 76;
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+        channel = manager_.status().channel;
+        giveRadio();
+
+        if (!takeLoop()) {
+            std::printf("Could not start Morse right now.\n");
+            return false;
+        }
+
+        loop_stop_requested_.store(false);
+        loop_config_ = LoopConfig{};
+        loop_config_.mode = LoopMode::Morse;
+        loop_config_.active = true;
+                loop_owns_radio_.store(true);
+        loop_config_.infinite = false;
+        loop_config_.restore_rx_after_completion =
+            origin == CommandOrigin::Remote && kWirelessControlEnabled && kWirelessControlAutoRx;
+        loop_config_.remaining_iterations = 1;
+        loop_config_.morse_text = text;
+        loop_config_.channel = channel;
+        loop_config_.power_level = kDefaultMorsePowerLevel;
+        last_morse_text_ = text;
+        giveLoop();
+
+        std::printf("Morse started on channel %u at dot=%u ms. Use STOP to abort.\n",
+                    static_cast<unsigned>(channel),
+                    static_cast<unsigned>(kDefaultMorseDotMs));
+        return true;
+    }
+
+    bool commandStop()
+    {
+        const LoopConfig loop = loopSnapshot();
+
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+
+        const RadioStatus before = manager_.status();
+        if (hasActiveIncomingReceiveLocked() || receiver_.resumable())
+            discardIncomingFileTransfer("Operator STOP cancelled active RX");
+        const bool receive_cleanup_ok = !receiver_.cleanupFailed();
+        const bool ok = ensureStandbyLocked() && receive_cleanup_ok;
+        const RadioStatus after = manager_.status();
+        giveRadio();
+
+        if (!ok) {
+            std::printf("Could not stop activity. state=%s fault=%d\n",
+                        RadioManager::stateName(after.state),
+                        after.last_fault);
+            return false;
+        }
+
+        const bool had_activity =
+            loop.active ||
+            before.state == RadioState::Boot ||
+            before.state == RadioState::RxListening ||
+            before.state == RadioState::CwTest ||
+            before.state == RadioState::Sleep ||
+            before.state == RadioState::PowerDown ||
+            before.state == RadioState::TxBusy ||
+            before.state == RadioState::Fault;
+
+        if (had_activity) {
+            std::printf("Stop complete. Radio is in standby.\n");
+        } else {
+            std::printf("Radio is already in standby.\n");
+        }
+
+        return true;
+    }
+
+    bool commandRx()
+    {
+        const bool no_ack = rx_no_ack_requested_;
+        // RX is a persistent listening mode. Repeating it must not leave RX,
+        // close the current partial sink, clear counters, or reset its session.
+        if (!takeRadio(pdMS_TO_TICKS(100))) {
+            std::printf("ERR RX radio_busy_retry\n");
+            return false;
+        }
+        const RadioStatus before = manager_.status();
+        if (host_session_owns_rx_.load() || loop_owns_radio_.load()) {
+            giveRadio();
+            std::printf("ERR RX host_or_loop_active_use_STOP\n");
+            return false;
+        }
+        if (before.state == RadioState::RxListening && no_ack == rx_no_ack_mode_) {
+            giveRadio();
+            std::printf("RX listening on channel %u\n", static_cast<unsigned>(before.channel));
+            return true;
+        }
+        if (hasActiveIncomingReceiveLocked()) {
+            giveRadio();
+            std::printf("ERR RX receive_active_use_STOP\n");
+            return false;
+        }
+        if (!power_.allowRf(monotonicMilliseconds())) {
+            giveRadio();
+            std::printf("ERR RX battery_requires_fresh_quiet_measurement_or_cutoff_reset\n");
+            return false;
+        }
+        // No peer can start a receive while this hardware lock is held. Stop
+        // is deliberately a separate action for queued RF loops/host sessions.
+        if (before.state == RadioState::RxListening && !manager_.leaveRx()) { giveRadio(); return false; }
+        bool ok = !no_ack || manager_.disableAutoAck();
+        if (ok) { rx_no_ack_mode_ = no_ack; ok = startRxLocked(); }
+        const RadioStatus status = manager_.status();
+        giveRadio();
+        if (!ok) {
+            std::printf("ERR RX start_failed_state_%s_fault_%d\n",
+                        RadioManager::stateName(status.state), status.last_fault);
+            return false;
+        }
+        std::printf("RX listening on channel %u\n", static_cast<unsigned>(status.channel));
+        return true;
+    }
+
+    bool commandStandby()
+    {
+        // STANDBY is the "normalize state" command for the operator.
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+
+        const bool ok = ensureStandbyLocked();
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        if (!ok) {
+            std::printf("Could not reach standby. state=%s fault=%d\n",
+                        RadioManager::stateName(status.state),
+                        status.last_fault);
+            return false;
+        }
+
+        std::printf("Radio is in standby on channel %u\n", static_cast<unsigned>(status.channel));
+        return true;
+    }
+
+    bool commandSleep()
+    {
+        // Sleep keeps the radio configuration but requests the chip's lower
+        // power state.
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+
+        bool ok = ensureStandbyLocked();
+        if (ok) {
+            ok = manager_.sleep();
+        }
+
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        if (!ok) {
+            std::printf("Could not enter sleep. state=%s fault=%d\n",
+                        RadioManager::stateName(status.state),
+                        status.last_fault);
+            return false;
+        }
+
+        std::printf("Radio is sleeping.\n");
+        return true;
+    }
+
+    bool commandWake()
+    {
+        // WAKE simply routes through ensureStandbyLocked(), which knows how to
+        // bring sleep or power-down states back to standby.
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+
+        const bool ok = ensureStandbyLocked();
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        if (!ok) {
+            std::printf("Could not wake radio. state=%s fault=%d\n",
+                        RadioManager::stateName(status.state),
+                        status.last_fault);
+            return false;
+        }
+
+        std::printf("Radio is awake in standby.\n");
+        return true;
+    }
+
+    bool commandPowerDown()
+    {
+        // Power-down is a stronger operator action than sleep, but the console
+        // still treats it as another coarse state transition.
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+
+        bool ok = ensureStandbyLocked();
+        if (ok) {
+            ok = manager_.powerDown();
+        }
+
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        if (!ok) {
+            std::printf("Could not power down radio. state=%s fault=%d\n",
+                        RadioManager::stateName(status.state),
+                        status.last_fault);
+            return false;
+        }
+
+        std::printf("Radio is powered down.\n");
+        return true;
+    }
+
+    bool commandChannel(const std::vector<std::string>& words)
+    {
+        // Changing channels is implemented as a full re-boot of the radio so
+        // packet mode returns to a known baseline on the new channel while
+        // preserving the selected TX power level.
+        if (words.size() < 2) {
+            std::printf("Usage: CHANNEL <0-%u>\n", kMaxRadioChannel);
+            return false;
+        }
+
+        uint8_t channel = 0;
+        if (!parseUint8Arg(words[1], 0, kMaxRadioChannel, channel)) {
+            std::printf("Channel must be in the range 0-%u.\n", kMaxRadioChannel);
+            return false;
+        }
+
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+
+        discardIncomingFileTransfer("Discarding partial RX file before channel change");
+        const bool ok = manager_.boot(channel);
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        if (!ok) {
+            std::printf("Could not switch channel. state=%s fault=%d\n",
+                        RadioManager::stateName(status.state),
+                        status.last_fault);
+            return false;
+        }
+
+        std::printf("Radio reinitialized on channel %u\n", static_cast<unsigned>(status.channel));
+        return true;
+    }
+
+    bool commandFem(const std::vector<std::string>& words, CommandOrigin origin)
+    {
+        const std::string action = words.size() == 3 ? uppercaseCopy(words[1]) : "";
+        const std::string value = words.size() == 3 ? uppercaseCopy(words[2]) : "";
+        const bool antenna = action == "ANT" && (value == "1" || value == "2") && hal_.femAntenna();
+        const bool lna = action == "LNA" && (value == "GAIN" || value == "BYPASS") && hal_.femLna();
+        if ((origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth) || (!antenna && !lna)) {
+            std::printf("FEM ERROR requires_supported_board_and_valid_ANT_or_LNA_setting\n");
+            return false;
+        }
+        if (!takeLoop(pdMS_TO_TICKS(50))) {
+            std::printf("FEM ERROR busy\n");
+            return false;
+        }
+        if (!takeRadio(pdMS_TO_TICKS(50))) {
+            giveLoop();
+            std::printf("FEM ERROR busy\n");
+            return false;
+        }
+        const bool idle = !loop_config_.active && !loop_owns_radio_.load() &&
+            manager_.status().state == RadioState::Standby && !hasActiveIncomingReceiveLocked();
+        const bool accepted = idle && (antenna ? hal_.selectFemAntenna(value == "2" ? 2 : 1)
+                                               : hal_.selectFemLna(value == "BYPASS"));
+        giveRadio();
+        giveLoop();
+        std::printf("FEM %s %s %s\n", accepted ? "OK" : "ERROR", action.c_str(), value.c_str());
+        return accepted;
+    }
+
+    bool commandPower(const std::vector<std::string>& words)
+    {
+        if (words.size() < 2) {
+            std::printf("Usage: POWER <0-3>\n");
+            return false;
+        }
+
+        uint8_t power_level = 0;
+        if (!parseUint8Arg(words[1], 0, 3, power_level)) {
+            std::printf("TX power level must be in the range 0-3.\n");
+            return false;
+        }
+
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+
+        bool ok = ensureStandbyLocked();
+        if (ok) {
+            ok = manager_.setPowerLevel(power_level);
+        }
+
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        if (!ok) {
+            std::printf("Could not set TX power. state=%s fault=%d\n",
+                        RadioManager::stateName(status.state),
+                        status.last_fault);
+            return false;
+        }
+
+        std::printf("Packet TX power set to %u on channel %u\n",
+                    static_cast<unsigned>(power_level),
+                    static_cast<unsigned>(status.channel));
+        return true;
+    }
+
+    bool commandCw(const std::vector<std::string>& words)
+    {
+        // Continuous-wave (CW) exposes a simple radio-frequency (RF) test mode
+        // for verifying channel/power output without sending normal packet
+        // payloads.
+        if (words.size() < 2) {
+            std::printf("Usage: CW START [channel] [power0-3] | CW LOOP <on_ms> <off_ms> [channel] [power0-3] [EVERY <loops>]\n");
+            return false;
+        }
+
+        const std::string action = uppercaseCopy(words[1]);
+        if (action == "STOP") {
+            return commandStop();
+        }
+
+        if (action == "LOOP") {
+            if (words.size() < 4) {
+                std::printf("Usage: CW LOOP <on_ms> <off_ms> [channel] [power0-3] [EVERY <loops>]\n");
+                return false;
+            }
+
+            uint32_t on_ms = 0;
+            uint32_t off_ms = 0;
+            if (!parseUint32Arg(words[2], 1, UINT32_MAX, on_ms) ||
+                !parseUint32Arg(words[3], 1, UINT32_MAX, off_ms)) {
+                std::printf("CW loop timings must be positive millisecond values.\n");
+                return false;
+            }
+
+            if (!Validation::cwDurationMs(on_ms).ok || !Validation::cwDurationMs(off_ms).ok) {
+                std::printf("CW loop timings must be greater than zero.\n");
+                return false;
+            }
+
+            uint8_t channel = manager_.status().channel;
+            uint8_t power_level = 3;
+            uint32_t report_every = 0;
+            bool parsed_channel = false;
+            bool parsed_power = false;
+
+            for (size_t i = 4; i < words.size(); ++i) {
+                const std::string token = uppercaseCopy(words[i]);
+                if (token == "EVERY") {
+                    if (i + 1 >= words.size() ||
+                        !parseUint32Arg(words[i + 1], 1, UINT32_MAX, report_every)) {
+                        std::printf("CW loop report interval must be a positive loop count.\n");
+                        return false;
+                    }
+                    ++i;
+                    continue;
+                }
+
+                if (!parsed_channel) {
+                    if (!parseUint8Arg(words[i], 0, kMaxRadioChannel, channel)) {
+                        std::printf("CW channel must be in the range 0-%u.\n", kMaxRadioChannel);
+                        return false;
+                    }
+                    parsed_channel = true;
+                    continue;
+                }
+
+                if (!parsed_power) {
+                    if (!parseUint8Arg(words[i], 0, 3, power_level)) {
+                        std::printf("CW power level must be in the range 0-3.\n");
+                        return false;
+                    }
+                    parsed_power = true;
+                    continue;
+                }
+
+                std::printf("Usage: CW LOOP <on_ms> <off_ms> [channel] [power0-3] [EVERY <loops>]\n");
+                return false;
+            }
+
+            if (!stopLoopAndWait()) {
+                std::printf("Could not stop the current loop cleanly.\n");
+                return false;
+            }
+
+            if (!takeLoop()) {
+                std::printf("Could not start CW loop right now.\n");
+                return false;
+            }
+
+            loop_stop_requested_.store(false);
+            loop_config_ = LoopConfig{};
+            loop_config_.mode = LoopMode::Cw;
+            loop_config_.active = true;
+                loop_owns_radio_.store(true);
+            loop_config_.infinite = true;
+            loop_config_.cw_on_ms = on_ms;
+            loop_config_.cw_off_ms = off_ms;
+            loop_config_.cw_report_every = report_every;
+            loop_config_.channel = channel;
+            loop_config_.power_level = power_level;
+            giveLoop();
+
+            std::printf("CW mode active on channel %u at power level %u (%u ms on, %u ms off)",
+                        static_cast<unsigned>(channel),
+                        static_cast<unsigned>(power_level),
+                        static_cast<unsigned>(on_ms),
+                        static_cast<unsigned>(off_ms));
+            if (report_every > 0) {
+                std::printf(", reporting every %u loops", static_cast<unsigned>(report_every));
+            }
+            std::printf(". Use STOP to abort.\n");
+            return true;
+        }
+
+        if (action != "START") {
+            std::printf("Usage: CW START [channel] [power0-3] | CW LOOP <on_ms> <off_ms> [channel] [power0-3] [EVERY <loops>]\n");
+            return false;
+        }
+
+        if (!stopLoopAndWait()) {
+            std::printf("Could not stop the current loop cleanly.\n");
+            return false;
+        }
+
+        if (!takeRadio()) {
+            std::printf("Radio is busy.\n");
+            return false;
+        }
+
+        // Defaults follow the current configured channel and maximum power so
+        // a bare "CW START" is convenient during bench testing.
+        uint8_t channel = manager_.status().channel;
+        uint8_t power_level = 3;
+
+        if (words.size() >= 3 && !parseUint8Arg(words[2], 0, kMaxRadioChannel, channel)) {
+            giveRadio();
+            std::printf("CW channel must be in the range 0-%u.\n", kMaxRadioChannel);
+            return false;
+        }
+
+        if (words.size() >= 4 && !parseUint8Arg(words[3], 0, 3, power_level)) {
+            giveRadio();
+            std::printf("CW power level must be in the range 0-3.\n");
+            return false;
+        }
+
+        bool ok = ensureStandbyLocked();
+        if (ok) {
+            ok = manager_.startCw(channel, static_cast<uint8_t>(power_level << 1));
+        }
+
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        if (!ok) {
+            std::printf("Could not start CW mode. state=%s fault=%d\n",
+                        RadioManager::stateName(status.state),
+                        status.last_fault);
+            return false;
+        }
+
+        std::printf("CW mode active on channel %u at power level %u. Use STOP to abort.\n",
+                    static_cast<unsigned>(status.channel),
+                    static_cast<unsigned>(power_level));
+        return true;
+    }
+
+    void printCwLoopReport(const LoopConfig& loop, uint32_t completed_iterations)
+    {
+        if (!takeRadio(pdMS_TO_TICKS(50))) {
+            return;
+        }
+
+        if (power_.radioAvailable()) manager_.refreshSnapshot();
+        const RadioStatus status = manager_.status();
+        giveRadio();
+
+        const unsigned channel = static_cast<unsigned>(status.channel);
+        const unsigned power_level = status.power_level >= 0
+            ? static_cast<unsigned>(status.power_level)
+            : static_cast<unsigned>(loop.power_level);
+
+        std::printf("CW mode active on channel %u at power level %u (%u ms on, %u ms off, loop %u)\n",
+                    channel,
+                    power_level,
+                    static_cast<unsigned>(loop.cw_on_ms),
+                    static_cast<unsigned>(loop.cw_off_ms),
+                    static_cast<unsigned>(completed_iterations));
+        std::fflush(stdout);
+    }
+
+    void runTxLoopIteration(const LoopConfig& loop)
+    {
+        if (!takeRadio()) {
+            return;
+        }
+
+        ProtocolTransferReport queued = copyTransferReport(last_tx_report_);
+        if (queued.state != ReliableTransferV2::SenderState::Preparing || loop.file_name != queued.file_name) {
+            size_t bytes = 0;
+            (void)statFileSize(buildFilePath(loop.file_name), bytes);
+            prepareTransferReport(last_tx_report_, FileInfo{loop.file_name, bytes}, manager_.status(), loop.no_ack && loop.completed_iterations ? queued.transfer_id : nextTransferId());
+        }
+        // Keep the requested mode even when battery/radio preparation aborts
+        // before the selected sender has a chance to publish its own report.
+        queued = copyTransferReport(last_tx_report_);
+        queued.no_ack = loop.no_ack;
+        publishTransferReport(last_tx_report_, queued);
+        const bool cutoff = power_.battery(monotonicMilliseconds()).cutoff;
+        bool ok = !cutoff && power_.radioAvailable() && ensureStandbyLocked();
+        RadioStatus status = manager_.status();
+        if (ok) {
+            const std::string path = buildFilePath(loop.file_name);
+            const auto check = power_.supported() ? &DemoConsoleApp::txBatteryCheckEntry : nullptr;
+            ok = loop.no_ack
+                ? sendDataFileNoAck(manager_, path.c_str(), &loop_stop_requested_, &last_tx_report_, check, this, loop.completed_iterations, 3)
+                : sendDataFile(manager_, transfer_service_, path.c_str(), &loop_stop_requested_,
+                               &last_tx_report_, check, this);
+            status = manager_.status();
+        } else {
+            ProtocolTransferReport failed = copyTransferReport(last_tx_report_);
+            failed.state = cutoff ? ReliableTransferV2::SenderState::Cancelled :
+                ReliableTransferV2::SenderState::Failed;
+            failed.error = cutoff ? ProtocolV2::ErrorCode::Cancelled :
+                ProtocolV2::ErrorCode::TransportFailure;
+            failed.radio = status;
+            failed.radio_valid = true;
+            publishTransferReport(last_tx_report_, failed);
+        }
+        giveRadio();
+
+        bool stopped = false;
+        bool restore_rx = false;
+        if (!takeLoop()) {
+            return;
+        }
+
+        stopped = loop_stop_requested_.load();
+        if (loop_config_.active && loop_config_.mode == LoopMode::Tx) {
+            if (ok) {
+                ++loop_config_.completed_iterations;
+                if (!loop_config_.infinite && loop_config_.remaining_iterations > 0) {
+                    --loop_config_.remaining_iterations;
+                }
+            }
+
+            const bool finished = ok && !loop_config_.infinite && loop_config_.remaining_iterations == 0;
+            if (stopped || !ok || finished) {
+                restore_rx = !stopped && loop_config_.restore_rx_after_completion;
+                clearLoopLocked();
+            }
+        }
+        giveLoop();
+
+        if (ok) {
+            ESP_LOGI(TAG, "TX pass complete for %s", loop.file_name.c_str());
+        } else if (stopped) {
+            ESP_LOGI(TAG, "TX stopped for %s", loop.file_name.c_str());
+        }
+
+        if (!ok && !stopped) {
+            ESP_LOGW(TAG, "TX loop stopped, state=%s fault=%d",
+                     RadioManager::stateName(status.state),
+                     status.last_fault);
+        }
+
+        if (restore_rx && power_.radioAvailable() &&
+            !power_.battery(monotonicMilliseconds()).cutoff) {
+            tryResumeWirelessRx("Remote control RX resumed after TX");
+        }
+    }
+
+    void runCwLoopCycle(const LoopConfig& loop)
+    {
+        if (!takeRadio()) {
+            return;
+        }
+
+        bool ok = ensureStandbyLocked();
+        RadioStatus status = manager_.status();
+        if (ok) {
+            ok = manager_.startCw(loop.channel, static_cast<uint8_t>(loop.power_level << 1));
+            status = manager_.status();
+        }
+        giveRadio();
+
+        if (!ok) {
+            if (takeLoop(pdMS_TO_TICKS(50))) {
+                if (loop_config_.active && loop_config_.mode == LoopMode::Cw) {
+                    clearLoopLocked();
+                }
+                giveLoop();
+            }
+            ESP_LOGW(TAG, "CW loop stopped, state=%s fault=%d",
+                     RadioManager::stateName(status.state),
+                     status.last_fault);
+            return;
+        }
+
+        waitForLoopStopOrTimeout(loop.cw_on_ms);
+
+        if (!stopCurrentCwIfNeeded()) {
+            return;
+        }
+
+        const bool stopped = loop_stop_requested_.load();
+        bool should_report = false;
+        uint32_t completed_iterations = 0;
+        if (takeLoop(pdMS_TO_TICKS(50))) {
+            if (loop_config_.active && loop_config_.mode == LoopMode::Cw) {
+                ++loop_config_.completed_iterations;
+                completed_iterations = loop_config_.completed_iterations;
+                should_report =
+                    !stopped &&
+                    loop.cw_report_every > 0 &&
+                    completed_iterations > 0 &&
+                    (completed_iterations % loop.cw_report_every) == 0;
+                if (stopped) {
+                    clearLoopLocked();
+                }
+            }
+            giveLoop();
+        }
+
+        if (stopped) {
+            return;
+        }
+
+        if (should_report) {
+            printCwLoopReport(loop, completed_iterations);
+        }
+
+        waitForLoopStopOrTimeout(loop.cw_off_ms);
+
+        if (loop_stop_requested_.load() && takeLoop(pdMS_TO_TICKS(50))) {
+            if (loop_config_.active && loop_config_.mode == LoopMode::Cw) {
+                clearLoopLocked();
+            }
+            giveLoop();
+        }
+    }
+
+    void runMorseIteration(const LoopConfig& loop)
+    {
+        const std::vector<KeyEvent> events = Morse::encode(loop.morse_text, kDefaultMorseDotMs);
+        const std::string morse_line = Morse::render(loop.morse_text);
+        if (events.empty()) {
+            if (takeLoop()) {
+                if (loop_config_.active && loop_config_.mode == LoopMode::Morse) {
+                    clearLoopLocked();
+                }
+                giveLoop();
+            }
+            return;
+        }
+
+        if (!takeRadio()) {
+            return;
+        }
+
+        bool ok = ensureStandbyLocked();
+        RadioStatus status = manager_.status();
+        if (ok) {
+            ESP_LOGI(TAG, "Starting Morse on channel %u: %s",
+                     static_cast<unsigned>(loop.channel),
+                     loop.morse_text.c_str());
+            ok = keyMorseEventsLocked(events,
+                                      loop.channel,
+                                      loop.power_level,
+                                      &loop_stop_requested_,
+                                      morse_line);
+            status = manager_.status();
+        }
+        giveRadio();
+
+        bool stopped = false;
+        bool restore_rx = false;
+        if (takeLoop()) {
+            stopped = loop_stop_requested_.load();
+            if (loop_config_.active && loop_config_.mode == LoopMode::Morse) {
+                if (ok) {
+                    ++loop_config_.completed_iterations;
+                    if (!loop_config_.infinite && loop_config_.remaining_iterations > 0) {
+                        --loop_config_.remaining_iterations;
+                    }
+                }
+
+                restore_rx = !stopped && loop_config_.restore_rx_after_completion;
+                clearLoopLocked();
+            }
+            giveLoop();
+        }
+
+        if (ok) {
+            ESP_LOGI(TAG, "Morse complete: %s", loop.morse_text.c_str());
+        } else if (stopped) {
+            ESP_LOGI(TAG, "Morse stopped: %s", loop.morse_text.c_str());
+        } else {
+            ESP_LOGW(TAG, "Morse stopped, state=%s fault=%d",
+                     RadioManager::stateName(status.state),
+                     status.last_fault);
+        }
+
+        if (restore_rx) {
+            tryResumeWirelessRx("Remote control RX resumed after Morse");
+        }
+    }
+
+    void loopTask()
+    {
+        while (true) {
+            const LoopConfig loop = loopSnapshot();
+            if (!loop.active) {
+                vTaskDelay(kLoopWorkerPeriod);
+                continue;
+            }
+
+            if (loop.mode == LoopMode::Tx) {
+                runTxLoopIteration(loop);
+                continue;
+            }
+
+            if (loop.mode == LoopMode::Cw) {
+                runCwLoopCycle(loop);
+                continue;
+            }
+
+            if (loop.mode == LoopMode::Morse) {
+                runMorseIteration(loop);
+                continue;
+            }
+
+            vTaskDelay(kLoopWorkerPeriod);
+        }
+    }
+
+    bool sendProtocolResponseLocked(const ProtocolV2::Frame& response)
+    {
+        if (rx_no_ack_mode_) return true;  // All RF response types, including timeout/error, remain silent.
+        if (manager_.status().state != RadioState::RxListening ||
+            !manager_.leaveRx()) {
+            return false;
+        }
+        const bool sent = manager_.sendPayloadAndListen(response.data(), response.size());
+        const bool resumed = manager_.enterRx();
+        return sent && resumed;
+    }
+
+    void processRxPayload(const uint8_t* payload, size_t len)
+    {
+        ProtocolV2::Frame adapted{}; ProtocolV2::Packet one_way{};
+        bool parity=false;
+        if (rx_no_ack_mode_) {
+            if(len!=adapted.size() || (payload[2]!='G' && payload[2]!='P')) {++raw_rx_packet_count_;return;}
+            parity=payload[2]=='P';
+            std::copy_n(payload,len,adapted.data());adapted[2]='N';
+            if (!NoAckTransfer::decode(adapted.data(), len, one_way, adapted) || (parity && one_way.type!=ProtocolV2::PacketType::Data)) { ++raw_rx_packet_count_; return; }
+            payload = adapted.data(); len = adapted.size();
+        }
+        const uint64_t now_ms = monotonicMilliseconds();
+        ProtocolV2::Packet incoming{};
+        const ProtocolV2::DecodeStatus decoded_status =
+            ProtocolV2::decode(payload, len, incoming);
+        const uint32_t expected_before = receiver_.expectedSequence();
+        const bool was_complete = receiver_.complete();
+        ProtocolV2::Frame response{};
+        receiver_.setResumeEnabled(!rx_no_ack_mode_);
+        const ReliableTransferV2::ReceiverEvent event = rx_no_ack_mode_ ? receiver_.onGapPacket(one_way,parity,now_ms,response) : receiver_.onFrame(
+            payload, len, now_ms, response);
+
+        if (decoded_status == ProtocolV2::DecodeStatus::Ok &&
+            incoming.type == ProtocolV2::PacketType::Start &&
+            receiver_.active() &&
+            receiver_.transferId() == incoming.transfer_id &&
+            active_api_receive_id_ != incoming.transfer_id) {
+            active_api_receive_id_ = incoming.transfer_id;
+            transfer_service_.reportReceiveStarted(
+                receiver_.transferId(),
+                receiver_.totalSize(),
+                receiver_.totalPackets(),
+                receiver_.expectedCrc32(),
+                now_ms);
+            transfer_service_.reportReceiveProgress(
+                receiver_.transferId(), receiver_.acceptedBytes(),
+                receiver_.expectedSequence(), now_ms);
+        }
+
+        if (event == ReliableTransferV2::ReceiverEvent::Ignored) {
+            ++raw_rx_packet_count_;
+#if RF3_VERBOSE_RX_LOG
+            ESP_LOGW(TAG,
+                     "RX ignored non-v2/stale frame decode=%u len=%u",
+                     static_cast<unsigned>(decoded_status),
+                     static_cast<unsigned>(len));
+#endif
+            return;
+        }
+
+        if (!sendProtocolResponseLocked(response)) {
+            ESP_LOGW(TAG,
+                     "Protocol v2 response transmit failed transfer=%08lX state=%s",
+                     static_cast<unsigned long>(receiver_.transferId()),
+                     ReliableTransferV2::receiverStateName(receiver_.state()));
+        }
+
+        if (event == ReliableTransferV2::ReceiverEvent::DataAccepted) {
+            ++decoded_rx_packet_count_;
+            transfer_service_.reportReceiveProgress(
+                receiver_.transferId(),
+                receiver_.acceptedBytes(),
+                rx_no_ack_mode_ ? receiver_.acceptedPackets() : incoming.sequence,
+                now_ms);
+#if RF3_VERBOSE_RX_LOG
+            if (incoming.sequence == 0 ||
+                (receiver_.acceptedPackets() % 64u) == 0) {
+                ESP_LOGI(TAG,
+                         "Protocol v2 RX DATA id=%08lX seq=%u bytes=%u total=%lu/%lu",
+                         static_cast<unsigned long>(receiver_.transferId()),
+                         static_cast<unsigned>(incoming.sequence),
+                         static_cast<unsigned>(incoming.payload_length),
+                         static_cast<unsigned long>(receiver_.acceptedBytes()),
+                         static_cast<unsigned long>(receiver_.totalSize()));
+            }
+#endif
+            return;
+        }
+
+        if (event == ReliableTransferV2::ReceiverEvent::Duplicate) {
+            ++raw_rx_packet_count_;
+            ESP_LOGW(TAG,
+                     "Protocol v2 duplicate DATA received id=%08lX seq=%u expected=%lu",
+                     static_cast<unsigned long>(receiver_.transferId()),
+                     static_cast<unsigned>(incoming.sequence),
+                     static_cast<unsigned long>(expected_before));
+            return;
+        }
+
+        if (event == ReliableTransferV2::ReceiverEvent::Completed) {
+            if (!was_complete) {
+                ++saved_rx_file_count_;
+                saved_rx_byte_count_ += receiver_.acceptedBytes();
+                last_saved_rx_file_ = incoming_file_.final_name;
+                ESP_LOGI(TAG,
+                         "Protocol v2 verified and published %s id=%08lX bytes=%lu packets=%lu crc32=%08lX",
+                         incoming_file_.final_name.c_str(),
+                         static_cast<unsigned long>(receiver_.transferId()),
+                         static_cast<unsigned long>(receiver_.acceptedBytes()),
+                         static_cast<unsigned long>(receiver_.acceptedPackets()),
+                         static_cast<unsigned long>(receiver_.calculatedCrc32()));
+                transfer_service_.reportReceiveCompleted(
+                    receiver_.transferId(),
+                    buildFilePath(incoming_file_.final_name),
+                    now_ms);
+                active_api_receive_id_ = 0;
+            }
+            return;
+        }
+
+        ++raw_rx_packet_count_;
+        if (event == ReliableTransferV2::ReceiverEvent::ResponseReady) {
+            if (decoded_status == ProtocolV2::DecodeStatus::Ok &&
+                incoming.type == ProtocolV2::PacketType::Data &&
+                static_cast<uint32_t>(incoming.sequence) > expected_before) {
+                missing_rx_packet_count_ +=
+                    static_cast<uint32_t>(incoming.sequence) - expected_before;
+            }
+#if RF3_VERBOSE_RX_LOG
+            ESP_LOGI(TAG,
+                     "Protocol v2 RX control id=%08lX type=%s state=%s expected=%lu",
+                     static_cast<unsigned long>(receiver_.transferId()),
+                     decoded_status == ProtocolV2::DecodeStatus::Ok
+                         ? ProtocolV2::packetTypeName(incoming.type) : "INVALID",
+                     ReliableTransferV2::receiverStateName(receiver_.state()),
+                     static_cast<unsigned long>(receiver_.expectedSequence()));
+#endif
+            return;
+        }
+
+        ESP_LOGE(TAG,
+                 "Protocol v2 RX terminal event=%u id=%08lX state=%s error=%s bytes=%lu/%lu seq=%lu cleanup_failed=%s",
+                 static_cast<unsigned>(event),
+                 static_cast<unsigned long>(receiver_.transferId()),
+                 ReliableTransferV2::receiverStateName(receiver_.state()),
+                 ProtocolV2::errorName(receiver_.error()),
+                 static_cast<unsigned long>(receiver_.acceptedBytes()),
+                 static_cast<unsigned long>(receiver_.totalSize()),
+                 static_cast<unsigned long>(receiver_.expectedSequence()),
+                  receiver_.cleanupFailed() ? "true" : "false");
+        transfer_service_.reportReceiveFailed(
+            receiver_.transferId(), receiver_.error(), now_ms);
+        active_api_receive_id_ = 0;
+    }
+
+    static bool txBatteryCheckEntry(void* context)
+    {
+        auto* app = static_cast<DemoConsoleApp*>(context);
+        return app->serviceBatteryLocked(monotonicMilliseconds(), true);
+    }
+
+    void announceBatteryCutoff()
+    {
+        constexpr std::string_view event =
+            "BATTERY SHUTOFF turn_physical_power_boot_switch_OFF_connect_charged_replacement_source\r\n";
+        // STATUS uses several writes. Start a line even if a concurrent
+        // console response has written a fragment without its terminator.
+        std::printf("\n%.*s\n", static_cast<int>(event.size() - 2), event.data());
+        std::fflush(stdout);
+        // Queue the warning before power removal. Actual delivery depends on
+        // the link and the ESP32 remaining powered long enough.
+        (void)sendBluetoothText(event);
+    }
+
+    void applyBatteryCutoffLocked(uint64_t now)
+    {
+        if (power_.requestCutoff()) {
+            announceBatteryCutoff();
+            loop_stop_requested_.store(true);
+            discardIncomingFileTransfer("Battery cutoff discarded incomplete RX");
+        }
+        if (power_.radioAvailable()) (void)manager_.powerDown();
+        (void)hal_.setSignalOutputsEnabled(false);
+        const bool outputs_low = power_.applyCutoff(now);
+        if (!outputs_low) ESP_LOGW(TAG, "Battery cutoff could not request the configured enables LOW");
+    }
+
+    // Caller owns radio_mutex_ from classifying the RF state through sampling
+    // and, for a scheduled check, through any standby and resume transitions.
+    bool serviceBatteryLocked(uint64_t now, bool file_tx)
+    {
+        const auto battery = power_.battery(now);
+        if (battery.cutoff && (power_.powerGood() || power_.radioAvailable() || !battery.persisted)) {
+            applyBatteryCutoffLocked(now);
+            return false;
+        }
+        if (file_tx && battery.cutoff) return false;
+
+        const RadioState state = manager_.status().state;
+        const bool quiet_radio = !hal_.ceAsserted() &&
+            (state == RadioState::Standby || state == RadioState::Sleep ||
+             state == RadioState::PowerDown || state == RadioState::Fault);
+        const bool listening = state == RadioState::RxListening &&
+            !receiveWorkerPaused() && !loop_owns_radio_.load();
+        if (((file_tx && state == RadioState::Standby && quiet_radio) || listening) &&
+            power_.activeCheckDue(now)) {
+            (void)power_.poll(now, false);
+            if (listening && !manager_.leaveRx()) {
+                power_.endActiveCheck(now);
+                return true;
+            }
+
+            constexpr uint32_t pause_ms = 7500;
+            const uint32_t serial = power_.readingSerial();
+            const uint64_t deadline = now + pause_ms;
+            // Finish the check after one fresh average, a stop, or the
+            // deadline. Leave time for RF to progress between low checks.
+            for (uint64_t sample_ms = now; sample_ms < deadline;
+                 sample_ms = monotonicMilliseconds()) {
+                if (file_tx && loop_stop_requested_.load()) break;
+                if (power_.poll(sample_ms, !hal_.ceAsserted(), hal_.lastRadioActivityMs(), true)) {
+                    power_.endActiveCheck(sample_ms);
+                    applyBatteryCutoffLocked(sample_ms);
+                    return false;
+                }
+                if (power_.readingSerial() != serial) break;
+                delayAtLeastMs(static_cast<uint32_t>(std::min<uint64_t>(25, deadline - sample_ms)));
+            }
+            power_.endActiveCheck(monotonicMilliseconds());
+            // Reenter RX without resetting the receiver or its partial file.
+            if (listening) (void)manager_.enterRx();
+            return true;
+        }
+
+        if (!file_tx) {
+            const bool quiet = quiet_radio && !loop_owns_radio_.load() &&
+                !hasActiveIncomingReceiveLocked();
+            const unsigned context = (static_cast<unsigned>(state) << 1) | power_.radioAvailable();
+            if (power_.poll(now, quiet, hal_.lastRadioActivityMs(), false, context)) {
+                applyBatteryCutoffLocked(now);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void serviceBatteryOnce()
+    {
+        if (!power_.supported() || !takeRadio(pdMS_TO_TICKS(10))) return;
+        (void)serviceBatteryLocked(monotonicMilliseconds(), false);
+        giveRadio();
+    }
+
+    void rxTask()
+    {
+        // This background task is intentionally conservative:
+        // - it tries to grab the mutex briefly
+        // - it only touches the radio when receive (RX) mode is active
+        // - it drains any queued packets before releasing the radio again
+        // - it saves accepted payload streams into SPIFFS as completed files
+        std::array<uint8_t, AudioPacket::kPacketBytes> payload{};
+        int64_t previous_poll_us = 0;
+
+        while (true) {
+            std::string remote_command;
+            std::vector<std::string> received_texts;
+
+            if (takeRadio(pdMS_TO_TICKS(10))) {
+                if (receiveWorkerPaused()) {
+                    previous_poll_us = 0;
+                    giveRadio();
+                    vTaskDelay(kRxPollPeriod);
+                    continue;
+                }
+                if (manager_.status().state == RadioState::RxListening) {
+                    const int64_t poll_us = esp_timer_get_time();
+                    if (previous_poll_us != 0)
+                        RuntimeDiagnostics::global().rx_poll.record(static_cast<uint64_t>(poll_us - previous_poll_us));
+                    previous_poll_us = poll_us;
+                    if (power_.radioAvailable()) manager_.refreshSnapshot();
+                    const RadioStatus snapshot = manager_.status();
+
+                    if (snapshot.carrier_detected && !last_carrier_detected_) {
+                        ++carrier_event_count_;
+                    }
+                    last_carrier_detected_ = snapshot.carrier_detected;
+
+                    const RxDrain::DrainResult drain_result = RxDrain::drainPending(
+                        [&]() {
+                            return manager_.hasPendingRx();
+                        },
+                        [&]() {
+                            size_t out_len = 0;
+                            if (manager_.receivePayload(payload.data(), payload.size(), out_len)) {
+                                if (rx_no_ack_mode_) {
+                                    processRxPayload(payload.data(), out_len);
+                                    return RxDrain::StepResult::Processed;
+                                }
+                                std::string_view completed_text;
+                                const StreamSync::TextMessageAssembler::Action text_action =
+                                    text_message_assembler_.accept(
+                                        payload.data(), out_len, completed_text);
+                                if (text_action !=
+                                    StreamSync::TextMessageAssembler::Action::NotText) {
+                                    if (text_action ==
+                                        StreamSync::TextMessageAssembler::Action::Complete) {
+                                        received_texts.emplace_back(
+                                            completed_text.data(), completed_text.size());
+                                        ++text_rx_count_;
+                                    } else if (text_action ==
+                                               StreamSync::TextMessageAssembler::Action::Invalid) {
+                                        ESP_LOGW(TAG, "Discarded malformed live-text frame");
+                                    }
+                                    return RxDrain::StepResult::Processed;
+                                }
+
+                                std::string_view remote_view;
+                                if (kWirelessControlEnabled &&
+                                    StreamSync::decodeRemoteCommand(payload.data(), out_len, remote_view)) {
+                                    remote_command.assign(remote_view.data(), remote_view.size());
+                                    return RxDrain::StepResult::Stop;
+                                }
+
+                                processRxPayload(payload.data(), out_len);
+                                return RxDrain::StepResult::Processed;
+                            }
+
+                            const RadioStatus status = manager_.status();
+                            ESP_LOGW(TAG, "RX read failed, state=%s fault=%d",
+                                     RadioManager::stateName(status.state),
+                                     status.last_fault);
+                            return RxDrain::StepResult::Failed;
+                        },
+                        RxDrain::kDefaultMaxPacketsPerPoll);
+
+                    if (drain_result.guard_exhausted) {
+                        ESP_LOGW(TAG,
+                                 "RX drain guard hit after %u packets",
+                                 static_cast<unsigned>(drain_result.processed));
+                    }
+                } else {
+                    previous_poll_us = 0;
+                    last_carrier_detected_ = false;
+                }
+
+                ProtocolV2::Frame timeout_response{};
+                if (receiver_.tick(monotonicMilliseconds(), timeout_response) ==
+                    ReliableTransferV2::ReceiverEvent::TimedOut) {
+                    transfer_service_.reportReceiveFailed(
+                        receiver_.transferId(),
+                        receiver_.error(),
+                        monotonicMilliseconds());
+                    active_api_receive_id_ = 0;
+                    (void)sendProtocolResponseLocked(timeout_response);
+                    ESP_LOGE(TAG,
+                             "Protocol v2 RX timed out transfer=%08lX after %lu ms cleanup_failed=%s",
+                             static_cast<unsigned long>(receiver_.transferId()),
+                             static_cast<unsigned long>(receiver_.timeoutMs()),
+                             receiver_.cleanupFailed() ? "true" : "false");
+                }
+                giveRadio();
+            }
+
+            if (!remote_command.empty()) {
+                ESP_LOGI(TAG, "RX remote command: %s", remote_command.c_str());
+                dispatchCommand(remote_command, CommandOrigin::Remote);
+            }
+
+            for (const std::string& text : received_texts) {
+                std::printf("TEXT RX: %s\n", text.c_str());
+                std::fflush(stdout);
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+                sendBluetoothText("TEXT RX: " + text + "\r\n");
+#endif
+            }
+
+            vTaskDelay(kRxPollPeriod);
+        }
+    }
+
+    bool hasActiveIncomingReceiveLocked() const
+    {
+        return receiver_.active() || incoming_file_.file != nullptr || active_api_receive_id_ != 0;
+    }
+
+    bool receiveWorkerPaused() const
+    {
+        return receive_mutation_reserved_.load() || host_session_owns_rx_.load() || loop_owns_radio_.load();
+    }
+
+    bool beginReceiveMutation(const std::vector<std::string>& words, CommandOrigin origin)
+    {
+        const char* reason = "radio_busy_retry";
+        if (takeRadio(pdMS_TO_TICKS(100))) {
+            const bool receiving = hasActiveIncomingReceiveLocked();
+            if (!receiving) receive_mutation_reserved_.store(true);
+            giveRadio();
+            if (!receiving) return true;
+            reason = "receive_active_use_STOP_to_cancel";
+        }
+        const std::string command = uppercaseCopy(words.front());
+        if (command == "UPLOAD" || command == "DOWNLOAD") {
+            emitHostTransferResponse(origin, command + " ERROR " + reason);
+        } else if (command == "STORAGE") {
+            emitHostTransferResponse(origin, HostStorageProtocol::error(reason));
+        } else if (command == "SELECTHEX" || (command == "TXHEX" || command == "TXNOACKHEX")) {
+            emitHostTransferResponse(origin, "ERR " + command +
+                (words.size() > 1 ? " " + words[1] : "") + " " + reason);
+        } else {
+            // USB receives this correlated error; SPP's existing command reply
+            // emits the matching ERR command and the intact receiver snapshot.
+            std::printf("ERR %s %s\n", command.c_str(), reason);
+        }
+        return false;
+    }
+
+    bool commandNrfRail(const std::vector<std::string>& words, CommandOrigin origin)
+    {
+        // Local USB / Bluetooth SPP board control only; never an over-air REMOTE
+        // operation. GPIO21 is a logic request to an external rail switch.
+        if (!power_.hasNrfRailControl()) {
+            std::printf("NRFRAIL ERROR no_independent_rail_control\n");
+            return false;
+        }
+        if ((origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth) ||
+            words.size() != 2 || (uppercaseCopy(words[1]) != "ON" && uppercaseCopy(words[1]) != "OFF")) {
+            std::printf("NRFRAIL ERROR use_ON_or_OFF_on_devboard_USB_or_Bluetooth\n");
+            return false;
+        }
+        if (host_upload_.active || host_download_.active || isLoopActive() || !takeRadio()) {
+            std::printf("NRFRAIL ERROR busy\n");
+            return false;
+        }
+        const auto status = manager_.status();
+        if (hasActiveIncomingReceiveLocked() || status.state == RadioState::RxListening || status.state == RadioState::TxBusy ||
+            status.state == RadioState::CwTest) {
+            giveRadio();
+            std::printf("NRFRAIL ERROR stop_radio_activity_first\n");
+            return false;
+        }
+        const bool enabled = uppercaseCopy(words[1]) == "ON";
+        bool ok = true;
+        if (enabled != power_.nrfRail()) {
+            if (enabled) {
+                ok = power_.setNrfRail(true);
+                if (ok) {
+                    delayAtLeastMs(10); // External rail settling + nRF startup guard.
+                    ok = hal_.setSignalOutputsEnabled(true);
+                    if (ok) (void)manager_.boot(status.channel);
+                    if (!ok) {
+                        (void)hal_.setSignalOutputsEnabled(false);
+                        (void)power_.setNrfRail(false);
+                    }
+                    // A missing radio is reported separately; rail HIGH is not proof of power-good.
+                }
+            } else {
+                ok = manager_.powerDown();
+                if (ok) ok = hal_.setSignalOutputsEnabled(false);
+                if (ok) ok = power_.setNrfRail(false);
+                if (!ok) (void)hal_.setSignalOutputsEnabled(true);
+            }
+        }
+        giveRadio();
+        std::printf("NRFRAIL %s %s\n", ok ? "OK" : "ERROR", enabled ? "ON" : "OFF");
+        return ok;
+    }
+
+    bool handleCommand(const std::string& line, CommandOrigin origin)
+    {
+        // Command dispatch is a simple keyword router. Each handler owns its
+        // own validation and user-facing error messages.
+        const std::vector<std::string> words = splitWords(line);
+        if (words.empty()) {
+            return true;
+        }
+
+        if (origin == CommandOrigin::Remote && !isRemoteCommandAllowed(words)) {
+            std::printf("Remote command '%s' is not supported.\n", words.front().c_str());
+            return false;
+        }
+
+        const std::string command = uppercaseCopy(words.front());
+        const std::string action = words.size() > 1 ? uppercaseCopy(words[1]) : "";
+        HostRxCommandGuard::Reservation reservation;
+        if (HostRxCommandGuard::needsReservation(command, action)) {
+            if (!beginReceiveMutation(words, origin)) return false;
+            reservation.acquired(receive_mutation_reserved_);
+        }
+        if (command == "FEM") return commandFem(words, origin);
+        if (command == "NRFRAIL") return commandNrfRail(words, origin);
+        if (command == "BATTERY") {
+            if (!power_.supported() || (origin!=CommandOrigin::Local && origin!=CommandOrigin::Bluetooth) ||
+                words.size()!=2 || action!="RESET" || !takeRadio(pdMS_TO_TICKS(50))) {
+                std::printf("BATTERY ERROR reset_requires_local_battery_control_and_idle_radio\n");
+                return false;
+            }
+            const bool reset = power_.resetCutoff(monotonicMilliseconds());
+            if (reset && !power_.hasNrfRailControl()) {
+                // On the old PCB GPIO15 is the only external power control.
+                // Restore the SPI outputs after power has had time to settle.
+                delayAtLeastMs(10);
+                if (!hal_.setSignalOutputsEnabled(true)) {
+                    applyBatteryCutoffLocked(monotonicMilliseconds());
+                    giveRadio();
+                    std::printf("BATTERY ERROR RESET radio_outputs_unavailable\n");
+                    return false;
+                }
+                (void)manager_.boot(manager_.status().channel);
+            }
+            giveRadio();
+            const char* detail = !reset ? " requires_fresh_quiet_pack_at_least_21V" :
+                power_.hasNrfRailControl() ? " nRF_rail_remains_OFF" : "";
+            std::printf("BATTERY %s RESET%s\n", reset ? "OK" : "ERROR", detail);
+            return reset;
+        }
+        const bool rf_command = command == "TX" || command == "TXNOACK" || command == "TXHEX" ||
+            command == "TXNOACKHEX" || command == "RX" || command == "RXNOACK" || command == "MORSE" ||
+            command == "REMOTE" || command == "TEXT" || command == "CW" || command == "CHANNEL" ||
+            command == "POWER" || command == "POWERDOWN" || command == "STANDBY" ||
+            command == "SLEEP" || command == "WAKE";
+        const bool rf_start=command=="TX" || command=="TXNOACK" || command=="TXHEX" ||
+            command=="TXNOACKHEX" || command=="TEXT" ||
+            command=="REMOTE" || command=="MORSE" || (command=="CW" && action!="STOP");
+        if (rf_start && !power_.allowRf(monotonicMilliseconds())) {
+            std::printf("ERR %s battery_requires_fresh_quiet_measurement_or_cutoff_reset\n",command.c_str());
+            return false;
+        }
+        if (!power_.radioAvailable() && rf_command) {
+            std::printf("ERR %s %s\n", command.c_str(), power_.hasNrfRailControl()
+                ? "nrf_rail_off_use_NRFRAIL_ON" : "battery_cutoff_requires_BATTERY_RESET");
+            return false;
+        }
+        if (command == "ECHO") {
+            const size_t separator = line.find_first_of(" \t");
+            const std::string text = separator == std::string::npos
+                ? std::string() : trimAscii(line.substr(separator + 1));
+            std::string response;
+            const bool accepted = HostTransferGuard::buildLocalEcho(
+                HardwareProfile::kSelectedId == HardwareProfile::Id::Esp32Devboard,
+                test_mode_.load(),
+                origin == CommandOrigin::Local || origin == CommandOrigin::Bluetooth,
+                text, StreamSync::kTextMessageMaxBytes, response);
+            // A distinct host command prevents a delayed echo request from
+            // becoming an RF TEXT transmission if test mode changes meanwhile.
+            emitHostTransferResponse(origin, accepted ? response :
+                "ECHO ERROR requires_devboard_test_mode_and_1_to_154_printable_ASCII");
+            return accepted;
+        }
+        if (command == "TESTMODE") {
+            if (HardwareProfile::kSelectedId != HardwareProfile::Id::Esp32Devboard ||
+                (origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth) ||
+                words.size() != 2 ||
+                (uppercaseCopy(words[1]) != "ON" && uppercaseCopy(words[1]) != "OFF")) {
+                std::printf("Usage: TESTMODE ON|OFF (devboard USB/Bluetooth only).\n");
+                return false;
+            }
+            const bool enable = uppercaseCopy(words[1]) == "ON";
+            if (enable && !test_mode_) {
+                if (!stopLoopAndWait()) {
+                    std::printf("Could not stop radio activity before test mode.\n");
+                    return false;
+                }
+                if (!takeRadio()) {
+                    std::printf("Could not acquire radio before test mode.\n");
+                    return false;
+                }
+                const RadioState state = manager_.status().state;
+                const bool stopped = state == RadioState::CwTest ? manager_.stopCw() :
+                                     state == RadioState::RxListening ? manager_.leaveRx() : true;
+                if (stopped) {
+                    test_mode_ = true;
+                }
+                giveRadio();
+                if (!stopped) {
+                    std::printf("Could not stop radio activity before test mode.\n");
+                    return false;
+                }
+            }
+            if (!enable) {
+                test_mode_ = false;
+            }
+            if (!enable) {
+                test_tx_count_ = 0;
+                test_tx_bytes_ = 0;
+            }
+            std::printf("Test mode %s; RF commands %s.\n",
+                        enable ? "enabled" : "disabled",
+                        enable ? "blocked" : "available");
+            return true;
+        }
+        if (command == "TESTTX") {
+            uint32_t bytes = 0;
+            if (!test_mode_ ||
+                (origin != CommandOrigin::Local && origin != CommandOrigin::Bluetooth)) {
+                std::printf("TESTTX requires devboard test mode over USB or Bluetooth.\n");
+                return false;
+            }
+            if (words.size() != 2 ||
+                !parseUint32Arg(words[1], 0, ProtocolV2::kMaxFileSize, bytes)) {
+                std::printf("Usage: TESTTX <bytes> (0 to Protocol v2 file limit).\n");
+                return false;
+            }
+            test_tx_bytes_ = bytes;
+            ++test_tx_count_;
+            std::printf("TESTTX accepted bytes=%lu count=%lu (simulated; no nRF24 TX).\n",
+                        static_cast<unsigned long>(bytes),
+                        static_cast<unsigned long>(test_tx_count_));
+            return true;
+        }
+        if (command == "UPLOAD") {
+            return commandUpload(words, origin);
+        }
+        if (command == "DOWNLOAD") {
+            return commandDownload(words, origin);
+        }
+        if (command == "STORAGE") {
+            return commandStorage(words, origin);
+        }
+        if (command == "SELECTHEX" || (command == "TXHEX" || command == "TXNOACKHEX")) {
+            return commandStoredName(words, origin);
+        }
+        if (test_mode_) {
+            if (command == "STATUS") {
+                printStatus();
+                if (origin == CommandOrigin::Local) std::printf("%s\n", buildStatusJson().c_str());
+                return true;
+            }
+            if (command == "HELP" || command == "?") {
+                printHelp();
+                return true;
+            }
+            std::printf("Test mode blocks RF command '%s'.\n", words.front().c_str());
+            return false;
+        }
+        if (command == "HELP" || command == "?") {
+            printHelp();
+            return true;
+        }
+        if (command == "STOP") {
+            return commandStop();
+        }
+        if (command == "STATUS") {
+            printStatus();
+            if (origin == CommandOrigin::Local) std::printf("%s\n", buildStatusJson().c_str());
+            return true;
+        }
+        if (command == "FILES" || command == "LS") {
+            return commandFiles();
+        }
+        if (command == "SELECT") {
+            return commandSelect(words);
+        }
+        if (command == "TX") {
+            return commandTx(words, origin);
+        }
+        if (command == "TEXT") {
+            return commandText(line);
+        }
+        if (command == "MORSE") {
+            return commandMorse(line, origin);
+        }
+        if (command == "REMOTE") {
+            return commandRemote(line);
+        }
+        if (command == "RX" || command == "RXNOACK") {
+            rx_no_ack_requested_ = command == "RXNOACK";
+            const bool accepted = commandRx();
+            if (command == "RXNOACK" && origin == CommandOrigin::Local)
+                std::printf("%s RXNOACK\n", accepted ? "OK" : "ERR");
+            return accepted;
+        }
+        if (command == "STANDBY") {
+            return commandStandby();
+        }
+        if (command == "SLEEP") {
+            return commandSleep();
+        }
+        if (command == "WAKE") {
+            return commandWake();
+        }
+        if (command == "POWERDOWN") {
+            return commandPowerDown();
+        }
+        if (command == "CHANNEL") {
+            return commandChannel(words);
+        }
+        if (command == "POWER") {
+            return commandPower(words);
+        }
+        if (command == "CW") {
+            return commandCw(words);
+        }
+
+        std::printf("Unknown command '%s'. Type HELP for the list.\n", words.front().c_str());
+        return false;
+    }
+
+    bool dispatchCommand(const std::string& line, CommandOrigin origin, uint32_t epoch = 0)
+    {
+        // Establish the PC-to-ESP link even while an RF command owns the
+        // command/radio mutexes. Identity is immutable build information.
+        const auto identity_words = splitWords(line);
+        if ((origin == CommandOrigin::Local || origin == CommandOrigin::Bluetooth) &&
+            identity_words.size() == 1 && (uppercaseCopy(identity_words.front()) == "HELLO" ||
+                                         uppercaseCopy(identity_words.front()) == "DIAG")) {
+            const bool diagnostics = uppercaseCopy(identity_words.front()) == "DIAG";
+            const std::string response = diagnostics
+                ? RuntimeDiagnostics::json(RuntimeDiagnostics::global(), HardwareProfile::kSelectedName,
+                                           configTICK_RATE_HZ)
+                : HostConnectionProtocol::hello(WifiControlConfig::kNodeName, HardwareProfile::kSelectedName,
+                                               ProtocolV2::kVersion, true, RuntimeDiagnostics::kBuild);
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+            if (origin == CommandOrigin::Bluetooth) {
+                if (!bluetooth_client_connected_.load() || epoch != bluetooth_epoch_.load()) {
+                    return false;
+                }
+                if (diagnostics && !sendBluetoothText("OK DIAG\r\n", epoch)) return false;
+                return sendBluetoothText(response + "\r\n", epoch);
+            }
+#endif
+            if (diagnostics) std::printf("OK DIAG\n");
+            std::printf("%s\n", response.c_str());
+            std::fflush(stdout);
+            return true;
+        }
+        if (!takeCommand(pdMS_TO_TICKS(500))) {
+            if ((origin == CommandOrigin::Local || origin == CommandOrigin::Bluetooth) &&
+                !identity_words.empty() &&
+                (uppercaseCopy(identity_words.front()) == "SELECTHEX" || (uppercaseCopy(identity_words.front()) == "TXHEX" || uppercaseCopy(identity_words.front()) == "TXNOACKHEX"))) {
+                const std::string response = "ERR " + uppercaseCopy(identity_words.front()) +
+                    (identity_words.size() > 1 ? " " + identity_words[1] : "") + " command_busy_retry";
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+                if (origin == CommandOrigin::Bluetooth) {
+                    if (bluetooth_client_connected_.load() && epoch == bluetooth_epoch_.load())
+                        sendBluetoothText(response + "\r\n", epoch);
+                } else
+#endif
+                {
+                    std::printf("%s\n", response.c_str());
+                    std::fflush(stdout);
+                }
+                return false;
+            }
+            if ((origin == CommandOrigin::Local || origin == CommandOrigin::Bluetooth) &&
+                !identity_words.empty() && uppercaseCopy(identity_words.front()) == "STORAGE") {
+                const std::string response = HostStorageProtocol::error("command_busy_retry");
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+                if (origin == CommandOrigin::Bluetooth) {
+                    if (bluetooth_client_connected_.load() && epoch == bluetooth_epoch_.load()) {
+                        sendBluetoothText(response + "\r\n", epoch);
+                    }
+                } else
+#endif
+                {
+                    std::printf("%s\n", response.c_str());
+                    std::fflush(stdout);
+                }
+                return false;
+            }
+            if (origin == CommandOrigin::Remote) {
+                ESP_LOGW(TAG, "Dropping remote command while another command is active: %s", line.c_str());
+            } else {
+                std::printf("Command system is busy.\n");
+            }
+            return false;
+        }
+
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+        if (origin == CommandOrigin::Bluetooth) {
+            if (!bluetooth_client_connected_.load() || epoch != bluetooth_epoch_.load()) {
+                giveCommand();
+                return false;
+            }
+            bluetooth_dispatch_epoch_ = epoch;
+        }
+#else
+        (void)epoch;
+#endif
+        expireHostSessions();
+        const bool ok = handleCommand(line, origin);
+        if (ok && origin == CommandOrigin::Remote) {
+            tryResumeWirelessRx("Remote control RX resumed");
+        }
+        giveCommand();
+        return ok;
+    }
+
+    RadioManager& manager_;
+    DevboardPower::Controller& power_;
+    Esp32Nrf24Hal& hal_;
+    FileTransfer::Service transfer_service_;  // Subsystem-facing Protocol v2 transfer API.
+    SemaphoreHandle_t status_mutex_ = nullptr;  // Only serializes status/cache string ownership.
+    HttpStatusSnapshot cached_host_status_{};
+    char selected_status_name_[HostStorageProtocol::kFilenameMaxBytes + 1]{};
+    SemaphoreHandle_t radio_mutex_ = nullptr;  // Serializes all radio access.
+    TaskHandle_t rx_task_ = nullptr;           // Background receive (RX) polling task.
+    SemaphoreHandle_t loop_mutex_ = nullptr;   // Guards background TX/CW loop configuration.
+    TaskHandle_t loop_task_ = nullptr;         // Background TX/CW loop worker.
+    TaskHandle_t wifi_control_task_ = nullptr; // Starts HTTP control off the event-task stack.
+    SemaphoreHandle_t command_mutex_ = nullptr;  // Serializes local and remote command dispatch.
+    std::string selected_file_ = kDefaultFile;  // Default file used by transmit (TX).
+    std::string last_morse_text_;              // Most recent MORSE text for STATUS output.
+    bool last_carrier_detected_ = false;      // Edge detector for RPD logging while in RX.
+    uint32_t carrier_event_count_ = 0;        // Number of distinct RPD-high events seen while listening.
+    IncomingFileStorage incoming_file_{};     // SPIFFS adapter state for the current RX partial file.
+    bool rx_no_ack_requested_ = false;
+    bool rx_no_ack_mode_ = false;
+    ReliableTransferV2::ReceiverSession receiver_;  // Verified Protocol v2 RX session.
+    uint32_t active_api_receive_id_ = 0;       // Receiver transfer mirrored into the subsystem API.
+    ProtocolTransferReport last_tx_report_{}; // Last reliable sender state for STATUS.
+    HostUploadStorage host_upload_{};         // Current PC-to-SPIFFS staged upload.
+    HostDownloadStorage host_download_{};     // Current SPIFFS-to-PC export session.
+    std::atomic_bool receive_mutation_reserved_{false};  // Acquired under radio, released after command.
+    std::atomic_bool host_session_owns_rx_{false};      // Holds RX-start exclusion across host chunks.
+    std::atomic_bool loop_owns_radio_{false};           // Holds RX-start exclusion until queued worker clears.
+    std::atomic_bool test_mode_{false};
+    std::atomic<uint32_t> test_tx_count_{0};
+    std::atomic<uint32_t> test_tx_bytes_{0};
+    std::atomic<uint32_t> text_tx_count_{0};
+    std::atomic<uint32_t> text_rx_count_{0};
+    StreamSync::TextMessageAssembler text_message_assembler_{};
+    uint32_t decoded_rx_packet_count_ = 0;    // Payloads accepted as in-order stream data.
+    uint32_t raw_rx_packet_count_ = 0;        // Payloads that were received but not accepted as stream data.
+    uint32_t missing_rx_packet_count_ = 0;    // Sequence slots skipped by tolerated forward gaps.
+    uint32_t saved_rx_file_count_ = 0;        // Completed files written to SPIFFS in the current RX session.
+    uint32_t saved_rx_byte_count_ = 0;        // Total bytes written across saved RX files in the current RX session.
+    std::string last_saved_rx_file_;          // Most recent completed RX file name under /spiffs.
+    LoopConfig loop_config_{};
+    std::atomic_bool loop_stop_requested_{false};
+    EventGroupHandle_t wifi_event_group_ = nullptr;
+    esp_netif_t* wifi_netif_ = nullptr;
+    httpd_handle_t http_server_ = nullptr;
+    esp_event_handler_instance_t wifi_event_handler_ = nullptr;
+    esp_event_handler_instance_t ip_event_handler_ = nullptr;
+    bool wifi_connected_ = false;
+    bool filesystem_ready_ = false;
+#if RF3_BLUETOOTH_CONTROL_ENABLED
+    inline static DemoConsoleApp* bluetooth_app_ = nullptr;
+    QueueHandle_t bluetooth_command_queue_ = nullptr;
+    QueueHandle_t bluetooth_tx_queue_ = nullptr;
+    TaskHandle_t bluetooth_command_task_ = nullptr;
+    std::string bluetooth_rx_line_;
+    bool bluetooth_rx_overflow_ = false;
+    portMUX_TYPE bluetooth_session_mux_ = portMUX_INITIALIZER_UNLOCKED;
+    bool bluetooth_disconnect_pending_ = false;  // Session mux protected.
+    bool bluetooth_close_received_ = false;      // Session mux protected.
+    uint32_t bluetooth_retry_handle_ = 0;  // All retry fields are session-mux protected.
+    uint32_t bluetooth_retry_epoch_ = 0;
+    int64_t bluetooth_retry_at_us_ = 0;
+    BluetoothTx::Flow bluetooth_tx_flow_;
+    std::atomic<uint32_t> bluetooth_epoch_{0};
+    uint32_t bluetooth_dispatch_epoch_ = 0;  // Command mutex protected.
+    std::atomic<uint32_t> bluetooth_spp_handle_{0};
+    std::atomic_bool bluetooth_client_connected_{false};
+#endif
+};
+}  // namespace
+
+extern "C" void app_main(void);
+
+void app_main(void)
+{
+    DevboardPowerIo power_io;
+#if defined(RF3_USB_CUSTOM_BENCH) && RF3_USB_CUSTOM_BENCH
+    // Bench wiring supplies ESP/nRF from USB and the FEM separately.
+    if (!power_io.output(15, false)) {
+        ESP_LOGE(TAG, "Cannot hold battery request LOW; stopping startup");
+        return;
+    }
+#endif
+    DevboardPower::Controller power(power_io, HardwareProfile::kSelectedBatteryPower);
+    if (!power.initialize()) {
+        ESP_LOGE(TAG, "Could not initialize board power outputs; stopping startup.");
+        return;
+    }
+    if (power.supported()) delayAtLeastMs(10);
+    // app_main is the firmware entry point the Espressif IoT Development
+    // Framework (ESP-IDF) calls after the operating system (OS) and
+    // drivers are ready. Everything else is built from the default pin config
+    // declared in Esp32Nrf24Config.
+    Esp32Nrf24Config config{};
+    ESP_LOGI(TAG,
+             "nRF24 pinset=%s pins: SCK=%d MISO=%d MOSI=%d CE=%d CSN=%d IRQ=%d",
+              HardwareProfile::kSelectedName,
+             static_cast<int>(config.sck_pin),
+             static_cast<int>(config.miso_pin),
+             static_cast<int>(config.mosi_pin),
+             static_cast<int>(config.ce_pin),
+             static_cast<int>(config.csn_pin),
+             static_cast<int>(config.irq_pin));
+
+    Esp32Nrf24Hal hal(config);
+    if (!power.radioAvailable()) (void)hal.setSignalOutputsEnabled(false);
+    Nrf24 radio(hal);
+    RadioManager manager(radio);
+    DemoConsoleApp app(manager, power, hal);
+
+    if (!app.initialize()) {
+        // Keep the firmware alive after initialization failure so the serial
+        // monitor can still show the error instead of crashing or reboot-looping.
+        ESP_LOGE(TAG, "Demo app initialization failed.");
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
+    app.run();
+}
