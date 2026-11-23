@@ -355,6 +355,7 @@ bool Nrf24::stopRx()
 bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
                          bool allowRecovery, bool listenAfterSend)
 {
+    last_frame_transmitted_ = false;
     if (!payload || len == 0 || len > 32) {
         return false;
     }
@@ -370,7 +371,6 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
         if (elapsed < kReliableTurnaroundUs)
             hal_.delayUs(static_cast<uint32_t>(kReliableTurnaroundUs - elapsed));
     }
-    bool frame_transmitted = false;
     auto attempt_transmit = [&](bool rearm_radio, bool hold_ce_until_done) {
         if (rearm_radio) {
             RuntimeDiagnostics::global().tx_recoveries.add();
@@ -478,7 +478,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
 #endif
 
             if (status & (1 << 5)) {
-                frame_transmitted = true;
+                last_frame_transmitted_ = true;
                 RuntimeDiagnostics::global().tx_ds.add();
                 last_tx_status_ = status;
                 last_tx_fifo_status_ = fifo_status;
@@ -557,7 +557,7 @@ bool Nrf24::transmitOnce(const uint8_t* payload, size_t len, uint32_t timeoutUs,
     // configuration and try once more before reporting failure to the app.
     // A confirmed on-air transmission followed by RX rearm failure must not
     // silently retransmit or flush a response through clone recovery.
-    return allowRecovery && !frame_transmitted && attempt_transmit(true, true);
+    return allowRecovery && !last_frame_transmitted_ && attempt_transmit(true, true);
 }
 
 bool Nrf24::readOnePacket(uint8_t* out, size_t capacity, size_t& outLen)

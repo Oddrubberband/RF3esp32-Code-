@@ -57,6 +57,7 @@ public:
     bool enterRx();
     bool leaveRx();
     bool hasPendingRx();
+    bool lastFrameTransmitted() const { return radio_.lastFrameTransmitted(); }
 
     // Data plane operations.
     bool sendPayload(const uint8_t* payload, size_t len, bool allowRecovery = true,

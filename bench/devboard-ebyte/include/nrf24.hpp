@@ -59,6 +59,7 @@ public:
     uint8_t lastTxObserve() const;
     bool lastTxTimedOut() const;
     bool lastTxSawIrq() const;
+    bool lastFrameTransmitted() const { return last_frame_transmitted_; }
 
 private:
     void selectFrontEnd(FrontEndMode mode);
@@ -85,6 +86,7 @@ private:
     uint8_t last_tx_status_ = 0;
     uint8_t last_tx_fifo_status_ = 0;
     uint8_t last_tx_observe_ = 0;
+    bool last_frame_transmitted_ = false;  // TX_DS observed during the most recent call.
     bool last_tx_timed_out_ = false;
     bool last_tx_saw_irq_ = false;
     bool rx_active_ = false;

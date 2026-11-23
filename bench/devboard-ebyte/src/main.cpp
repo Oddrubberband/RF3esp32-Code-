@@ -4283,7 +4283,8 @@ private:
             (text.size() + StreamSync::kTextChunkMaxBytes - 1) /
             StreamSync::kTextChunkMaxBytes;
 
-        for (size_t chunk_index = 0; sent && chunk_index < chunk_count; ++chunk_index) {
+        bool listening = true;
+        for (size_t chunk_index = 0; sent && listening && chunk_index < chunk_count; ++chunk_index) {
             const size_t offset = chunk_index * StreamSync::kTextChunkMaxBytes;
             const size_t remaining = text.size() - offset;
             const size_t chunk_len =
@@ -4301,17 +4302,23 @@ private:
                 packet,
                 packet_len);
             if (sent) {
-                sent = sendPayloadWithRetry(manager_, packet, packet_len);
+                // Count a confirmed TX exactly once, even if rearming RX fails afterward.
+                sent = TxHelpers::sendWithRetry([&]() {
+                    listening = manager_.sendPayloadAndListen(packet, packet_len);
+                    return listening || manager_.lastFrameTransmitted();
+                }, [](uint32_t ms) { delayAtLeastMs(ms); });
+                if (!listening && chunk_index + 1 < chunk_count) sent = false;
             }
             if (sent && chunk_index + 1 < chunk_count) {
-                delayAtLeastMs(3);
+                // A FreeRTOS delay may wake before three full milliseconds have elapsed.
+                constexpr uint32_t gap_us = 3000;
+                const uint64_t start_us = hal_.nowUs();
+                delayAtLeastMs(gap_us / 1000);
+                const uint64_t elapsed_us = hal_.nowUs() - start_us;
+                if (elapsed_us < gap_us) hal_.delayUs(static_cast<uint32_t>(gap_us - elapsed_us));
             }
         }
 
-        bool resumed = true;
-        if (sent && manager_.status().state == RadioState::Standby) {
-            resumed = manager_.enterRx();
-        }
         if (sent) {
             ++text_tx_count_;
         }
@@ -4319,13 +4326,15 @@ private:
         giveRadio();
 
         if (!sent) {
-            std::printf("Could not send text message. state=%s fault=%d\n",
+            std::printf("ERR TEXT transmit_incomplete state=%s fault=%d\n",
                         RadioManager::stateName(status.state),
                         status.last_fault);
             return false;
         }
-        if (!resumed) {
-            std::printf("Text was sent, but receive mode could not be restored.\n");
+        if (!listening) {
+            std::printf("ERR TEXT sent_locally_rx_rearm_failed state=%s fault=%d\n",
+                        RadioManager::stateName(status.state), status.last_fault);
+            return false;
         }
         std::printf("TEXT TX: %s\n", text.c_str());
         return true;
@@ -5566,10 +5575,6 @@ private:
                         [&]() {
                             size_t out_len = 0;
                             if (manager_.receivePayload(payload.data(), payload.size(), out_len)) {
-                                if (rx_no_ack_mode_) {
-                                    processRxPayload(payload.data(), out_len);
-                                    return RxDrain::StepResult::Processed;
-                                }
                                 std::string_view completed_text;
                                 const StreamSync::TextMessageAssembler::Action text_action =
                                     text_message_assembler_.accept(
@@ -5588,6 +5593,10 @@ private:
                                     return RxDrain::StepResult::Processed;
                                 }
 
+                                if (rx_no_ack_mode_) {
+                                    processRxPayload(payload.data(), out_len);
+                                    return RxDrain::StepResult::Processed;
+                                }
                                 std::string_view remote_view;
                                 if (kWirelessControlEnabled &&
                                     StreamSync::decodeRemoteCommand(payload.data(), out_len, remote_view)) {
