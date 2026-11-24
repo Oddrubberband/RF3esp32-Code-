@@ -1,0 +1,10 @@
+RF3 Field Desktop R20 for Windows x64
+
+1. Extract the entire ZIP to a folder on your PC.
+2. Open RF3Desktop.exe in the extracted folder. Keep the _internal folder beside it. No Python or PlatformIO installation is required.
+3. Connect your RF3 board by USB. Close any serial monitor using its port. Select the board's USB COM port in the GUI and connect. Each endpoint uses the port on its own PC.
+4. To try the controls without a board, open Practice.cmd.
+
+With the custom ESP PCB running RF3-SENSE-C1-20261123, the GUI shows the latest one-second battery voltage and the rolling four-interval mean. The EBYTE devboard can use its existing firmware. This desktop package does not flash boards.
+
+If Windows does not list a COM port, check the USB data cable and the board's USB-to-serial driver in Device Manager. Connection logs are saved under %LOCALAPPDATA%\RF3\logs.

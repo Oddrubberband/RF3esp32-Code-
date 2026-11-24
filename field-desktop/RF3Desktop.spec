@@ -1,0 +1,47 @@
+# -*- mode: python ; coding: utf-8 -*-
+
+
+a = Analysis(
+    ['host_gui/run_gui.py'],
+    pathex=[SPECPATH + '/host_gui'],
+    binaries=[],
+    datas=[(SPECPATH + '/host_gui/rf3_gui/app/tx_profiles.csv', 'rf3_gui/app'),
+           (SPECPATH + '/host_gui/rf3_gui/ui/RF_Wizard_Shrouded_R3.png', 'rf3_gui/ui'),
+           (SPECPATH + '/host_gui/rf3_gui/ui/wizard.ico', 'rf3_gui/ui')],
+    hiddenimports=[],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='RF3Desktop',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    icon=SPECPATH + '/host_gui/rf3_gui/ui/wizard.ico',
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='RF3Desktop',
+)
