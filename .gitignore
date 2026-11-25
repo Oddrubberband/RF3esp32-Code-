@@ -30,3 +30,8 @@ LOCAL_CURRENT.json
 release-dist/
 .ci-native/
 .test-native/
+
+# Current field packages and staged board images
+release/
+boards/*/firmware/
+boards/*/Firmware_Images.json

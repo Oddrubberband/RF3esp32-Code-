@@ -1,25 +1,31 @@
-# Use the firmware for your board
+# RF3 R28 board setup
 
-| Board | Build shown in Read RF Diagnostics | Firmware installer option |
-|---|---|---|
-| Old custom ESP32 PCB, 16 MB | RF3-CBT-R4-20261119 | custom |
-| USB ESP32 devboard, 4 MB | RF3-NFEM-R3 | devboard |
+| Board | Build ID shown by HELLO | Flash | Radio CE / CSN / IRQ |
+| --- | --- | --- | --- |
+| Custom ESP32 PCB with external Skyworks FEM and voltage sense | `RF3-R28-CUSTOM` | 16 MB | 17 / 27 / 16 |
+| USB ESP32 devboard with EBYTE SPI module | `RF3-R28-EBYTE` | 4 MB | 27 / 5 / 26 |
 
-Download and extract the firmware ZIP for **v2026.11.20-firmware-audit**. Turn off the separate front-end supply before resetting or flashing. Disconnect the board in RF3 Desktop and close its serial monitor. In the extracted firmware folder, run the line for your board and enter its **USB programming port** when prompted.
+Both profiles use GPIO 18, 23, and 19 for SPI SCK, MOSI, and MISO. The custom build expects the ANT1 path and starts with the receive LNA bypassed. Gain can be selected in Standby for subsequent receive windows. Use the EBYTE profile for the devboard with its commercial SPI module.
+
+## Build from source
+
+With PlatformIO installed, open PowerShell at the repository root or in the extracted R28 board source package.
 
 ```powershell
-.\Flash_Manual.ps1 -Board custom
-.\Flash_Manual.ps1 -Board devboard
+.\Build_Both.cmd
 ```
 
-The helper checks the image files and prompts you to operate BOOT and EN. Release BOOT and press EN after verification. Check the build ID in the desktop before using the radio. Re-enable the separately powered front end only after verifying the idle control levels and correct wiring on your assembly.
+Use `.\Build_Both.cmd --board custom` or `.\Build_Both.cmd --board ebyte` to build a single target. The build helper checks image integrity, firmware identity, application size and the expected partition addresses before staging images and their hashes. With PlatformIO installed in the active Python environment, the equivalent is `python build_boards.py --build`.
 
-## Which wiring the firmware expects
+## Flash the matching board
 
-| Signal | Old custom PCB GPIO | USB devboard GPIO |
-|---|---:|---:|
-| Radio CE / CSN / IRQ | 17 / 27 / 16 | 27 / 5 / 26 |
-| Front end CTX / CRX | 32 / 33 | 32 / 33 |
-| Front end CSD / CPS / ANT_SEL | 26 / 25 / 21 | 14 / 13 / 17 |
+Use a successfully staged local build or extract the R28 firmware ZIP. Close the GUI connection and any serial monitor on the board's USB programming port. Keep the independent FEM supply off through flashing, reset, and startup of the custom board.
 
-The custom PCB uses GPIO15 for battery enable, GPIO34 for sensing, and supports antenna selection in standby. The USB devboard uses independent radio and front-end supplies and selects ANT1. The board and front end require a common ground. [Fixes and test results](FIRMWARE_FIXES.md)
+```powershell
+.\boards\custom-pcb-sense\Flash_Custom_PCB.cmd
+.\boards\devboard-ebyte\Flash_Devboard.cmd
+```
+
+Run the matching line and enter that board's USB programming COM port. The launcher uses PlatformIO's Python and esptool, verifies the image hashes, and prompts for manual BOOT and EN. Release BOOT once writing begins, then press EN when programming finishes. The launchers preserve the SPIFFS partition.
+
+Reconnect using [R24 Field Desktop](https://github.com/Oddrubberband/RF3esp32-Code-/releases/tag/v2026.11.24-field-r24) and check the build ID before testing. Set both boards to the same channel, starting with channel 0 for the RF3 bench setup. Select Reliable (ACK), start Receive on the destination, and send a known file. Check peer completion, CRC, elapsed time, and retries. For a rollback use the matching, previously verified image for that board.

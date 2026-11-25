@@ -1,0 +1,57 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+// AudioPacket defines the on-air packet format used by the demo.
+//
+// Each nRF24 payload is capped at 32 bytes, so the project reserves the first
+// 4 bytes for metadata and uses the remaining bytes for generic payload data.
+// The historical "audio" name is kept for compatibility with existing tests
+// and source files, but the bytes now represent arbitrary file contents.
+namespace AudioPacket {
+// The radio's fixed payload limit is 32 bytes.
+constexpr size_t kPacketBytes = 32;
+// Every packet starts with sequence, payload length, and flags.
+constexpr size_t kHeaderBytes = 4;
+// The rest of the payload can carry data bytes.
+constexpr size_t kAudioBytesPerPacket = kPacketBytes - kHeaderBytes;
+
+// These flags mark stream boundaries for the receiver.
+constexpr uint8_t kFirst = 0x01;
+constexpr uint8_t kLast = 0x02;
+
+struct Header {
+    uint16_t sequence = 0;  // Monotonic chunk index within one transmitted file.
+    uint8_t audio_len = 0;  // Number of valid data bytes that follow the header.
+    uint8_t flags = 0;      // Boundary markers such as kFirst and kLast.
+};
+
+// Encode one payload chunk into the project's wire format.
+//
+// The caller provides one slice of data and two framing booleans. The function
+// writes the packed packet into out_packet and reports how many bytes should be
+// sent over the radio.
+//
+// The firmware uses fixed-width nRF24 payloads, so every encoded packet
+// occupies the full 32-byte on-air frame. The header's audio_len field tells
+// the receiver how many of the trailing bytes are meaningful payload data.
+bool encode(uint16_t sequence,
+            const uint8_t* audio,
+            size_t audio_len,
+            bool is_first,
+            bool is_last,
+            uint8_t* out_packet,
+            size_t& out_packet_len);
+
+// Decode one packet and point the caller at the embedded payload bytes.
+//
+// This validates the packet shape before exposing the payload pointer so higher
+// layers can safely append the recovered data bytes to a
+// reassembly buffer. Any packet length from the compact header+payload size up
+// through the fixed nRF24 payload width is accepted; trailing bytes are padding.
+bool decode(const uint8_t* packet,
+            size_t packet_len,
+            Header& out_header,
+            const uint8_t*& out_audio);
+}  // namespace AudioPacket

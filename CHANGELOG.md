@@ -1,3 +1,15 @@
+# RF3 changelog
+
+## November 25, 2026 — R28 field firmware and R24 desktop
+
+- R24 desktop improves receive-attempt reporting, delivery CSVs, cancellation and serial recovery. It imports board files in create-only mode by default when firmware supports it.
+- R25 reserves 10 KiB for Bluetooth file commands and moves long-lived runtime objects off the application task stack.
+- R26 defaults the custom receiver to LNA bypass. Standby selection enables gain for subsequent RX windows.
+- R27 can re-arm a faulted receiver with an eligible Reliable checkpoint up to five times at one-second intervals, preserving partial data.
+- R28 can retry a DATA frame at 125 ms after three fast first-send ACKs. The extra send stays within the original one-second response window. The normal retry schedule remains available.
+
+The current source and board methods are described in [START_HERE.md](START_HERE.md).
+
 # Changes in RF3-BAT-R1-20261105
 
 ## 20 November 2026 — custom PCB R4 and USB devboard R3

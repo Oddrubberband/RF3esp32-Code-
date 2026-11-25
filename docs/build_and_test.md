@@ -1,5 +1,37 @@
 # Build and verify RF3
 
+## R28 firmware
+
+Follow [the board setup guide](../START_HERE.md) for the current profiles, verified staging, and manual flash commands. The PlatformIO core version used by the build workflow is recorded in [requirements.txt](../requirements.txt).
+
+The current source provides hardware-free Reliable resume, diagnostics and DATA retry tests in the board directories. With g++ on PATH, for example:
+
+```powershell
+python boards/custom-pcb-sense/tools/tests/test_resume_runtime.py --compiler g++ --output .test-output/custom-resume
+python boards/devboard-ebyte/tools/tests/test_resume_runtime.py --compiler g++ --output .test-output/ebyte-resume
+```
+
+## R24 Field Desktop
+
+From the repository root, open PowerShell:
+
+```powershell
+Set-Location field-desktop
+py -3.11 -m pip install -r host_gui/requirements.txt
+$env:QT_QPA_PLATFORM = 'offscreen'
+Push-Location host_gui
+py -3.11 -m unittest discover -s tests
+Pop-Location
+py -3.11 -m PyInstaller --noconfirm RF3Desktop.spec
+py -3.11 package.py
+```
+
+The packager checks the source modules bundled in the executable and starts the extracted Windows program in both serial and Practice modes. Open `release/` for the portable ZIP and its checksum.
+
+## November 20 legacy build
+
+The following commands reproduce the November 20 audit release using the earlier root-level firmware and desktop. Use the current commands above for the R24/R28 pair.
+
 Run from the source repository root. Firmware uses ESP-IDF through PlatformIO.
 GUI dependencies include PySide6, pyserial and PyInstaller. Native tests require
 g++ in PATH. CI uses Python3.11 and the pinned requirements files.
