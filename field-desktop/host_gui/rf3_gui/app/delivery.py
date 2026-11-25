@@ -47,6 +47,12 @@ class Reading:
     def key(self):
         return self.board, self.direction, self.mode, self.id, self.instance
 
+    @property
+    def evidence_rank(self):
+        counters = (self.received, self.sent, self.first, self.planned, self.retries)
+        known_counts = tuple(value if value is not None else -1 for value in counters)
+        return (self.closed, self.verified, *known_counts, bool(self.session))
+
     @classmethod
     def parse(cls, line):
         parts = line.split()
@@ -79,7 +85,10 @@ class Reading:
                     val("local_retries"),row["file_verified"],row["observation_closed"],row["result"])))
         stamp=datetime.fromisoformat(row["timestamp_utc"])
         if stamp.tzinfo is None: raise ValueError("Missing UTC offset")
-        obj.time=stamp.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+        try:
+            obj.time = stamp.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+        except OverflowError as exc:
+            raise ValueError("Delivery timestamp is outside the UTC date range") from exc
         obj.resumes=count(val("resume_count"))
         session=row["session_id"]
         if session and not re.fullmatch(r"[0-9a-f]{32}",session):
@@ -109,21 +118,33 @@ class DeliveryBook:
         self.latest.clear()
 
     def import_csv(self, path):
-        additions={}
-        with open(path,encoding="utf-8-sig",newline="") as f:
-            reader=csv.DictReader(f)
+        additions = {}
+        summary_keys = set()
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
             if not set(COLUMNS).issubset(reader.fieldnames or ()):
                 raise ValueError("Choose an RF3 delivery CSV exported by R18 or later.")
             for data in reader:
-                if data.get("record_type")=="summary":
-                    row=Reading.from_csv(data)
-                    additions[row.key]=row
-        if not additions: raise ValueError("The CSV has no delivery summaries.")
-        if not self.local:
-            for row in additions.values():
+                record_type = data.get("record_type")
+                if record_type not in {"summary", "endpoint"}:
+                    continue
+                row = Reading.from_csv(data)
+                previous = additions.get(row.key)
+                if previous is None or row.evidence_rank > previous.evidence_rank:
+                    additions[row.key] = row
+                if record_type == "summary":
+                    summary_keys.add(row.key)
+        restore = not self.local
+        if not additions or (restore and not summary_keys):
+            raise ValueError("The CSV has no delivery summaries.")
+        for row in sorted(additions.values(), key=lambda entry: entry.time):
+            if restore and row.key in summary_keys:
                 self.observe(row)
-        else:
-            self.peer.update(additions)
+                continue
+            book = self.local if row.key in self.local else self.peer
+            previous = book.get(row.key)
+            if previous is None or row.evidence_rank > previous.evidence_rank:
+                book[row.key] = row
         return len(additions)
 
     def partner(self, row):
@@ -132,7 +153,12 @@ class DeliveryBook:
                     and other.mode==row.mode and other.id==row.id
                     and (row.planned is None or other.planned is None or row.planned==other.planned)
                     and abs((datetime.fromisoformat(row.time)-datetime.fromisoformat(other.time)).total_seconds())<=300)
-        candidates={r.key:r for r in (*self.peer.values(),*self.local.values()) if matches(r)}
+        candidates = {r.key: r for r in self.peer.values() if matches(r)}
+        for other in self.local.values():
+            if matches(other):
+                imported = candidates.get(other.key)
+                if imported is None or other.evidence_rank >= imported.evidence_rank:
+                    candidates[other.key] = other
         if row.mode=="noack":
             exact=[r for r in candidates.values() if r.instance==row.instance]
             if len(exact)==1: return exact[0]
@@ -153,11 +179,19 @@ class DeliveryBook:
         rx=row if row.direction=="RX" else peer
         sent=tx.sent if tx and tx.closed else None
         if sent is None and rx: sent=rx.sent
-        received=rx.received if rx else row.received
-        first=rx.first if rx else None
-        plan=row.planned
-        complete=bool(rx and rx.closed or not rx and row.closed and row.received is not None)
-        if tx and not tx.closed and rx and rx.sent is None: complete=False
+        received = rx.received if rx else row.received
+        first = rx.first if rx else None
+        plan = row.planned
+        complete = bool(rx and rx.closed or not rx and row.closed and row.received is not None)
+        if tx and not tx.closed and rx and rx.sent is None:
+            complete = False
+        # A closed ACK sender can prove delivery even if an imported receiver
+        # report was saved while still observing or has no usable packet count.
+        acknowledged = (row.mode == "ack" and tx and tx.closed and tx.received is not None
+                        and (not complete or received is None))
+        if acknowledged:
+            received = tx.received
+            complete = True
         missing=sent-received if (complete and sent is not None and received is not None
                                    and received<=sent) else None
         def pct(n,d):
@@ -178,7 +212,9 @@ class DeliveryBook:
         if row.mode != "text":
             crc = "passed" if row.verified or (peer and peer.verified) else "unverified"
         evidence = "delivery unknown"
-        if peer:
+        if acknowledged:
+            evidence = "acknowledged"
+        elif peer:
             evidence = "paired endpoints"
         elif rx:
             evidence = "receiver"
@@ -229,3 +265,17 @@ class DeliveryBook:
             rows.append(self.summary(row))
         return rows
 
+    def export_rows(self, direction=None):
+        rows = self.rows(direction)
+        keys = {(r["board"], r["direction"], r["mode"], r["transfer_id"], r["observation_id"])
+                for r in rows}
+        evidence = {}
+        for key in keys:
+            peer = self.partner(self.local[key])
+            if peer is not None and peer.key not in keys:
+                evidence[peer.key] = peer
+        for key in sorted(evidence):
+            row = self.summary(evidence[key])
+            row["record_type"] = "endpoint"
+            rows.append(row)
+        return rows

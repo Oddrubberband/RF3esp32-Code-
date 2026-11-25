@@ -38,7 +38,7 @@ class TestStorageManager(unittest.TestCase):
         backend._snapshot = backend._replace_snapshot(
             connection_state=ConnectionState.CONNECTED, confirmed_radio_state=RadioState.STANDBY,
             capabilities=RadioCapabilities(supports_host_storage=True, supports_host_file_upload=True,
-                                           supports_host_file_download=True, supports_host_chunk_retry=True))
+                                           supports_host_file_download=True, supports_host_chunk_retry=True, supports_create_upload=True))
         sent = []
         def capture(command):
             backend._pending_commands.append(command)
@@ -150,7 +150,7 @@ class TestStorageManager(unittest.TestCase):
                     command = sent[cursor]
                     cursor += 1
                     words = command.split()
-                    if words[:2] == ["UPLOAD", "BEGIN"]:
+                    if words[:2] == ["UPLOAD", "BEGINCREATE"]:
                         metadata = words[2:]
                         backend._handle_line("UPLOAD READY " + " ".join(metadata))
                     elif words[:2] == ["UPLOAD", "DATA"]:

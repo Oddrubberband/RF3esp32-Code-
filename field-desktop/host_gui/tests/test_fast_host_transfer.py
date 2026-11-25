@@ -59,7 +59,7 @@ class TestFastHostTransfer(unittest.TestCase):
             confirmed_radio_state=RadioState.STANDBY,
             capabilities=RadioCapabilities(host_chunk_max=chunk, supports_host_storage=True,
                                            supports_host_file_upload=True, supports_host_file_download=True,
-                                           supports_host_chunk_retry=True))
+                                           supports_host_chunk_retry=True, supports_create_upload=True))
         commands = []
         def send(command):
             backend._pending_commands.append(command)
@@ -138,7 +138,7 @@ class TestFastHostTransfer(unittest.TestCase):
                     for _ in range(40000):
                         command = commands[cursor]; cursor += 1
                         words = command.split()
-                        if words[:2] == ["UPLOAD", "BEGIN"]:
+                        if words[:2] == ["UPLOAD", "BEGINCREATE"]:
                             metadata = words[2:5]
                             self.assertEqual(len(words), 6 if chunk != 64 else 5)
                             backend._handle_line("UPLOAD READY " + " ".join(metadata)

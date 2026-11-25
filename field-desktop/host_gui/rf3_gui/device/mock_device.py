@@ -29,6 +29,9 @@ from rf3_gui.app.sim_tx import timing_profile
 from rf3_gui.protocol import console_protocol
 
 
+MOCK_STORAGE_CAPACITY = 1_048_576
+
+
 class MockDeviceBackend(DeviceBackend):
     def __init__(self) -> None:
         super().__init__()
@@ -59,6 +62,12 @@ class MockDeviceBackend(DeviceBackend):
         self._connected = False
         self._stored_files = {"README.md": b"RF3 mock SPIFFS storage\n"}
         self._battery_percent = 87
+        self._discovery_timer = QTimer(self, singleShot=True, interval=450)
+        self._discovery_timer.timeout.connect(self._finish_discovery)
+        self._connect_timer = QTimer(self, singleShot=True, interval=500)
+        self._connect_timer.timeout.connect(self._finish_connect)
+        self._morse_timer = QTimer(self, singleShot=True, interval=600)
+        self._morse_timer.timeout.connect(self._finish_morse)
         self._transfer_timer = QTimer(self)
         self._transfer_timer.timeout.connect(self._advance_transfer)
         self._transfer_path: Path | None = None
@@ -71,10 +80,25 @@ class MockDeviceBackend(DeviceBackend):
         self._transfer_no_ack = False
 
     def discover(self) -> None:
+        if self._snapshot.connection_state != ConnectionState.DISCONNECTED:
+            self.command_finished.emit("DISCOVER", False, "Disconnect or cancel before scanning")
+            return
+        self._snapshot = self._replace_snapshot(connection_state=ConnectionState.SEARCHING)
+        self._discovery_timer.start()
+        self.status_changed.emit(self._snapshot)
         self.log_event.emit("info", "Mock discovery started")
-        QTimer.singleShot(450, lambda: self.devices_discovered.emit([self._device]))
+
+    def _finish_discovery(self) -> None:
+        if self._snapshot.connection_state != ConnectionState.SEARCHING:
+            return
+        self._snapshot = self._replace_snapshot(connection_state=ConnectionState.DISCONNECTED)
+        self.devices_discovered.emit([self._device])
+        self.status_changed.emit(self._snapshot)
 
     def connect_to(self, device: DeviceInfo) -> None:
+        if self._snapshot.connection_state != ConnectionState.DISCONNECTED:
+            self.command_finished.emit("CONNECT", False, "Disconnect or cancel before connecting")
+            return
         self._snapshot = DeviceSnapshot(
             connection_state=ConnectionState.CONNECTING,
             requested_radio_state=RadioState.UNKNOWN,
@@ -83,16 +107,20 @@ class MockDeviceBackend(DeviceBackend):
             power_level=self._snapshot.power_level,
             capabilities=self._capabilities,
         )
+        self._connect_timer.start()
+        self.storage_changed.emit(StorageListing())
         self.status_changed.emit(self._snapshot)
         self.log_event.emit("info", f"Connecting to {device.name}")
-        QTimer.singleShot(500, self._finish_connect)
 
     def disconnect_from_device(self) -> None:
+        self._discovery_timer.stop()
+        self._connect_timer.stop()
+        self._morse_timer.stop()
+        self._transfer_timer.stop()
         if self._transfer_started is not None:
             self.rf_ended.emit("TX", self._rf_sample_id, "Failed")
         self._transfer_started = None
         self._connected = False
-        self._transfer_timer.stop()
         self._snapshot = DeviceSnapshot(
             connection_state=ConnectionState.DISCONNECTED,
             requested_radio_state=RadioState.UNKNOWN,
@@ -101,6 +129,7 @@ class MockDeviceBackend(DeviceBackend):
             power_level=self._snapshot.power_level,
             capabilities=self._capabilities,
         )
+        self.storage_changed.emit(StorageListing())
         self.connection_changed.emit(self._device)
         self.status_changed.emit(self._snapshot)
         self.log_event.emit("info", "Mock device disconnected")
@@ -117,9 +146,18 @@ class MockDeviceBackend(DeviceBackend):
         if self._require_connected("STORAGE LIST"):
             self.storage_changed.emit(StorageListing(
                 tuple(StoredFile(name, len(data)) for name, data in sorted(self._stored_files.items())),
-                sum(map(len, self._stored_files.values())), 1_048_576, True))
+                sum(map(len, self._stored_files.values())), MOCK_STORAGE_CAPACITY, True))
 
-    def import_file(self, source_path: Path) -> None:
+    def _store_file(self, name: str, data: bytes, *, replace_existing: bool = False) -> None:
+        previous = self._stored_files.get(name)
+        if previous is not None and not replace_existing:
+            raise ValueError(f"{name} already exists in mock SPIFFS. Confirm replacement and retry.")
+        required = sum(map(len, self._stored_files.values())) - len(previous or b"") + len(data)
+        if required > MOCK_STORAGE_CAPACITY:
+            raise ValueError("Not enough space in mock SPIFFS")
+        self._stored_files[name] = data
+
+    def import_file(self, source_path: Path, *, replace_existing: bool = False) -> None:
         if not self._require_connected("UPLOAD"):
             return
         try:
@@ -129,7 +167,7 @@ class MockDeviceBackend(DeviceBackend):
             if len(data) > PROTOCOL_V2_MAX_FILE_SIZE:
                 raise ValueError("File exceeds the supported transfer size")
             name = console_protocol.import_filename(source_path.name)
-            self._stored_files[name] = data
+            self._store_file(name, data, replace_existing=replace_existing)
             self.transfer_changed.emit(TransferProgress(state=TransferState.COMPLETED,
                 sent_bytes=len(data), total_bytes=len(data),
                 message=f"Mock import of {name}; no nRF24 TX", source_path=source_path))
@@ -156,6 +194,9 @@ class MockDeviceBackend(DeviceBackend):
             self.command_finished.emit("STORAGE DELETE", False, "Invalid SPIFFS file")
             return
         del self._stored_files[remote_name]
+        if self._snapshot.selected_file == remote_name:
+            self._snapshot = self._replace_snapshot(selected_file="")
+            self.status_changed.emit(self._snapshot)
         self.command_finished.emit("STORAGE DELETE", True, f"Deleted {remote_name} from mock SPIFFS")
         self.refresh_storage()
 
@@ -206,8 +247,16 @@ class MockDeviceBackend(DeviceBackend):
         self.command_finished.emit(command, True, f"Packet TX power set to {level}")
         self.status_changed.emit(self._snapshot)
 
+    def set_no_ack_mode(self, enabled: bool) -> bool:
+        if self._snapshot.connection_state == ConnectionState.BUSY:
+            return False
+        self._no_ack_selected = bool(enabled)
+        if self._snapshot.confirmed_radio_state == RadioState.RX_LISTENING:
+            self.enter_rx()
+        return True
+
     def enter_rx(self) -> None:
-        self._set_radio_state(console_protocol.rx_command(), RadioState.RX_LISTENING)
+        self._set_radio_state("RXNOACK" if self._no_ack_selected else "RX", RadioState.RX_LISTENING)
 
     def enter_standby(self) -> None:
         self._set_radio_state(console_protocol.standby_command(), RadioState.STANDBY)
@@ -225,6 +274,7 @@ class MockDeviceBackend(DeviceBackend):
         command = console_protocol.stop_command()
         if not self._require_connected(command):
             return
+        self._morse_timer.stop()
         if (self._transfer_started is not None
                 and time.monotonic() - self._transfer_started >=
                 self._transfer_profile.elapsed_for_size(self._transfer_total)):
@@ -292,7 +342,11 @@ class MockDeviceBackend(DeviceBackend):
             self.command_finished.emit(command, False, "File exceeds the supported transfer size")
             return
         try:
+            console_protocol.transfer_extension(name)
             payload = source_path.read_bytes() if source_path is not None else self._stored_files[name]
+        except ValueError as exc:
+            self.command_finished.emit(command, False, str(exc))
+            return
         except OSError as exc:
             self.command_finished.emit(command, False, f"Could not read source file: {exc}")
             return
@@ -302,14 +356,20 @@ class MockDeviceBackend(DeviceBackend):
         self._transfer_crc = f"0x{crc32(payload):08X}"
         if source_path is not None and not self._snapshot.test_mode:
             board_name = console_protocol.import_filename(name)
-            for candidate in (name, board_name):
-                if self._stored_files.get(candidate) == payload:
-                    name = candidate
-                    self.log_event.emit("info", f"Reusing {name} from mock board storage")
-                    break
+            matching_name = next((candidate for candidate in (name, board_name)
+                                  if self._stored_files.get(candidate) == payload), None)
+            if matching_name is not None:
+                name = matching_name
+                self.log_event.emit("info", f"Reusing {name} from mock board storage")
+            elif board_name in self._stored_files:
+                name = console_protocol.staged_filename(name, payload)
             else:
                 name = board_name
-                self._stored_files[name] = payload
+                try:
+                    self._store_file(name, payload)
+                except ValueError as exc:
+                    self.command_finished.emit(command, False, str(exc))
+                    return
                 self.refresh_storage()
         self._transfer_path = source_path
         self._transfer_total = size
@@ -323,7 +383,7 @@ class MockDeviceBackend(DeviceBackend):
             connection_state=ConnectionState.BUSY,
             requested_radio_state=RadioState.TX_BUSY,
             confirmed_radio_state=RadioState.TX_BUSY,
-            selected_file=name,
+            selected_file=self._snapshot.selected_file if console_protocol.is_staged_filename(name) else name,
             active_tx_file=name,
         )
         self.command_finished.emit(command, True, f"Mock TX started for {name}")
@@ -367,15 +427,17 @@ class MockDeviceBackend(DeviceBackend):
         command = console_protocol.morse_command(text)
         if not self._require_connected(command):
             return
-        self._interrupt_transfer()
+        if self._snapshot.confirmed_radio_state not in {RadioState.STANDBY, RadioState.RX_LISTENING}:
+            self.command_finished.emit(command, False, "Radio is not ready for Morse")
+            return
         self._snapshot = self._replace_snapshot(
             connection_state=ConnectionState.BUSY,
             requested_radio_state=RadioState.TX_BUSY,
             confirmed_radio_state=RadioState.TX_BUSY,
         )
+        self._morse_timer.start()
         self.command_finished.emit(command, True, "Morse started on channel 76 at dot=120 ms. Use STOP to abort.")
         self.status_changed.emit(self._snapshot)
-        QTimer.singleShot(600, self._finish_morse)
 
     def send_remote_command(self, command_text: str) -> None:
         command = console_protocol.remote_command(command_text)
@@ -448,6 +510,8 @@ class MockDeviceBackend(DeviceBackend):
         self.status_changed.emit(self._snapshot)
 
     def _finish_connect(self) -> None:
+        if self._snapshot.connection_state != ConnectionState.CONNECTING:
+            return
         self._connected = True
         self.connection_changed.emit(self._device)
         self._snapshot = DeviceSnapshot(
@@ -463,6 +527,7 @@ class MockDeviceBackend(DeviceBackend):
         self.status_changed.emit(self._snapshot)
 
     def _interrupt_transfer(self) -> None:
+        self._morse_timer.stop()
         self._transfer_timer.stop()
         if self._transfer_started is not None:
             self._transfer_started = None
@@ -476,6 +541,7 @@ class MockDeviceBackend(DeviceBackend):
             connection_state=ConnectionState.CONNECTED,
             requested_radio_state=state,
             confirmed_radio_state=state,
+            rx_no_ack=self._no_ack_selected if state == RadioState.RX_LISTENING else self._snapshot.rx_no_ack,
         )
         self.command_finished.emit(command, True, f"Confirmed state {state.value}")
         self.status_changed.emit(self._snapshot)
@@ -536,7 +602,7 @@ class MockDeviceBackend(DeviceBackend):
     def _finish_morse(self) -> None:
         if not self._connected:
             return
-        if self._snapshot.confirmed_radio_state != RadioState.TX_BUSY:
+        if self._snapshot.confirmed_radio_state != RadioState.TX_BUSY or self._transfer_started is not None:
             return
         self._snapshot = self._replace_snapshot(
             connection_state=ConnectionState.CONNECTED,
@@ -559,6 +625,7 @@ class MockDeviceBackend(DeviceBackend):
             "rx_total_bytes": self._snapshot.rx_total_bytes,
             "rx_error": self._snapshot.rx_error,
             "profile": self._snapshot.profile,
+            "rx_no_ack": self._snapshot.rx_no_ack,
             "active_tx_file": self._snapshot.active_tx_file,
             "connection_state": self._snapshot.connection_state,
             "test_mode": self._snapshot.test_mode,

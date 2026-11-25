@@ -37,6 +37,47 @@ class TestNoAckMode(unittest.TestCase):
         self.assertFalse(self.backend._no_ack_selected)
         self.assertEqual(self.commands(), [])
 
+    def test_listening_mode_switch_waits_for_peer_telemetry(self):
+        self.status(state="RxListening", no_ack_files=True, rx_no_ack=True)
+        self.assertTrue(self.backend.no_ack_selected)
+        self.assertTrue(self.backend.set_no_ack_mode(False))
+        self.assertEqual(self.commands(), ["RX"])
+        self.status(state="RxListening", no_ack_files=True, rx_no_ack=True)
+        self.assertTrue(self.backend._snapshot.rx_no_ack)
+        self.assertFalse(self.backend.no_ack_selected)
+        self.assertFalse(self.backend.set_no_ack_mode(True))
+        self.assertEqual(self.commands(), [])
+        self.backend._handle_line("RX listening on channel 0")
+        self.assertEqual(self.commands(), ["STATUS"])
+        self.status(state="RxListening", no_ack_files=True, rx_no_ack=False)
+        self.assertFalse(self.backend._snapshot.rx_no_ack)
+        self.backend.enter_rx()
+        self.assertEqual(self.commands(), [])
+
+    def test_rejected_live_silent_mode_restores_confirmed_preference(self):
+        self.status(state="RxListening", no_ack_files=True, rx_no_ack=False)
+        self.assertTrue(self.backend.set_no_ack_mode(True))
+        self.assertEqual(self.commands(), ["RXNOACK"])
+        self.backend._handle_line("ERR RX receive_active_use_STOP")
+        self.assertFalse(self.backend.no_ack_selected)
+        self.assertEqual(self.commands(), ["STATUS"])
+        self.assertNotIn("RXNOACK", self.backend._pending_commands)
+
+    def test_live_silent_mode_succeeds_on_usb_response(self):
+        self.status(state="RxListening", no_ack_files=True, rx_no_ack=False)
+        self.assertTrue(self.backend.set_no_ack_mode(True))
+        self.assertEqual(self.commands(), ["RXNOACK"])
+        self.backend._handle_line("RX listening on channel 0")
+        self.assertNotIn("RXNOACK", self.backend._pending_commands)
+        self.assertEqual(self.commands(), ["STATUS"])
+        self.status(state="RxListening", no_ack_files=True, rx_no_ack=True)
+        self.assertTrue(self.backend._snapshot.rx_no_ack)
+
+    def test_standby_mode_selection_does_not_arm_receive(self):
+        self.status(no_ack_files=True, rx_no_ack=False)
+        self.assertTrue(self.backend.set_no_ack_mode(True))
+        self.assertEqual(self.commands(), [])
+
     def test_stored_file_uses_distinct_command_and_latches_mode(self):
         self.start()
         self.assertEqual(self.commands(), [console_protocol.stored_tx_command("report.bin", no_ack=True)])

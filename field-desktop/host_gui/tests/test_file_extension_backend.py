@@ -28,7 +28,7 @@ class TestFileExtensionBackend(unittest.TestCase):
             connection_state=ConnectionState.CONNECTED, confirmed_radio_state=RadioState.STANDBY,
             capabilities=RadioCapabilities(supports_host_storage=True, supports_host_file_upload=True,
                                            supports_host_file_download=True, supports_host_chunk_retry=True,
-                                           supports_stored_file_tx=True, host_chunk_max=256))
+                                           supports_stored_file_tx=True, supports_create_upload=True, host_chunk_max=256))
         self.events, self.progress = [], []
         self.backend.command_finished.connect(lambda *args: self.events.append(args))
         self.backend.transfer_changed.connect(self.progress.append)
@@ -103,15 +103,18 @@ class TestFileExtensionBackend(unittest.TestCase):
                 if mode == "import":
                     self.backend.import_file(source)
                 else:
+                    self.backend._snapshot = replace(self.backend._snapshot, capabilities=replace(
+                        self.backend._snapshot.capabilities, supports_file_guard=True, supports_stored_file_tx=False))
                     self.backend.start_tx(source)
                 upload = self.backend._upload_session
                 self.assertIsNotNone(upload)
                 self.assertTrue(upload.verify_only)
                 remote = upload.remote_name
-                self.assertEqual(Path(remote).suffix, suffix)
+                self.assertEqual(Path(remote).suffix, suffix if mode == "import" else "")
+                tag = remote.encode().hex().upper()
                 self.assertLessEqual(len(remote.encode("ascii")), 30)
                 all_commands = self.commands()
-                self.assertEqual(all_commands[-1], console_protocol.upload_begin_command(remote, len(payload), crc, 256))
+                self.assertEqual(all_commands[-1], console_protocol.upload_begin_command(remote, len(payload), crc, 256, create_only=True))
                 self.backend._handle_line(f"UPLOAD READY {remote} {len(payload)} {crc:08X} 256")
                 for sequence, offset in enumerate(range(0, len(payload), 256)):
                     chunk = payload[offset:offset + 256]
@@ -125,8 +128,12 @@ class TestFileExtensionBackend(unittest.TestCase):
                 self.backend._handle_line(f"UPLOAD COMPLETE {remote} {len(payload)} {crc:08X}")
                 queued = self.commands()
                 all_commands += queued
-                self.assertEqual(queued, [console_protocol.download_begin_command(remote, 256)])
-                self.backend._handle_line(f"DOWNLOAD READY {remote} {len(payload)} {crc:08X} 256")
+                if mode == "import":
+                    self.assertEqual(queued, [console_protocol.download_begin_command(remote, 256)])
+                    self.backend._handle_line(f"DOWNLOAD READY {remote} {len(payload)} {crc:08X} 256")
+                else:
+                    self.assertEqual(queued, [console_protocol.download_begin_hex_command(remote, 256, staged=True)])
+                    self.backend._handle_line(f"DOWNLOAD READYHEX {tag} {len(payload)} {crc:08X} 256")
                 for sequence, offset in enumerate(range(0, len(payload), 256)):
                     chunk = payload[offset:offset + 256]
                     queued = self.commands()
@@ -136,7 +143,8 @@ class TestFileExtensionBackend(unittest.TestCase):
                 queued = self.commands()
                 all_commands += queued
                 self.assertEqual(queued, ["DOWNLOAD END"])
-                self.backend._handle_line(f"DOWNLOAD COMPLETE {remote} {len(payload)} {crc:08X}")
+                end = f"DOWNLOAD COMPLETE {remote}" if mode == "import" else f"DOWNLOAD COMPLETEHEX {tag}"
+                self.backend._handle_line(f"{end} {len(payload)} {crc:08X}")
                 self.assertEqual(self.progress[-1].state.value, "Completed")
                 self.assertIn("byte-for-byte match", self.progress[-1].message)
                 self.assertFalse(any(command.startswith(("TX ", "TXHEX ")) for command in all_commands))

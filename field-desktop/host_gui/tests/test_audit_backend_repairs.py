@@ -199,7 +199,8 @@ class TestAuditBackendRepairs(unittest.TestCase):
         self.backend._handle_line('{"state":"Standby"}')
         self.assertIn("TESTMODE ON", self.backend._pending_commands)
         self.assertIs(self.backend._awaiting_test_mode, True)
-        self.status(profile="esp32-devboard", test_mode_supported=True, test_mode=True)
+        self.status(profile="esp32-devboard", test_mode_supported=True, test_mode=True,
+                    file_guard=True, host_stored_tx=False)
         self.assertNotIn("TESTMODE ON", self.backend._pending_commands)
         self.assertIsNone(self.backend._awaiting_test_mode)
         self.assertFalse(self.backend._test_mode_timer.isActive())

@@ -10,7 +10,7 @@ import time
 import uuid
 import unittest
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -93,7 +93,10 @@ class TestWindowsBluetooth(unittest.TestCase):
 
     def test_fresh_scan_does_not_pair_or_enable_service(self):
         api = FakeApi()
-        peers = self.adapter(api).scan(threading.Event())
+        seen = api.device.last_seen.utc()
+        with patch("rf3_gui.device.windows_bluetooth.datetime", wraps=datetime) as clock:
+            clock.now.side_effect = [seen - timedelta(seconds=1), seen + timedelta(seconds=1)]
+            peers = self.adapter(api).scan(threading.Event())
         self.assertEqual(peers, [BluetoothPeer("ESP test", ADDRESS, False, True)])
         self.assertEqual(api.calls, ["radio", "inquiry", "closed"])
 
@@ -318,7 +321,7 @@ class TestBluetoothGuiIntegration(unittest.TestCase):
             def write(self, payload):
                 written.append(payload)
                 parts = payload.decode("ascii").split()
-                if parts[:2] == ["UPLOAD", "BEGIN"]:
+                if parts[:2] == ["UPLOAD", "BEGINNEW"]:
                     metadata[:] = parts[2:]
                     stored.clear()
                     responses.put(f"UPLOAD READY {' '.join(metadata)}\r\n".encode())
@@ -327,13 +330,15 @@ class TestBluetoothGuiIntegration(unittest.TestCase):
                     responses.put(f"UPLOAD ACK {parts[2]} {len(stored)}\r\n".encode())
                 elif parts == ["UPLOAD", "END"]:
                     responses.put(f"UPLOAD COMPLETE {metadata[0]} {len(stored)} {binascii.crc32(stored):08X}\r\n".encode())
-                elif parts[:2] == ["DOWNLOAD", "BEGIN"]:
-                    responses.put(f"DOWNLOAD READY {metadata[0]} {len(stored)} {binascii.crc32(stored):08X}\r\n".encode())
+                elif parts[:2] == ["DOWNLOAD", "BEGINHEX"]:
+                    assert bytes.fromhex(parts[2]).decode() == metadata[0]
+                    responses.put(f"DOWNLOAD READYHEX {parts[2]} {len(stored)} {binascii.crc32(stored):08X}\r\n".encode())
                 elif parts[:2] == ["DOWNLOAD", "DATA"]:
                     offset = int(parts[2]) * 64
                     responses.put(f"DOWNLOAD DATA {parts[2]} {stored[offset:offset + 64].hex()}\r\n".encode())
                 elif parts == ["DOWNLOAD", "END"]:
-                    responses.put(f"DOWNLOAD COMPLETE {metadata[0]} {len(stored)} {binascii.crc32(stored):08X}\r\n".encode())
+                    name = metadata[0].encode().hex().upper()
+                    responses.put(f"DOWNLOAD COMPLETEHEX {name} {len(stored)} {binascii.crc32(stored):08X}\r\n".encode())
                 elif parts[0] == "ECHO":
                     responses.put(b"ECHO TEXT: " + payload[len(b"ECHO "):])
                 return len(payload)
@@ -397,7 +402,8 @@ class TestBluetoothGuiIntegration(unittest.TestCase):
                 window.test_mode_checkbox.click()
                 wait_for(lambda: b"TESTMODE ON\r\n" in written)
                 responses.put(b'{"state":"Fault","fault":1,"test_mode":true,"test_mode_supported":true,'
-                              b'"host_upload":"enabled","host_download":"enabled","host_echo":"enabled"}\r\n')
+                              b'"host_upload":"enabled","host_download":"enabled","host_echo":"enabled",'
+                              b'"file_guard":true,"upload_create":true}\r\n')
                 wait_for(lambda: window.transmit_button.text() == "Upload && Verify")
                 self.assertFalse(window.rx_button.isEnabled())
                 window.transmit_button.click()

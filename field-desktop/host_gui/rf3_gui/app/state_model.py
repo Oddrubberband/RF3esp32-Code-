@@ -69,6 +69,8 @@ class RadioCapabilities:
     supports_no_ack_files: bool = False
     supports_test_mode: bool = False
     supports_stored_file_tx: bool = False
+    supports_file_guard: bool = False
+    supports_create_upload: bool = False
     host_chunk_max: int = 64
     supports_host_storage: bool = False
     min_channel: int = MIN_CHANNEL
@@ -128,6 +130,8 @@ class DeviceSnapshot:
     rx_no_ack: bool = False
     rx_transfer_state: str = ""
     rx_transfer_id: str = ""
+    rx_attempt: int = 0
+    host_file_transfer: bool = False
     rx_received_bytes: int = 0
     rx_total_bytes: int = 0
     rx_error: str = ""

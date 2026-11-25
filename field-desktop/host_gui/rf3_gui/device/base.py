@@ -30,6 +30,10 @@ class DeviceBackend(QObject):
         self.rf_sample.emit(direction, identifier, phase, done, total)
         self.rf_report_details.emit(direction, identifier, details)
 
+    @property
+    def no_ack_selected(self) -> bool:
+        return self._no_ack_selected
+
     def set_no_ack_mode(self, enabled: bool) -> bool:
         self._no_ack_selected = bool(enabled)
         return True
@@ -58,7 +62,7 @@ class DeviceBackend(QObject):
     def refresh_storage(self) -> None:
         raise NotImplementedError
 
-    def import_file(self, source_path: Path) -> None:
+    def import_file(self, source_path: Path, *, replace_existing: bool = False) -> None:
         raise NotImplementedError
 
     def export_file(self, remote_name: str, destination_path: Path) -> None:

@@ -107,6 +107,8 @@ class _UploadSession:
     no_ack: bool = False
     verify_only: bool = False
     store_only: bool = False
+    create_only: bool = False
+    end_sent: bool = False
     chunk_bytes: int = HOST_TRANSFER_CHUNK_BYTES
     sequence: int = 0
     acknowledged_bytes: int = 0
@@ -124,6 +126,7 @@ class _DownloadSession:
     partial_path: Path | None
     verification_source: _UploadSession | None = None
     reuse_source: _UploadSession | None = None
+    stored_tx_mode: bool | None = None
     file: BinaryIO | None = None
     expected_size: int | None = None
     expected_crc32: int | None = None
@@ -160,11 +163,20 @@ class SerialDeviceBackend(DeviceBackend):
         self._stop_event = threading.Event()
         self._write_queue: queue.Queue[str | None] = queue.Queue()
         self._pending_commands: deque[str] = deque()
+        self._usb_sync_identity: dict[str, Any] | None = None
+        self._usb_sync_completed = False
+        self._identity_max_channel: int | None = None
+        self._legacy_rxnoack_error = False
+        self._host_cancel_kind: str | None = None
+        self._host_cleanup_only = False
         self._command_deadlines: dict[str, float] = {}
         self._last_tx_id = ""
         self._rf_tx_no_ack = False
         self._rf_tx_name: str | None = None
+        self._rf_expected: tuple[int, int] | None = None
+        self._rx_sample_attempt: int | None = None
         self._rf_resume_due: float | None = None
+        self._rf_resume_root: str = ''
         self._rf_retried_ids: set[str] = set()
         self._rf_stop_requested = False
         self._rf_status_probe = False
@@ -400,7 +412,8 @@ class SerialDeviceBackend(DeviceBackend):
         if self._serial is None or not self._identity_ok or not self._diagnostics_supported:
             self.command_finished.emit("DIAG", False, "Diagnostics require the RX Fix firmware on a connected board")
             return
-        if self._upload_session is not None or self._download_session is not None or self._storage_kind is not None:
+        if (self._upload_session is not None or self._download_session is not None
+                or self._host_cancel_kind is not None or self._storage_kind is not None):
             self.command_finished.emit("DIAG", False, "Wait for the PC file operation to finish")
             return
         self._send_command("DIAG")
@@ -490,6 +503,10 @@ class SerialDeviceBackend(DeviceBackend):
             if self._storage_kind == "delete":
                 if values.get("op") != "delete" or values.get("name") != self._storage_delete_name:
                     raise ValueError("SPIFFS delete response does not match the selected file")
+                name = self._storage_delete_name
+                if self._snapshot.telemetry.last_rx_file == name:
+                    self._snapshot = self._replace_snapshot(telemetry=replace(
+                        self._snapshot.telemetry, last_rx_file="", last_rx_path=""))
                 self._finish_storage(True, "Deleted " + self._storage_delete_name + " from SPIFFS")
                 return
             offset, total = values.get("offset"), values.get("total")
@@ -635,7 +652,7 @@ class SerialDeviceBackend(DeviceBackend):
         self._radio_command(console_protocol.power_command(level), ready=True)
 
     def set_fem_antenna(self, antenna: int) -> None:
-        if type(antenna) is not int or antenna not in (1, 2) or self._snapshot.fem_antenna is None:
+        if type(antenna) is not int or antenna != 1 or self._snapshot.fem_antenna is None:
             self.command_finished.emit("FEM ANT", False, "Antenna selection is unavailable")
             return
         if not self._operation_allowed("FEM ANT"):
@@ -673,6 +690,12 @@ class SerialDeviceBackend(DeviceBackend):
         if enabled and not self._snapshot.capabilities.supports_no_ack_files:
             self.command_finished.emit("MODE", False, "Flash matching firmware for no-ACK file mode")
             return False
+        if self._snapshot.confirmed_radio_state == RadioState.RX_LISTENING:
+            command = "RXNOACK" if enabled else "RX"
+            if not self._operation_allowed(command, radio=True) or self._snapshot.test_mode:
+                return False
+            if self._snapshot.rx_no_ack != enabled:
+                self._send_command(command)
         self._no_ack_selected = bool(enabled)
         return True
 
@@ -706,13 +729,17 @@ class SerialDeviceBackend(DeviceBackend):
         self._radio_command(console_protocol.power_down_command(), RadioState.POWER_DOWN)
 
     def stop(self) -> None:
-        # STOP is allowed to cancel active RF, but never interleaves a host-file
-        # or storage transaction (disconnect cancels those safely).
+        # An active host transfer has its own cancellation command.
         if self._serial is None or not self._handshake_ok:
             self.command_finished.emit("STOP", False, "Not connected")
             return
-        if self._upload_session or self._download_session or self._storage_kind or self._awaiting_echo:
-            self.command_finished.emit("STOP", False, "Finish the host operation or disconnect to cancel it")
+        if self._host_cancel_kind is not None:
+            return
+        if self._upload_session or self._download_session:
+            self._cancel_host_transfer()
+            return
+        if self._storage_kind or self._awaiting_echo:
+            self.command_finished.emit("STOP", False, "Finish the active host operation before stopping the radio")
             return
         if self._incoming_rx_active() and not self._rx_cancel_requested:
             self._rx_cancel_requested = True
@@ -740,6 +767,9 @@ class SerialDeviceBackend(DeviceBackend):
         if self._no_ack_selected and not self._snapshot.capabilities.supports_no_ack_files:
             self.command_finished.emit("TXNOACKHEX", False, "Flash matching no-ACK firmware")
             return
+        if self._snapshot.capabilities.supports_file_guard:
+            self._lookup_tx_file(None, name, stored_tx_mode=self._no_ack_selected)
+            return
         self._begin_rf_transfer(name, no_ack=self._no_ack_selected)
         self._send_command(console_protocol.stored_tx_command(name, no_ack=self._no_ack_selected))
 
@@ -761,16 +791,20 @@ class SerialDeviceBackend(DeviceBackend):
         return True
 
     def _begin_rf_transfer(self, name: str, *, source_path: Path | None = None,
-                           total_bytes: int = 0, no_ack: bool = False, resuming: bool = False) -> None:
+                           total_bytes: int = 0, no_ack: bool = False, resuming: bool = False,
+                           identity: tuple[int, int] | None = None) -> None:
         if not resuming:
+            self._rf_expected = identity
             self._delivery_session = uuid4().hex
             self._rf_retried_ids.clear()
+            self._rf_resume_root = ''
         self._rf_resume_due = None
         self._rf_stop_requested = False
         self._rf_status_probe = False
         self._rf_tx_no_ack = no_ack
         self._rf_tx_name = name
-        self.rf_tx_command_active.emit(True)
+        if not resuming:
+            self.rf_tx_command_active.emit(True)
         self._rf_tx_baseline_id = self._last_tx_id
         self._rf_tx_id = ""
         self._rf_progress_marker = None
@@ -845,18 +879,23 @@ class SerialDeviceBackend(DeviceBackend):
                 or loop not in {"", "None", "Idle"} or self._incoming_rx_active()
                 or any(cmd != "STATUS" for cmd in self._pending_commands)):
             return
-        self._rf_retried_ids.add(self._rf_tx_id)
+        previous = self._rf_tx_id
+        self._rf_retried_ids.add(previous)
+        if not self._rf_resume_root:
+            self._rf_resume_root = previous
         self._begin_rf_transfer(name, total_bytes=total, resuming=True)
-        self._send_command(console_protocol.stored_tx_command(name))
+        self._send_command(console_protocol.stored_tx_command(
+            name, identity=self._rf_expected, resume_from=self._rf_resume_root))
 
     def start_tx(self, source_path: Path) -> None:
         self._start_upload(source_path)
 
-    def import_file(self, source_path: Path) -> None:
+    def import_file(self, source_path: Path, *, replace_existing: bool = False) -> None:
         if self._storage_allowed("UPLOAD"):
-            self._start_upload(source_path, store_only=True)
+            self._start_upload(source_path, store_only=True, replace_existing=replace_existing)
 
-    def _start_upload(self, source_path: Path, *, store_only: bool = False) -> None:
+    def _start_upload(self, source_path: Path, *, store_only: bool = False,
+                      replace_existing: bool = False) -> None:
         if self._no_ack_selected and not store_only and not self._snapshot.test_mode and not (
                 self._snapshot.capabilities.supports_no_ack_files
                 and self._snapshot.capabilities.supports_stored_file_tx):
@@ -916,25 +955,53 @@ class SerialDeviceBackend(DeviceBackend):
             chunk_bytes=_negotiated_host_chunk(self._snapshot.capabilities.host_chunk_max),
         )
         caps = self._snapshot.capabilities
-        if (not session.verify_only and caps.supports_host_storage and caps.supports_stored_file_tx
+        if store_only and not replace_existing:
+            if not caps.supports_create_upload:
+                self.command_finished.emit("UPLOAD", False, "Create-only Import requires updated firmware")
+                return
+            session.create_only = True
+        if not store_only and caps.supports_file_guard:
+            try:
+                session.remote_name = console_protocol.staged_filename(source_path.name, data,
+                                                                       verify_only=session.verify_only)
+            except ValueError as exc:
+                self.command_finished.emit("UPLOAD", False, str(exc))
+                return
+            session.create_only = True
+        if (not store_only and caps.supports_host_storage and caps.supports_stored_file_tx
                 and caps.supports_host_file_download):
             first_name = source_path.name if console_protocol.valid_storage_name(source_path.name) else remote_name
             self._lookup_tx_file(session, first_name)
             return
+        if session.verify_only and not store_only and not session.create_only:
+            self.command_finished.emit("UPLOAD", False, "Safe Upload & Verify requires updated firmware")
+            return
         self._upload_prepared(session)
 
-    def _lookup_tx_file(self, source: _UploadSession, name: str) -> None:
+    def _lookup_tx_file(self, source: _UploadSession | None, name: str,
+                        *, stored_tx_mode: bool | None = None) -> None:
+        chunk = source.chunk_bytes if source else _negotiated_host_chunk(self._snapshot.capabilities.host_chunk_max)
         self._download_session = _DownloadSession(source_name=name, destination_path=None, partial_path=None,
-                                                  reuse_source=source, encoded_name=True, chunk_bytes=source.chunk_bytes)
+                                                  reuse_source=source, stored_tx_mode=stored_tx_mode,
+                                                  encoded_name=True, chunk_bytes=chunk)
         self._pause_status_polling()
         self._snapshot = self._replace_snapshot(connection_state=ConnectionState.BUSY)
         self.status_changed.emit(self._snapshot)
         self.transfer_changed.emit(TransferProgress(
-            state=TransferState.PREPARING, total_bytes=len(source.data), source_path=source.source_path,
-            message=f"Checking {name} on the board before uploading"))
-        self._send_host_command(console_protocol.download_begin_hex_command(name, source.chunk_bytes))
+            state=TransferState.PREPARING, total_bytes=len(source.data) if source else 0,
+            source_path=source.source_path if source else None,
+            message="Checking the board file before transmitting"))
+        self._send_host_command(console_protocol.download_begin_hex_command(
+            name, chunk, staged=source is not None and source.create_only))
 
-    def _lookup_miss(self, source: _UploadSession, checked_name: str) -> None:
+    def _lookup_miss(self, source: _UploadSession, checked_name: str, *, conflict: bool = False) -> None:
+        if source.verify_only and not source.create_only:
+            self._fail_host_transfer("Upload & Verify requires updated firmware when no matching board file exists", "DOWNLOAD")
+            return
+        if conflict and checked_name == source.remote_name:
+            self._fail_host_transfer("A different board file owns this name; the existing file was preserved",
+                                     "DOWNLOAD")
+            return
         self._download_session = None
         if checked_name != source.remote_name:
             self._lookup_tx_file(source, source.remote_name)
@@ -964,7 +1031,8 @@ class SerialDeviceBackend(DeviceBackend):
         )
         self._send_host_command(
             console_protocol.upload_begin_command(remote_name, len(data), self._upload_session.crc32,
-                                                  self._upload_session.chunk_bytes)
+                                                  self._upload_session.chunk_bytes,
+                                                  create_only=session.create_only)
         )
 
     def export_file(self, remote_name: str, destination_path: Path) -> None:
@@ -1330,7 +1398,8 @@ class SerialDeviceBackend(DeviceBackend):
         self.command_finished.emit("CONNECT", False, message)
 
     def _send_handshake_status(self) -> None:
-        if self._serial is None or self._handshake_ok or self._handshake_write_pending:
+        if (self._serial is None or self._handshake_ok or self._handshake_write_pending
+                or self._usb_sync_identity is not None):
             return
         # A driver write can succeed while the remote misses the first HELLO.
         # Only one pair of probes may be in flight during the handshake.
@@ -1344,8 +1413,11 @@ class SerialDeviceBackend(DeviceBackend):
         if self._serial is None:
             self.command_finished.emit(command, False, "Not connected")
             return
+        if command in {"RX", "RXNOACK"}:
+            self._legacy_rxnoack_error = False
         if command == "STATUS":
-            if self._upload_session is not None or self._download_session is not None or self._storage_kind is not None:
+            if (self._upload_session is not None or self._download_session is not None
+                    or self._host_cancel_kind is not None or self._storage_kind is not None):
                 return
             if "STATUS" in self._pending_commands:
                 return
@@ -1385,7 +1457,25 @@ class SerialDeviceBackend(DeviceBackend):
             command for command in self._pending_commands if command != "STATUS"
         )
 
+    def _cancel_host_transfer(self) -> None:
+        if self._host_cancel_kind is not None:
+            return
+        kind = "UPLOAD" if self._upload_session is not None else "DOWNLOAD"
+        command = f"{kind} CANCEL"
+        upload = self._upload_session
+        if upload is not None and upload.end_sent and self._snapshot.capabilities.supports_file_guard:
+            command += f" RESULT {upload.remote_name} {len(upload.data)} {upload.crc32:08X}"
+        self._host_cancel_kind = kind
+        if command not in self._pending_commands:
+            self._pending_commands = deque(item for item in self._pending_commands
+                                           if not item.startswith(kind + " "))
+            self._send_host_command(command)
+        self._host_transfer_timer.start(HOST_TRANSFER_TIMEOUT_MS)
+
     def _on_host_transfer_timeout(self) -> None:
+        if self._host_cancel_kind is not None:
+            self._on_read_failed("ESP did not confirm the host transfer cancellation. Reconnect to recover the session.")
+            return
         command = self._last_host_command
         if (self._serial is not None and command is not None
                 and self._snapshot.capabilities.supports_host_chunk_retry
@@ -1421,6 +1511,8 @@ class SerialDeviceBackend(DeviceBackend):
         self._download_session = None
         self._last_host_command = None
         self._host_retry_count = 0
+        self._host_cancel_kind = None
+        self._host_cleanup_only = False
 
     def _fail_host_transfer(self, message: str, kind: str) -> None:
         self._host_transfer_timer.stop()
@@ -1428,13 +1520,6 @@ class SerialDeviceBackend(DeviceBackend):
         self._pending_commands = deque(
             command for command in self._pending_commands if not command.startswith(prefix)
         )
-        if self._serial is not None:
-            cancel = (
-                console_protocol.upload_cancel_command()
-                if kind == "UPLOAD"
-                else console_protocol.download_cancel_command()
-            )
-            self._write_queue.put(cancel)
         path = (
             self._upload_session.source_path
             if self._upload_session is not None
@@ -1445,12 +1530,16 @@ class SerialDeviceBackend(DeviceBackend):
             else None
         )
         self._discard_host_transfer()
+        if self._serial is not None:
+            self._host_cancel_kind = kind
+            self._host_cleanup_only = True
+            self._send_host_command(f"{kind} CANCEL")
         self._snapshot = self._replace_snapshot(
-            connection_state=ConnectionState.CONNECTED,
+            connection_state=ConnectionState.BUSY if self._host_cancel_kind else ConnectionState.CONNECTED,
             requested_radio_state=self._snapshot.confirmed_radio_state,
         )
         self.status_changed.emit(self._snapshot)
-        if self._handshake_ok:
+        if self._handshake_ok and self._host_cancel_kind is None:
             self._status_poll_timer.start()
         self.transfer_changed.emit(
             TransferProgress(
@@ -1517,17 +1606,21 @@ class SerialDeviceBackend(DeviceBackend):
                 # Latch this choice in the session: even a later STATUS change
                 # must never turn a validation upload into an RF TX command.
                 self._upload_session = None
+                staged = console_protocol.is_staged_filename(session.remote_name)
                 self._download_session = _DownloadSession(
                     source_name=session.remote_name, destination_path=None,
                     partial_path=None, verification_source=session,
-                    chunk_bytes=session.chunk_bytes,
+                    encoded_name=staged, chunk_bytes=session.chunk_bytes,
                 )
                 self.transfer_changed.emit(TransferProgress(
                     state=TransferState.VERIFYING, total_bytes=len(session.data),
                     message="ESP verified upload CRC32; reading file back from SPIFFS; no nRF24 TX",
                     source_path=session.source_path,
                 ))
-                self._send_host_command(console_protocol.download_begin_command(session.remote_name, session.chunk_bytes))
+                command = (console_protocol.download_begin_hex_command(session.remote_name, session.chunk_bytes, staged=True)
+                           if staged else
+                           console_protocol.download_begin_command(session.remote_name, session.chunk_bytes))
+                self._send_host_command(command)
                 return
             self._transmit_prepared(session, session.remote_name)
 
@@ -1547,8 +1640,9 @@ class SerialDeviceBackend(DeviceBackend):
             return
         source_path = session.source_path
         total = len(session.data)
+        identity = (total, session.crc32) if self._snapshot.capabilities.supports_file_guard else None
         if self._snapshot.capabilities.supports_stored_file_tx:
-            command = console_protocol.stored_tx_command(remote_name, no_ack=session.no_ack)
+            command = console_protocol.stored_tx_command(remote_name, no_ack=session.no_ack, identity=identity)
         elif remote_name.upper() in {"LOOP", "STOP"}:
             self._snapshot = self._replace_snapshot(connection_state=ConnectionState.CONNECTED,
                                                     requested_radio_state=self._snapshot.confirmed_radio_state)
@@ -1560,7 +1654,8 @@ class SerialDeviceBackend(DeviceBackend):
             return
         else:
             command = console_protocol.tx_command(remote_name)
-        self._begin_rf_transfer(remote_name, source_path=source_path, total_bytes=total, no_ack=session.no_ack)
+        self._begin_rf_transfer(remote_name, source_path=source_path, total_bytes=total,
+                                no_ack=session.no_ack, identity=identity)
         self._send_command(command)
         self._status_poll_timer.start()
 
@@ -1569,6 +1664,7 @@ class SerialDeviceBackend(DeviceBackend):
         if session is None:
             return
         if session.acknowledged_bytes >= len(session.data):
+            session.end_sent = True
             self._send_host_command(console_protocol.upload_end_command())
             return
         session.current_chunk = session.data[
@@ -1584,9 +1680,9 @@ class SerialDeviceBackend(DeviceBackend):
         if session is None:
             return
         source = session.reuse_source
-        if source is not None:
+        if source is not None or session.stored_tx_mode is not None:
             if command.startswith("DOWNLOAD BEGINHEX "):
-                if not accepted and message == "DOWNLOAD ERROR file_not_found_or_too_large":
+                if source is not None and not accepted and message == "DOWNLOAD ERROR file_not_found_or_too_large":
                     self._lookup_miss(source, session.source_name)
                 elif accepted and session.ready:
                     # BEGINHEX hashes the board file. Close the read session without requesting DATA.
@@ -1596,12 +1692,27 @@ class SerialDeviceBackend(DeviceBackend):
             elif command == console_protocol.download_cancel_command():
                 if not accepted or message != "DOWNLOAD CANCELLED" or not session.ready:
                     self._fail_host_transfer("Board did not confirm closing the file lookup", "DOWNLOAD")
+                elif session.stored_tx_mode is not None:
+                    identity = (session.expected_size, session.expected_crc32)
+                    self._download_session = None
+                    self._snapshot = self._replace_snapshot(connection_state=ConnectionState.CONNECTED)
+                    self._begin_rf_transfer(session.source_name, total_bytes=identity[0],
+                                            no_ack=session.stored_tx_mode, identity=identity)
+                    self._send_command(console_protocol.stored_tx_command(
+                        session.source_name, no_ack=session.stored_tx_mode, identity=identity))
                 elif session.expected_size == len(source.data) and session.expected_crc32 == source.crc32:
                     self._download_session = None
                     self.log_event.emit("info", f"Reusing {session.source_name} from board storage: size and CRC32 match")
-                    self._transmit_prepared(source, session.source_name)
+                    if source.verify_only:
+                        self._download_session = _DownloadSession(
+                            session.source_name, None, None, verification_source=source,
+                            encoded_name=True, chunk_bytes=source.chunk_bytes)
+                        self._send_host_command(console_protocol.download_begin_hex_command(
+                            session.source_name, source.chunk_bytes, staged=True))
+                    else:
+                        self._transmit_prepared(source, session.source_name)
                 else:
-                    self._lookup_miss(source, session.source_name)
+                    self._lookup_miss(source, session.source_name, conflict=True)
             return
         if not accepted:
             self._fail_host_transfer(message, "DOWNLOAD")
@@ -1825,6 +1936,10 @@ class SerialDeviceBackend(DeviceBackend):
         self._handshake_ok = False
         self._identity_ok = False
         self._diagnostics_supported = False
+        self._usb_sync_identity = None
+        self._usb_sync_completed = False
+        self._identity_max_channel = None
+        self._legacy_rxnoack_error = False
         self._handshake_write_pending = False
         stop_event.set()
         for timer in (self._handshake_timer, self._setup_timer, self._handshake_status_timer,
@@ -1846,6 +1961,7 @@ class SerialDeviceBackend(DeviceBackend):
         self._observed_rf_id = ""
         self._rf_sample_last.clear()
         self._rf_sample_retired.clear()
+        self._rx_sample_attempt = None
         self._rx_cancel_requested = False
         self._pending_selection_name = None
         self._storage_kind = None
@@ -1961,14 +2077,13 @@ class SerialDeviceBackend(DeviceBackend):
                     self._finish_pending(bool(values["accepted"]), line, values["command"])
             return
 
-        status_start = line.find("profile=")
-        if status_start >= 0:
+        if line.startswith("profile="):
             # On USB a board can print a shorter console summary immediately
             # before the full JSON reply. Only the latter carries all fields.
             if self._has_json_transfer_status:
                 return
             try:
-                self._apply_status(parse_status_line(line[status_start:]))
+                self._apply_status(parse_status_line(line))
             except (ValueError, TypeError, OverflowError):
                 self.log_event.emit("warning", "Ignored invalid numeric fields in RF3 status")
                 return
@@ -2005,8 +2120,48 @@ class SerialDeviceBackend(DeviceBackend):
         self._finish_pending(True, "Diagnostics received", "DIAG")
 
     def _handle_host_transfer_line(self, line: str) -> bool:
-        if line == "DOWNLOAD CANCELLED":
-            self._finish_pending(True, line, "DOWNLOAD CANCEL")
+        kind = self._host_cancel_kind
+        if kind is not None and line.startswith(kind + " "):
+            upload = self._upload_session
+            stored = kind == "UPLOAD" and line.startswith("UPLOAD STORED ")
+            if upload and upload.end_sent and line.startswith(("UPLOAD COMPLETE ", "UPLOAD STORED ")):
+                parts = line.split()
+                try:
+                    upload.complete = (len(parts) == 5 and parts[2] == upload.remote_name
+                                       and int(parts[3]) == len(upload.data) and int(parts[4], 16) == upload.crc32)
+                except ValueError:
+                    upload.complete = False
+            rejected = line.startswith(f"{kind} CANCEL ERROR ")
+            if line == f"{kind} CANCELLED" or (stored and upload and upload.complete) or rejected:
+                cleanup_only = self._host_cleanup_only
+                self._host_transfer_timer.stop()
+                self._pending_commands = deque(command for command in self._pending_commands
+                                               if not command.startswith(f"{kind} CANCEL"))
+                if rejected:
+                    message = f"ESP rejected {kind.lower()} cancellation: {line.split(' ERROR ', 1)[1]}"
+                elif upload and upload.complete:
+                    message = f"Stopped. ESP already stored {upload.remote_name}."
+                elif upload and upload.end_sent:
+                    message = "Stopped. The ESP may have committed the upload before cancellation."
+                elif self._download_session and self._download_session.verification_source:
+                    message = "Stopped readback. The uploaded file remains on the ESP."
+                else:
+                    message = "ESP confirmed the host transfer cancellation"
+                self._discard_host_transfer()
+                self._snapshot = self._replace_snapshot(connection_state=ConnectionState.CONNECTED)
+                self.status_changed.emit(self._snapshot)
+                if not cleanup_only:
+                    state = TransferState.FAILED if rejected else TransferState.CANCELLED
+                    self.transfer_changed.emit(TransferProgress(state=state, message=message))
+                    self.command_finished.emit("STOP", not rejected, message)
+                self._status_poll_timer.start()
+                self.request_status()
+            return True
+        if line in {"UPLOAD CANCELLED", "DOWNLOAD CANCELLED"}:
+            self._finish_pending(True, line, line.split()[0] + " CANCEL")
+            return True
+        if line.startswith(("UPLOAD CANCEL ERROR ", "DOWNLOAD CANCEL ERROR ")):
+            self._finish_pending(False, line, line.split()[0] + " CANCEL")
             return True
         if line.startswith("UPLOAD ERROR"):
             self._finish_pending(False, line, "UPLOAD")
@@ -2017,6 +2172,8 @@ class SerialDeviceBackend(DeviceBackend):
 
         upload = self._upload_session
         if upload is not None and line.startswith("UPLOAD READY "):
+            begin = ("UPLOAD BEGINNEW" if console_protocol.is_staged_filename(upload.remote_name)
+                     else "UPLOAD BEGINCREATE") if upload.create_only else "UPLOAD BEGIN"
             parts = line.split()
             try:
                 valid = (
@@ -2029,10 +2186,10 @@ class SerialDeviceBackend(DeviceBackend):
             except ValueError:
                 valid = False
             if not valid:
-                self._finish_pending(False, "Invalid UPLOAD READY response", "UPLOAD BEGIN")
+                self._finish_pending(False, "Invalid UPLOAD READY response", begin)
                 return True
             upload.ready = True
-            self._finish_pending(True, line, "UPLOAD BEGIN")
+            self._finish_pending(True, line, begin)
             return True
 
         if upload is not None and line.startswith("UPLOAD ACK "):
@@ -2070,7 +2227,8 @@ class SerialDeviceBackend(DeviceBackend):
 
         download = self._download_session
         if download is not None and line.startswith(("DOWNLOAD READY ", "DOWNLOAD READYHEX ")):
-            if download.reuse_source is not None and (download.ready or not line.startswith("DOWNLOAD READYHEX ")):
+            lookup = download.reuse_source is not None or download.stored_tx_mode is not None
+            if lookup and (download.ready or not line.startswith("DOWNLOAD READYHEX ")):
                 return True
             parts = line.split()
             try:
@@ -2082,7 +2240,7 @@ class SerialDeviceBackend(DeviceBackend):
                     and name == download.source_name
                     and 0 <= size <= PROTOCOL_V2_MAX_FILE_SIZE
                     and 0 <= crc32 <= 0xFFFFFFFF
-                    and (download.reuse_source is None or re.fullmatch(r"[0-9a-fA-F]{8}", parts[4]) is not None)
+                    and (not lookup or re.fullmatch(r"[0-9a-fA-F]{8}", parts[4]) is not None)
                     and (download.chunk_bytes == HOST_TRANSFER_CHUNK_BYTES or int(parts[5], 10) == download.chunk_bytes)
                 )
             except (IndexError, ValueError, UnicodeError):
@@ -2218,6 +2376,18 @@ class SerialDeviceBackend(DeviceBackend):
             self._finish_pending(True, "nRF rail output confirmed by STATUS", "NRFRAIL")
 
     def _apply_status(self, values: dict[str, Any]) -> None:
+        maximum = values.get("max_channel")
+        if type(maximum) is int and 0 <= maximum <= MAX_CHANNEL:
+            self._identity_max_channel = maximum
+        if self._usb_sync_identity is not None:
+            return  # Wait for the board to release the previous USB file session.
+        if (values.get("usb_sync") is True and not self._handshake_ok
+                and not self._usb_sync_completed and self._active_device is not None
+                and not _is_bluetooth_serial(self._active_device)):
+            # STATUS can arrive first if the first HELLO was lost.
+            self._usb_sync_identity = {}
+            self._send_command("HOSTSYNC")
+            return
         state = _radio_state_from_text(str(values.get("State") or values.get("state") or "Unknown"))
         if self._serial is not None and self._identity_ok and values.get("state") == "Unavailable":
             # A verified RF3 host response can remain usable while another
@@ -2225,13 +2395,16 @@ class SerialDeviceBackend(DeviceBackend):
             board_power, board_fields = self._board_power_fields(values)
             self._confirm_nrf_rail(board_fields)
             rx_fields = self._rx_status_fields(values)
+            requested = "STATUS" in self._pending_commands
             self._status_response_timer.stop()
             self._finish_pending(True, "RF3 connected; radio status unavailable", "STATUS")
             self._snapshot = self._replace_snapshot(
                 confirmed_radio_state=RadioState.UNKNOWN,
                 power_level=None,
                 connection_state=(ConnectionState.BUSY if self._local_operation_active(include_rx=False)
-                                  or rx_fields["rx_transfer_state"] in RX_ACTIVE_STATES else ConnectionState.CONNECTED),
+                                  or rx_fields["rx_transfer_state"] in RX_ACTIVE_STATES
+                                   or values.get("loop") in ("Morse", "CwLoop", "TxLoop", "Busy")
+                                   else ConnectionState.CONNECTED),
                 telemetry=replace(self._snapshot.telemetry, **board_fields),
                 capabilities=replace(self._snapshot.capabilities, supports_board_power=board_power,
                                      supports_battery_percent=bool(board_fields["battery_state"])),
@@ -2240,7 +2413,7 @@ class SerialDeviceBackend(DeviceBackend):
             )
             self.status_changed.emit(self._snapshot)
             self._sample_rx_status(values, rx_fields)
-            if (values.get("rx_state") == rx_fields["rx_transfer_state"]
+            if requested or (values.get("rx_state") == rx_fields["rx_transfer_state"]
                     and isinstance(values.get("rx_id"), str)
                     and values["rx_id"].upper() == rx_fields["rx_transfer_id"]
                     and parse_fraction(values.get("rx_bytes")) ==
@@ -2304,7 +2477,8 @@ class SerialDeviceBackend(DeviceBackend):
             rpd=_status_enabled(values.get("rpd")),
         )
         capabilities = RadioCapabilities(
-            max_channel=83 if antenna is not None else MAX_CHANNEL,
+            max_channel=self._identity_max_channel if self._identity_max_channel is not None
+            else 83 if antenna is not None else MAX_CHANNEL,
             host_chunk_max=_negotiated_host_chunk(values.get("host_chunk_max")),
             supports_host_storage=_status_enabled(values.get("host_storage")),
             supports_battery_percent=bool(board_fields["battery_state"]),
@@ -2317,6 +2491,8 @@ class SerialDeviceBackend(DeviceBackend):
             supports_host_echo=_status_enabled(values.get("host_echo")),
             supports_test_mode=_status_enabled(values.get("test_mode_supported")),
             supports_stored_file_tx=_status_enabled(values.get("host_stored_tx")),
+            supports_file_guard=values.get("file_guard") is True,
+            supports_create_upload=values.get("upload_create") is True,
             supports_no_ack_files=_status_enabled(values.get("no_ack_files")),
         )
         power = values.get("power")
@@ -2350,6 +2526,9 @@ class SerialDeviceBackend(DeviceBackend):
             capabilities=capabilities,
             **rx_fields,
         )
+        if (state == RadioState.RX_LISTENING and "rx_no_ack" in values
+                and not any(cmd in ("RX", "RXNOACK") for cmd in self._pending_commands)):
+            self._no_ack_selected = self._snapshot.rx_no_ack
         self.status_changed.emit(self._snapshot)
         if confirmed_test_request:
             self._finish_pending(True, "ESP STATUS confirmed requested test mode", "TESTMODE")
@@ -2387,8 +2566,23 @@ class SerialDeviceBackend(DeviceBackend):
             return
         self._identity_ok = True
         self._diagnostics_supported = values.get("diagnostics") is True
+        maximum = values.get("max_channel")
+        if type(maximum) is int and 0 <= maximum <= MAX_CHANNEL:
+            self._identity_max_channel = maximum
+        if self._usb_sync_identity is not None:
+            self._usb_sync_identity = values
+            return
         if self._handshake_ok:
             return
+        if (values.get("usb_host_sync") is True and not self._usb_sync_completed
+                and self._active_device is not None
+                and not _is_bluetooth_serial(self._active_device)):
+            self._usb_sync_identity = values
+            self._send_command("HOSTSYNC")
+            return
+        self._finish_identity(values)
+
+    def _finish_identity(self, values: dict[str, Any]) -> None:
         self._handshake_ok = True
         self._setup_timer.stop()
         self._handshake_timer.stop()
@@ -2398,6 +2592,9 @@ class SerialDeviceBackend(DeviceBackend):
             connection_state=ConnectionState.CONNECTED,
             connection_detail=f"RF3 {values['node_name']} connected; waiting for radio status",
             profile=values["profile"],
+            capabilities=replace(self._snapshot.capabilities, max_channel=self._identity_max_channel
+                                 if self._identity_max_channel is not None
+                                 else self._snapshot.capabilities.max_channel),
         )
         self.status_changed.emit(self._snapshot)
         self.command_finished.emit("CONNECT", True, "RF3 HELLO identity received")
@@ -2427,6 +2624,7 @@ class SerialDeviceBackend(DeviceBackend):
 
     def _local_operation_active(self, *, include_rx: bool = True) -> bool:
         return bool(self._upload_session is not None or self._download_session is not None
+                    or self._host_cancel_kind is not None
                     or any(command.startswith(("FEM ANT ", "FEM LNA ")) for command in self._pending_commands)
                     or self._storage_kind is not None or self._awaiting_echo is not None
                     or self._awaiting_test_mode is not None or self._rf_tx_name is not None
@@ -2439,6 +2637,7 @@ class SerialDeviceBackend(DeviceBackend):
         previous = {
             "rx_transfer_state": self._snapshot.rx_transfer_state,
             "rx_transfer_id": self._snapshot.rx_transfer_id,
+            "rx_attempt": self._snapshot.rx_attempt,
             "rx_received_bytes": self._snapshot.rx_received_bytes,
             "rx_total_bytes": self._snapshot.rx_total_bytes,
             "rx_error": self._snapshot.rx_error,
@@ -2486,7 +2685,10 @@ class SerialDeviceBackend(DeviceBackend):
         received, total = parsed
         inconsistent_complete = state == "Completed" and (
             received != total or error.lower() not in {"", "none", "0"})
-        if identifier == previous["rx_transfer_id"]:
+        attempt = values.get("rx_attempt", 0)
+        if type(attempt) is not int or not 0 <= attempt <= 0xFFFFFFFF:
+            raise ValueError("Invalid receiver attempt number")
+        if identifier == previous["rx_transfer_id"] and (not attempt or attempt == previous["rx_attempt"]):
             if previous["rx_transfer_state"] in RX_TERMINAL_STATES:
                 return previous  # Duplicate/late active snapshots cannot revive it.
             if total != previous["rx_total_bytes"]:
@@ -2510,7 +2712,7 @@ class SerialDeviceBackend(DeviceBackend):
             # existing guard/deadline intact.
             self._rx_cancel_requested = False
             self._rx_cancel_timer.stop()
-        return dict(rx_transfer_state=state, rx_transfer_id=identifier,
+        return dict(rx_transfer_state=state, rx_transfer_id=identifier, rx_attempt=attempt,
                     rx_received_bytes=received, rx_total_bytes=total, rx_error=_status_text(error))
 
     def _emit_rf_sample(self, direction: str, identifier: str, phase: str,
@@ -2549,6 +2751,7 @@ class SerialDeviceBackend(DeviceBackend):
             "total_packets": sequence[1],
             "file_crc32_hex": "0x" + crc.upper() if isinstance(crc, str) and re.fullmatch(r"[0-9a-fA-F]{8}", crc) else None,
             "tx_retries": retries if type(retries) is int and retries >= 0 else None,
+            **({"rx_attempt": self._rx_sample_attempt} if direction == "RX" else {}),
         })
 
     def _end_rf_trace(self, direction: str, identifier: str, phase: str) -> None:
@@ -2565,6 +2768,11 @@ class SerialDeviceBackend(DeviceBackend):
     def _sample_rx_status(self, values: dict[str, Any], fields: dict[str, Any]) -> None:
         if self._snapshot.test_mode:
             return
+        if values.get("rx_state") == fields["rx_transfer_state"] == "Idle":
+            attempt = values.get("rx_attempt")
+            if type(attempt) is int and 0 <= attempt <= 0xFFFFFFFF:
+                self._rx_sample_attempt = attempt
+            return
         # _rx_status_fields can retain or clamp previous metadata. Only the
         # accepted bytes/phase actually present in this wire report are fresh.
         parsed = parse_fraction(values.get("rx_bytes"))
@@ -2576,7 +2784,14 @@ class SerialDeviceBackend(DeviceBackend):
             if fields["rx_transfer_state"] in {"Failed", "Cancelled"}:
                 self._end_rf_trace("RX", fields["rx_transfer_id"], fields["rx_transfer_state"])
             return
-        self._emit_rf_sample("RX", identifier, fields["rx_transfer_state"], *parsed, values)
+        attempt = fields.get("rx_attempt", 0)
+        restarted = bool(
+            attempt and self._rx_sample_attempt is not None and attempt != self._rx_sample_attempt)
+        if restarted:
+            self._rf_sample_last.pop("RX", None)
+        self._rx_sample_attempt = attempt
+        self._emit_rf_sample("RX", identifier, fields["rx_transfer_state"], *parsed, values,
+                             allow_terminal=restarted)
 
     def _apply_transfer_status(self, values: dict[str, Any]) -> None:
         if self._snapshot.test_mode or self._upload_session is not None or self._download_session is not None:
@@ -2616,6 +2831,15 @@ class SerialDeviceBackend(DeviceBackend):
                 self._finish_rf_transfer(TransferState.FAILED, "Invalid RF progress metadata; delivery is unconfirmed")
             return
         sent, total = parsed
+        if self._rf_tx_name is not None and self._rf_expected is not None and tx_state not in {
+            "Preparing", "Failed", "Cancelled"
+        }:
+            crc = values.get("tx_crc32")
+            if (not isinstance(crc, str) or re.fullmatch(r"[0-9a-fA-F]{8}", crc) is None
+                    or (total, int(crc, 16)) != self._rf_expected):
+                self._finish_rf_transfer(TransferState.FAILED,
+                                         "The ESP reported different file contents; delivery is unconfirmed")
+                return
         mode = values.get("tx_no_ack", False)  # Legacy reliable firmware omits it.
         mode_mismatch = self._rf_tx_name is not None and mode is not self._rf_tx_no_ack
         if mode_mismatch and tx_state not in {"Cancelled", "Failed"}:
@@ -2685,8 +2909,9 @@ class SerialDeviceBackend(DeviceBackend):
                                                             total_bytes=total, message=message))
             return
         self._observed_rf_id = tx_id
-        marker = (tx_id, tx_state, sent, total, values.get("tx_seq"), values.get("tx_retries"))
-        if self._rf_tx_name is not None and (marker != self._rf_progress_marker or self._rf_status_probe):
+        marker = (tx_id, tx_state, sent, total, values.get("tx_seq"), values.get("tx_retries"),
+                  values.get("tx_work") if mode is True else None)
+        if self._rf_tx_name is not None and marker != self._rf_progress_marker:
             self._rf_status_probe = False
             self._rf_resume_due = None
             self._rf_progress_marker = marker
@@ -2695,6 +2920,20 @@ class SerialDeviceBackend(DeviceBackend):
                                                     total_bytes=total, message=message))
 
     def _apply_known_response(self, line: str) -> bool:
+        status_busy = line == "ERR STATUS" or line.startswith("ERR STATUS ")
+        legacy_status_busy = line == "Command system is busy." and list(self._pending_commands) == ["STATUS"]
+        if (status_busy or legacy_status_busy) and "STATUS" in self._pending_commands:
+            # The poll timer can retry, bounded by the original telemetry deadline.
+            self._pending_commands.remove("STATUS")
+            return True
+        legacy_failure = next((command for prefix, command in (
+            ("Could not enter sleep.", "SLEEP"), ("Could not wake radio.", "WAKE"),
+            ("Could not power down radio.", "POWERDOWN"), ("Could not reach standby.", "STANDBY"),
+            ("Could not stop activity.", "STOP"),
+        ) if line.startswith(prefix) and command in self._pending_commands), None)
+        if legacy_failure is not None:
+            self._finish_pending(False, line, legacy_failure)
+            return True
         if line.startswith(("FEM ERROR", "ERR FEM ")):
             self._finish_pending(False, line, "FEM ANT")
             self._finish_pending(False, line, "FEM LNA")
@@ -2744,8 +2983,32 @@ class SerialDeviceBackend(DeviceBackend):
             return True
         if line in {"OK STATUS", "OK DIAG"}:
             return True  # Acceptance is not usable telemetry; keep the original deadline.
+        if line == "OK HOSTSYNC" and self._usb_sync_identity is not None:
+            values = self._usb_sync_identity
+            self._usb_sync_identity = None
+            self._usb_sync_completed = True
+            self._finish_pending(True, line, "HOSTSYNC")
+            if values:
+                self._finish_identity(values)
+            else:
+                self._write_queue.put("HELLO")
+            self.request_status()
+            return True
+        if match := re.fullmatch(r"Channel must be in the range 0-(\d+)\.", line):
+            if any(command.startswith("CHANNEL ") for command in self._pending_commands):
+                maximum = int(match.group(1))
+                if maximum <= MAX_CHANNEL:
+                    self._identity_max_channel = maximum
+                    self._snapshot = self._replace_snapshot(capabilities=replace(
+                        self._snapshot.capabilities, max_channel=maximum))
+                    self.status_changed.emit(self._snapshot)
+                self._finish_pending(False, line, "CHANNEL")
+                return True
         if line.startswith("OK "):
             command = line[3:]
+            if command.startswith("CW LOOP ") and command in self._pending_commands:
+                self._snapshot = self._replace_snapshot(connection_state=ConnectionState.BUSY)
+                self.status_changed.emit(self._snapshot)
             if command.startswith("TEXT "):
                 self.text_message_received.emit("tx", command[len("TEXT "):])
             self._finish_pending(True, line, command)
@@ -2757,6 +3020,12 @@ class SerialDeviceBackend(DeviceBackend):
                 self._fail_test_tx(line)
             token = line[4:].split(" ", 1)[0]
             known = {item.split(" ", 1)[0] for item in self._pending_commands}
+            if token == "RX" and "RXNOACK" in known:
+                token = "RXNOACK"
+                self._legacy_rxnoack_error = True
+            if line == "ERR RXNOACK" and token not in known and self._legacy_rxnoack_error:
+                self._legacy_rxnoack_error = False
+                return True
             if token in known:
                 self._finish_pending(False, line, token)
             else:
@@ -2770,15 +3039,15 @@ class SerialDeviceBackend(DeviceBackend):
             self._finish_pending(True, line, "TEXT")
             self.request_status()
             return True
-        if match := re.search(r"RX listening on channel (\d+)", line):
-            expected = "RX"
+        if match := re.match(r"RX listening on channel (\d+)", line):
+            expected = "RXNOACK" if "RXNOACK" in self._pending_commands else "RX"
             state = RadioState.RX_LISTENING
             self._snapshot = self._replace_snapshot(
                 connection_state=ConnectionState.CONNECTED,
                 confirmed_radio_state=state,
                 channel=int(match.group(1)),
             )
-        elif match := re.search(r"Radio is in standby on channel (\d+)", line):
+        elif match := re.match(r"Radio is in standby on channel (\d+)", line):
             expected = "STANDBY"
             state = RadioState.STANDBY
             self._snapshot = self._replace_snapshot(
@@ -2786,35 +3055,35 @@ class SerialDeviceBackend(DeviceBackend):
                 confirmed_radio_state=state,
                 channel=int(match.group(1)),
             )
-        elif "Stop complete. Radio is in standby." in line or "Radio is already in standby." in line:
+        elif line in {"Stop complete. Radio is in standby.", "Radio is already in standby."}:
             expected = "STOP"
             state = RadioState.STANDBY
             self._snapshot = self._replace_snapshot(
                 connection_state=ConnectionState.CONNECTED,
                 confirmed_radio_state=state,
             )
-        elif "Radio is sleeping." in line:
+        elif line == "Radio is sleeping.":
             expected = "SLEEP"
             state = RadioState.SLEEP
             self._snapshot = self._replace_snapshot(
                 connection_state=ConnectionState.CONNECTED,
                 confirmed_radio_state=state,
             )
-        elif "Radio is awake in standby." in line:
+        elif line == "Radio is awake in standby.":
             expected = "WAKE"
             state = RadioState.STANDBY
             self._snapshot = self._replace_snapshot(
                 connection_state=ConnectionState.CONNECTED,
                 confirmed_radio_state=state,
             )
-        elif "Radio is powered down." in line:
+        elif line == "Radio is powered down.":
             expected = "POWERDOWN"
             state = RadioState.POWER_DOWN
             self._snapshot = self._replace_snapshot(
                 connection_state=ConnectionState.CONNECTED,
                 confirmed_radio_state=state,
             )
-        elif match := re.search(r"Radio reinitialized on channel (\d+)", line):
+        elif match := re.match(r"Radio reinitialized on channel (\d+)", line):
             expected = "CHANNEL"
             state = RadioState.STANDBY
             self._snapshot = self._replace_snapshot(
@@ -2822,11 +3091,12 @@ class SerialDeviceBackend(DeviceBackend):
                 confirmed_radio_state=state,
                 channel=int(match.group(1)),
             )
-        elif match := re.search(r"Packet TX power set to (\d+) on channel (\d+)", line):
+        elif match := re.match(r"Packet TX power set to (\d+) on channel (\d+)(?: state=(\w+))?", line):
             expected = "POWER"
-            state = self._snapshot.confirmed_radio_state
+            state = _radio_state_from_text(match.group(3) or "Standby")
             self._snapshot = self._replace_snapshot(
                 connection_state=ConnectionState.CONNECTED,
+                confirmed_radio_state=state,
                 power_level=int(match.group(1)),
                 channel=int(match.group(2)),
             )
@@ -2837,7 +3107,7 @@ class SerialDeviceBackend(DeviceBackend):
                 connection_state=ConnectionState.BUSY,
                 confirmed_radio_state=state,
             )
-        elif match := re.search(r"Morse started on channel (\d+)", line):
+        elif match := re.match(r"Morse started on channel (\d+)", line):
             expected = "MORSE"
             state = RadioState.TX_BUSY
             self._snapshot = self._replace_snapshot(
@@ -2845,7 +3115,16 @@ class SerialDeviceBackend(DeviceBackend):
                 confirmed_radio_state=state,
                 channel=int(match.group(1)),
             )
-        elif match := re.search(r"CW mode active on channel (\d+) at power level (\d+)", line):
+        elif line.startswith("CW LOOP queued "):
+            if any(item.startswith("CW LOOP ") for item in self._pending_commands):
+                self._snapshot = self._replace_snapshot(connection_state=ConnectionState.BUSY)
+                self.status_changed.emit(self._snapshot)
+                self._finish_pending(True, line, "CW LOOP")
+                self.request_status()
+            return True
+        elif re.search(r"\bloop \d+\)$", line) and line.startswith("CW mode active "):
+            return True  # Older firmware logged restored packet settings between bursts.
+        elif match := re.search(r"^CW mode active on channel (\d+) at power level (\d+)", line):
             expected = "CW"
             state = RadioState.CW_TEST
             self._snapshot = self._replace_snapshot(
@@ -2878,6 +3157,21 @@ class SerialDeviceBackend(DeviceBackend):
             return  # The matching antenna in STATUS confirms the switch.
         self._pending_commands.remove(command)
         self._command_deadlines.pop(command, None)
+        if not accepted and command in {"STOP", "SLEEP", "WAKE", "STANDBY", "POWERDOWN"}:
+            if command == "STOP":
+                self._rx_cancel_requested = False
+                self._rx_cancel_timer.stop()
+                self._rf_stop_requested = False
+            self._snapshot = self._replace_snapshot(requested_radio_state=self._snapshot.confirmed_radio_state)
+            self.status_changed.emit(self._snapshot)
+            self.request_status()
+        if command in ("RX", "RXNOACK"):
+            if not accepted:
+                self._no_ack_selected = self._snapshot.rx_no_ack
+                self.status_changed.emit(self._snapshot)
+            self.request_status()
+        if command.startswith("POWER ") or (command.startswith("CHANNEL ") and not accepted):
+            self.request_status()
         if command.startswith("SELECTHEX"):
             name = self._pending_selection_name
             self._pending_selection_name = None
@@ -2912,6 +3206,7 @@ class SerialDeviceBackend(DeviceBackend):
     def _replace_snapshot(self, **changes) -> DeviceSnapshot:
         values = {
             "rx_no_ack": self._snapshot.rx_no_ack,
+            "host_file_transfer": self._upload_session is not None or self._download_session is not None,
             "fem_antenna": self._snapshot.fem_antenna,
             "fem_lna": self._snapshot.fem_lna,
             "connection_state": self._snapshot.connection_state,
@@ -2928,6 +3223,7 @@ class SerialDeviceBackend(DeviceBackend):
             "active_tx_file": self._snapshot.active_tx_file,
             "rx_transfer_state": self._snapshot.rx_transfer_state,
             "rx_transfer_id": self._snapshot.rx_transfer_id,
+            "rx_attempt": self._snapshot.rx_attempt,
             "rx_received_bytes": self._snapshot.rx_received_bytes,
             "rx_total_bytes": self._snapshot.rx_total_bytes,
             "rx_error": self._snapshot.rx_error,

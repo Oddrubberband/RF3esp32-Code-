@@ -30,8 +30,11 @@ class DeliveryTest(unittest.TestCase):
             for direction in ("TX",None):
                 a.save(direction,path)
                 with path.open(newline="") as f: rows=list(csv.DictReader(f))
-                self.assertEqual(len(rows),1)
+                self.assertEqual([row["record_type"] for row in rows], ["summary", "endpoint"])
                 r=rows[0]
+                restored=DeliveryBook()
+                restored.import_csv(path)
+                self.assertEqual(restored.rows()[0]["loss_pct"], 0.3)
                 self.assertEqual((r["missing_packets"],r["loss_pct"],r["first_pass_missing"],
                                   r["recovered_later"],r["crc_result"]),("3","0.3","18","15","passed"))
                 self.assertEqual(r["local_received"],"")

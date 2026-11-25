@@ -156,7 +156,9 @@ def number(parent, column, title):
 class MetricsPage(QWidget):
     def __init__(self, controller):
         super().__init__()
+        self._controller = controller
         self.live = SessionTraces()
+        self._accepted_report = None
         self.cadence = StatusCadence()
         self.capture = ReportCapture()
         self.destroyed.connect(self.capture.close)
@@ -243,16 +245,20 @@ class MetricsPage(QWidget):
         self.refresh()
 
     def observe(self, direction, identity, phase, count, total):
-        self.live.observe(direction, identity, phase, count, total, monotonic())
+        snapshot = self._controller.snapshot
+        attempt = snapshot.rx_attempt if direction == "RX" and identity == snapshot.rx_transfer_id else 0
+        trace = self.live.observe(direction, identity, phase, count, total, monotonic(), attempt=attempt)
+        self._accepted_report = (direction, trace) if trace is not None else None
 
     def tx_command(self, active):
         self.live.tx_command(active, monotonic())
 
     def record_report(self, direction, identity, details):
-        trace = self.live.traces.get(direction)
-        if trace is None or trace.identity != identity:
+        accepted = self._accepted_report
+        self._accepted_report = None
+        if accepted is None or accepted[0] != direction or accepted[1].identity != identity:
             return
-        self.capture.record(direction, trace, details)
+        self.capture.record(direction, accepted[1], details)
         self.export_buttons[direction].setEnabled(True)
 
     def delivery_update(self, row):
@@ -280,7 +286,7 @@ class MetricsPage(QWidget):
             for row in self.capture.delivery.local.values():
                 self.delivery_history.addItem(f"{row.board} {row.direction} · {row.mode} · {row.id}", "|".join(row.key))
                 self.export_buttons[row.direction].setEnabled(True)
-                self.last_delivery = row.direction
+            self.last_delivery = max(self.capture.delivery.local.values(), key=lambda row: row.time).direction
             self.summary_button.setEnabled(True)
         self.refresh_delivery()
         matches = sum(self.capture.delivery.partner(r) is not None for r in self.capture.delivery.local.values())
@@ -330,8 +336,9 @@ class MetricsPage(QWidget):
 
     def on_status(self, snapshot):
         connected = snapshot.connection_state in {ConnectionState.CONNECTED, ConnectionState.BUSY}
-        if not connected and (self.live.traces or self.live.pending_tx_start is not None or self.cadence.last is not None):
+        if not connected and (self.live.traces or self.live.tx_command_start is not None or self.cadence.last is not None):
             self.live = SessionTraces()
+            self._accepted_report = None
             self.cadence = StatusCadence()
         if self.online and not connected:
             self.capture.delivery.disconnect()

@@ -1,8 +1,8 @@
 """Package the Windows app and test the actual extracted executable."""
+import argparse
 from pathlib import Path
 import hashlib
 import os
-import shutil
 import subprocess
 import tempfile
 import time
@@ -11,7 +11,7 @@ import zipfile
 from PyInstaller.archive.readers import CArchiveReader
 
 ROOT = Path(__file__).resolve().parent
-PRODUCT = "RF3-Field-R20-Windows-x64.zip"
+PRODUCT = "RF3-Field-R24-Windows-x64.zip"
 
 
 def check_exe(folder):
@@ -27,12 +27,12 @@ def check_exe(folder):
         with tempfile.TemporaryDirectory() as logs:
             env = dict(os.environ, QT_QPA_PLATFORM="offscreen", RF3_LOG_DIR=logs)
             args = [exe, "--backend", "mock"] if backend == "mock" else [exe]
-            proc = subprocess.Popen(args, cwd=folder, env=env)
+            proc = subprocess.Popen(args, cwd=folder, env=env, creationflags=subprocess.CREATE_NO_WINDOW)
             try:
                 for _ in range(60):
                     if proc.poll() is not None:
                         raise RuntimeError(f"{backend} startup failed: {proc.returncode}")
-                    if any("GUI build=RF3-FIELD-R20" in f.read_text(errors="replace")
+                    if any("GUI build=RF3-FIELD-R24" in f.read_text(errors="replace")
                            for f in Path(logs).glob("connection-*.log")):
                         break
                     time.sleep(.5)
@@ -49,21 +49,30 @@ def check_exe(folder):
 
 
 def main():
-    dist = ROOT / "dist/RF3Desktop"
-    output = ROOT / "release"
-    output.mkdir(exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dist", type=Path, default=ROOT / "dist/RF3Desktop")
+    parser.add_argument("--output", type=Path, default=ROOT / "release")
+    args = parser.parse_args()
+    dist, output = args.dist.resolve(), args.output.resolve()
+    if not (dist / "RF3Desktop.exe").is_file() or not (dist / "_internal").is_dir():
+        parser.error(f"Expected RF3Desktop.exe and _internal in {dist}")
+    output.mkdir(parents=True, exist_ok=True)
     archive = output / PRODUCT
-    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in sorted(dist.rglob("*")):
-            if f.is_file():
-                z.write(f, f.relative_to(dist).as_posix())
-        for name in ("START-HERE.txt", "Practice.cmd"):
-            z.write(ROOT / name, name)
-    with tempfile.TemporaryDirectory() as temp, zipfile.ZipFile(archive) as z:
-        if z.testzip() is not None:
-            raise ValueError("ZIP integrity failure")
-        z.extractall(temp)
-        check_exe(Path(temp))
+    with tempfile.TemporaryDirectory(dir=output) as temp:
+        candidate = Path(temp) / PRODUCT
+        with zipfile.ZipFile(candidate, "w", zipfile.ZIP_DEFLATED) as z:
+            for f in sorted(dist.rglob("*")):
+                if f.is_file():
+                    z.write(f, f.relative_to(dist).as_posix())
+            for name in ("START-HERE.txt", "Practice.cmd"):
+                z.write(ROOT / name, name)
+        extracted = Path(temp) / "extract"
+        with zipfile.ZipFile(candidate) as z:
+            if z.testzip() is not None:
+                raise ValueError("ZIP integrity failure")
+            z.extractall(extracted)
+        check_exe(extracted)
+        candidate.replace(archive)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     (output / "SHA256SUMS.txt").write_text(f"{digest}  {PRODUCT}\n", encoding="ascii")
     print(f"{archive.stat().st_size} bytes, SHA256 {digest}")

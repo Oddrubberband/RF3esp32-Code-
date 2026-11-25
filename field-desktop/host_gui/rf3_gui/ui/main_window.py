@@ -132,12 +132,16 @@ class MainWindow(QMainWindow):
         return page
 
     def _selected_storage_file(self):
-        row = self.storage_table.currentRow()
+        selected = self.storage_table.selectionModel().selectedRows()
+        if not selected:
+            return None
+        row = selected[0].row()
         files = self._controller.storage.files
-        return files[row] if 0 <= row < len(files) else None
+        return files[row] if row < len(files) else None
 
     def _apply_storage_listing(self, listing: StorageListing) -> None:
-        old_item = self.storage_table.item(self.storage_table.currentRow(), 0)
+        selected = self.storage_table.selectionModel().selectedRows()
+        old_item = self.storage_table.item(selected[0].row(), 0) if selected else None
         selected_name = old_item.text() if old_item else None
         self.storage_table.setRowCount(len(listing.files))
         selected_row = -1
@@ -218,7 +222,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Unsupported file type", str(exc))
             return
         existing = {entry.name for entry in self._controller.storage.files}
-        if remote_name in existing:
+        replace_existing = remote_name in existing
+        if replace_existing:
             answer = QMessageBox.question(self, "Replace SPIFFS file?",
                                           f"Replace {remote_name} on the connected ESP32?",
                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -228,7 +233,10 @@ class MainWindow(QMainWindow):
         if not self._dialog_connection_valid(epoch):
             return
         self.storage_operation.setText(f"Importing {path.name} as {remote_name}; no nRF24 transmission")
-        self._controller.import_file(path)
+        if replace_existing:
+            self._controller.import_file(path, replace_existing=True)
+        else:
+            self._controller.import_file(path)
 
     def _export_storage_file(self) -> None:
         epoch = self._connection_epoch
@@ -434,7 +442,7 @@ class MainWindow(QMainWindow):
         self.file_mode_combo.addItem("Reliable (ACK)", False)
         self.file_mode_combo.addItem("No ACK (one-way)", True)
         self.file_mode_combo.setAccessibleName("File transfer mode")
-        self.file_mode_combo.setToolTip("Set both boards to the same mode, then press Receive on the destination.")
+        self.file_mode_combo.setToolTip("Select the same mode on both boards. A listening receiver applies changes immediately.")
         self.file_mode_combo.currentIndexChanged.connect(self._set_file_mode)
         self.file_mode_hint = QLabel()
         self.file_mode_hint.setWordWrap(True)
@@ -578,7 +586,7 @@ class MainWindow(QMainWindow):
         self.cw_on_spin.setValue(500)
         self.cw_on_spin.setSuffix(" ms")
         self.cw_off_spin = QSpinBox()
-        self.cw_off_spin.setRange(1, 60000)
+        self.cw_off_spin.setRange(7, 60000)
         self.cw_off_spin.setValue(500)
         self.cw_off_spin.setSuffix(" ms")
         self.cw_loop_button = QPushButton("Loop CW")
@@ -813,12 +821,12 @@ class MainWindow(QMainWindow):
         antenna = snapshot.fem_antenna
         self.fem_antenna_row.setVisible(connected and antenna in (1, 2))
         if antenna in (1, 2):
-            other = 3 - antenna
-            ports = {1: "J1", 2: "J5"}
+            ports = {1: "J5", 2: "J1"}
             self.fem_antenna_label.setText(f"FEM antenna: ANT{antenna} ({ports[antenna]})")
-            self.fem_antenna_button.setText(f"Select ANT{other} ({ports[other]})")
-            self.fem_antenna_button.setProperty("antenna", other)
-            self.fem_antenna_button.setEnabled(controls_enabled and snapshot.confirmed_radio_state == RadioState.STANDBY)
+            self.fem_antenna_button.setText("Select ANT1 (J5)")
+            self.fem_antenna_button.setProperty("antenna", 1)
+            self.fem_antenna_button.setVisible(antenna != 1)
+            self.fem_antenna_button.setEnabled(antenna != 1 and controls_enabled and snapshot.confirmed_radio_state == RadioState.STANDBY)
 
         lna = snapshot.fem_lna
         if connected and lna in ("gain", "bypass"):
@@ -972,6 +980,8 @@ class MainWindow(QMainWindow):
                  else 1.0 if rx_state == "Completed" else 0.0)
         self.rx_progress.setValue(int(min(1.0, max(0.0, ratio)) * 1000))
         if snapshot is not self._rx_rate_snapshot:
+            if self._rx_rate_snapshot is not None and self._rx_rate_snapshot.rx_attempt != snapshot.rx_attempt:
+                self._rx_rate_tracker.reset()
             self._rx_rate_snapshot = snapshot
             estimate = self._rx_rate_tracker.observe(snapshot.rx_transfer_id,
                 snapshot.rx_transfer_state, snapshot.rx_received_bytes)
@@ -1015,13 +1025,20 @@ class MainWindow(QMainWindow):
         self.bluetooth_scan_button.setEnabled(not (connected or busy or connecting or searching))
         self.device_combo.setEnabled(not (connected or busy or connecting or searching))
         self.file_mode_combo.setEnabled(connected and not busy and not snapshot.test_mode and snapshot.rx_transfer_state not in {"Receiving", "WaitingForEnd", "Verifying", "Publishing"})
-        no_ack = bool(self.file_mode_combo.currentData())
+        no_ack = self._controller.no_ack_selected
+        self.file_mode_combo.blockSignals(True)
+        self.file_mode_combo.setCurrentIndex(int(no_ack))
+        self.file_mode_combo.blockSignals(False)
         self.file_mode_hint.setText(
             "Select No ACK on both boards. The receiver sends no replies; delivery is unconfirmed."
             if no_ack else "ACK confirms delivery and retries missing packets."
         )
+        if connected and snapshot.confirmed_radio_state == RadioState.RX_LISTENING:
+            active_mode = "No ACK" if snapshot.rx_no_ack else "Reliable (ACK)"
+            self.file_mode_hint.setText(f"Board listening in {active_mode}.")
         self.refresh_button.setEnabled(connected and not busy)
-        self.stop_button.setEnabled((connected or busy) and not snapshot.test_mode and self._pending_test_mode is None)
+        self.stop_button.setEnabled((connected or busy) and (not snapshot.test_mode or snapshot.host_file_transfer)
+                                     and self._pending_test_mode is None)
         receiving = snapshot.rx_transfer_state in {"Receiving", "WaitingForEnd", "Verifying", "Publishing"}
         self.stop_button.setText("Cancel Receive" if receiving else "Stop")
         self.stop_button.setToolTip("Cancel the incoming RF file" if receiving else "Stop the current RF operation")
@@ -1052,12 +1069,12 @@ class MainWindow(QMainWindow):
         self.save_received_button.setEnabled(
             connected
             and not busy
-            and snapshot.telemetry.rx_saved > 0
+            and bool(snapshot.telemetry.last_rx_file)
             and snapshot.capabilities.supports_host_file_download
             and not snapshot.test_mode
             and self._pending_test_mode is None
         )
-        self.morse_text_edit.setEnabled(controls_enabled)
+        self.morse_text_edit.setEnabled(rf_ready)
         self.send_morse_button.setEnabled(rf_ready)
         remote_enabled = rf_ready and snapshot.capabilities.supports_remote_commands
         self.remote_command_edit.setEnabled(remote_enabled)
@@ -1090,7 +1107,8 @@ class MainWindow(QMainWindow):
         self.cw_off_spin.setEnabled(controls_enabled)
         self.cw_start_button.setEnabled(rf_ready)
         self.cw_loop_button.setEnabled(rf_ready)
-        self.cw_stop_button.setEnabled((connected or busy) and not snapshot.test_mode and self._pending_test_mode is None)
+        self.cw_stop_button.setEnabled((connected or busy) and (not snapshot.test_mode or snapshot.host_file_transfer)
+                                     and self._pending_test_mode is None)
         self.cw_stop_button.setText("Cancel Receive" if receiving else "Stop")
 
         self.statusBar().showMessage(
@@ -1139,7 +1157,9 @@ class MainWindow(QMainWindow):
                     "radio module is installed before trying RF sleep/wake/RX/TX commands."
                 )
             QMessageBox.warning(self, "Command rejected", message)
-        elif _command.startswith(("TEXT ", "ECHO ")):
+        elif (_command.startswith(("TEXT ", "ECHO "))
+              and not self.live_text_edit.isModified()
+              and self.live_text_edit.text().strip() == _command.partition(" ")[2]):
             self.live_text_edit.clear()
 
     def _choose_file(self) -> None:
@@ -1149,11 +1169,9 @@ class MainWindow(QMainWindow):
         path = Path(path_text)
         if self._controller.set_selected_file(path):
             self.file_path_edit.setText(str(path))
-            self.progress_bar.setValue(0)
-            self.progress_bar.hide()
-            self.transfer_state_label.setText("Idle")
             self.upload_name_value.setText(f"SPIFFS upload name: {console_protocol.import_filename(path.name)}")
-            self.transfer_detail_label.setText("File Transmit reuses a board copy when its name, size and CRC32 match.")
+            if self.transfer_state_label.text() == TransferState.IDLE.value:
+                self.transfer_detail_label.setText("File Transmit reuses a board copy when its name, size and CRC32 match.")
             self._apply_snapshot(self._controller.snapshot)
 
     def _set_channel(self) -> None:
@@ -1191,6 +1209,7 @@ class MainWindow(QMainWindow):
         self._controller.send_remote_command(self.remote_command_edit.text())
 
     def _send_text_message(self) -> None:
+        self.live_text_edit.setModified(False)
         self._controller.send_text_message(self.live_text_edit.text())
 
     def _append_text_message(self, direction: str, text: str) -> None:

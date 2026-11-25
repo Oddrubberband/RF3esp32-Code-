@@ -18,8 +18,9 @@ class Sample:
 
 
 class Trace:
-    def __init__(self, identity, total, start, first_count, command_start=None):
+    def __init__(self, identity, total, start, first_count, command_start=None, *, attempt=0):
         self.identity = identity
+        self.attempt = attempt
         self.total = total
         self.start = start
         self.average_start = start if command_start is None else command_start
@@ -30,10 +31,10 @@ class Trace:
 
     def add(self, phase, count, now):
         if self.phase in TERMINAL:
-            return
+            return False
         points = self.points
         if points and (now < points[-1].t or count < points[-1].count):
-            return
+            return False
         # Consolidate bursts inside fixed 250 ms bins. Retain the first observation
         # and both sides of an acquisition gap for the derivative and the plot.
         if len(points) >= 2 and (int((now-self.start)*4) == int((points[-1].t-self.start)*4)
@@ -58,6 +59,7 @@ class Trace:
         while len(points) > 2 and points[1].t < now-PLOT_SECONDS:
             points.popleft()
         self.phase = phase
+        return True
 
     def stale(self, now):
         return self.phase not in TERMINAL and now-self.points[-1].t > GAP_SECONDS
@@ -84,29 +86,32 @@ class SessionTraces:
     def __init__(self):
         self.traces = {}
         self.latest = None
-        self.pending_tx_start = None
+        self.tx_command_start = None
 
     def tx_command(self, active, now):
-        self.pending_tx_start = now if active else None
+        self.tx_command_start = now if active else None
         if active:
             self.traces.pop("TX", None)
 
-    def observe(self, direction, identity, phase, count, total, now):
+    def observe(self, direction, identity, phase, count, total, now, *, attempt=0):
         if direction not in {"TX", "RX"} or not identity or not 0 <= count <= total:
-            return
+            return None
         trace = self.traces.get(direction)
-        if trace is None or trace.identity != identity:
-            start = self.pending_tx_start if direction == "TX" else None
-            trace = self.traces[direction] = Trace(identity, total, now, count, start)
-            if direction == "TX":
-                self.pending_tx_start = None
+        restarted_rx = direction == "RX" and trace is not None and (
+            (attempt and attempt != trace.attempt)
+            or (not attempt and trace.phase == "Failed"
+                and phase in {"Receiving", "WaitingForEnd", "Verifying", "Publishing", "Completed"})
+        )
+        if trace is None or trace.identity != identity or restarted_rx:
+            start = self.tx_command_start if direction == "TX" else None
+            trace = self.traces[direction] = Trace(identity, total, now, count, start, attempt=attempt)
         elif trace.total != total:
             # An inconsistent size is not evidence of new progress.
-            return
-        if trace.phase in TERMINAL or (trace.points and count < trace.points[-1].count):
-            return
-        trace.add(phase, count, now)
+            return None
+        if not trace.add(phase, count, now):
+            return None
         self.latest = direction
+        return trace
 
     def end_observation(self, direction, identity, phase):
         trace = self.traces.get(direction)

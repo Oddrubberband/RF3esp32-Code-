@@ -12,7 +12,7 @@ from rf3_gui.app.delivery import DeliveryBook, FIELDS, COLUMNS as SUMMARY_COLUMN
 COLUMNS = (
     "timestamp_utc", "source", "direction", "transfer_id", "phase", "packet_number",
     "total_packets", "file_crc32_hex", "payload_bytes", "total_bytes", "tx_retries",
-    "elapsed_s", "recent_Bps", "average_Bps", "payload_eta_s",
+    "elapsed_s", "recent_Bps", "average_Bps", "payload_eta_s", "rx_attempt",
 ) + FIELDS
 
 
@@ -25,7 +25,7 @@ class ReportCapture:
         sample = trace.points[-1]
         row = dict(details, timestamp_utc=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                    direction=direction, transfer_id=trace.identity, phase=trace.phase,
-                   payload_bytes=sample.count, total_bytes=trace.total)
+                   payload_bytes=sample.count, total_bytes=trace.total, rx_attempt=trace.attempt or None)
         metrics = (sample.t - trace.average_start, sample.rate,
                    trace.average_rate(sample.t), trace.eta(sample.t))
         for name, value in zip(("elapsed_s", "recent_Bps", "average_Bps", "payload_eta_s"), metrics):
@@ -53,7 +53,7 @@ class ReportCapture:
                     shutil.copyfileobj(stream, output)
                 else:
                     writer.writeheader()
-                writer.writerows(self.delivery.rows(direction))
+                writer.writerows(self.delivery.export_rows(direction))
             os.replace(temporary, path)
         finally:
             if stream:

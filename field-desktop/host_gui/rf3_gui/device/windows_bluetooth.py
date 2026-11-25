@@ -15,7 +15,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 
 SPP_SERVICE_UUID = "00001101-0000-1000-8000-00805f9b34fb"
@@ -221,12 +221,15 @@ def matching_spp_ports(address: str, ports, registry_ports=()) -> list[str]:
         combined = (hardware + " " + label).upper()
         if "INCOMING" in combined or not ("BLUETOOTH" in combined or "BTHENUM" in combined):
             continue
+        service_uuid = re.search(r"BTHENUM\\\{([0-9A-F-]{36})\}", hardware.upper())
+        if service_uuid is not None and service_uuid.group(1) != SPP_SERVICE_UUID.upper():
+            continue
+        explicit_spp = service_uuid is not None or re.search(r"BTHENUM\\SPP(?:_|\\|$)", hardware.upper()) is not None
         remote = instance_address(hardware)
         name = str(port.device).upper()
-        if remote is not None:
-            if remote == selected:
-                matches.add(name)
-        elif name in mapped:
+        if remote is not None and remote != selected:
+            continue
+        if (remote == selected and explicit_spp) or name in mapped:
             matches.add(name)
     return sorted(matches)
 
@@ -266,7 +269,7 @@ class WindowsBluetooth:
                 if not device.address:
                     continue
                 seen = device.last_seen.utc()
-                fresh = seen is not None and started - timedelta(seconds=2) <= seen <= finished + timedelta(seconds=2)
+                fresh = seen is not None and started <= seen <= finished
                 address = format_address(device.address)
                 peers[address] = BluetoothPeer(device.name or "Unnamed Classic Bluetooth device",
                                                address, bool(device.authenticated), fresh)

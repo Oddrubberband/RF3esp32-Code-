@@ -61,8 +61,12 @@ class TestHostFileTransfer(unittest.TestCase):
                 else:
                     backend._handle_line(f"DOWNLOAD READYHEX {path.name.encode().hex()} 3 {checksum}")
                     backend._handle_line("DOWNLOAD CANCELLED")
-                self.assertEqual(sent[-1], console_protocol.upload_begin_command("song.bin", 3, 0x352441C2))
-                self.assertEqual(backend._upload_session.data, b"abc")
+                if checksum is None:
+                    self.assertEqual(sent[-1], console_protocol.upload_begin_command("song.bin", 3, 0x352441C2))
+                    self.assertEqual(backend._upload_session.data, b"abc")
+                else:
+                    self.assertFalse(any(command.startswith("UPLOAD BEGIN") for command in sent))
+                    self.assertIsNone(backend._upload_session)
 
     def test_lookup_checks_import_alias_and_rejects_an_unrelated_reply(self):
         with tempfile.TemporaryDirectory() as d:
@@ -174,38 +178,41 @@ class TestHostFileTransfer(unittest.TestCase):
     def _begin_validation(self, directory, payload, *, bluetooth=True):
         backend, sent = self._connected_backend(bluetooth=bluetooth)
         self.addCleanup(backend.disconnect_from_device)
-        backend._snapshot = replace(backend._snapshot, test_mode=True)
+        backend._snapshot = replace(backend._snapshot, test_mode=True, capabilities=replace(
+            backend._snapshot.capabilities, supports_file_guard=True))
         progress = []
         backend.transfer_changed.connect(progress.append)
         source = Path(directory) / "validate.bin"
         source.write_bytes(payload)
         crc = binascii.crc32(payload) & 0xFFFFFFFF
         backend.start_tx(source)
-        self.assertEqual(sent[-1], console_protocol.upload_begin_command("validate.bin", len(payload), crc))
-        backend._handle_line(f"UPLOAD READY validate.bin {len(payload)} {crc:08X}")
+        name = console_protocol.staged_filename(source.name, payload, verify_only=True)
+        tag = name.encode().hex().upper()
+        self.assertEqual(sent[-1], console_protocol.upload_begin_command(name, len(payload), crc, create_only=True))
+        backend._handle_line(f"UPLOAD READY {name} {len(payload)} {crc:08X}")
         for sequence, offset in enumerate(range(0, len(payload), 64)):
             chunk = payload[offset:offset + 64]
             self.assertEqual(sent[-1], console_protocol.upload_data_command(sequence, chunk))
             backend._handle_line(f"UPLOAD ACK {sequence} {offset + len(chunk)}")
         self.assertEqual(sent[-1], "UPLOAD END")
         self.assertNotEqual(progress[-1].state, TransferState.COMPLETED)
-        return backend, sent, progress, crc
+        return backend, sent, progress, crc, name, tag
 
     def test_test_mode_roundtrip_verifies_binary_and_empty_files_without_rf(self):
         for bluetooth in (False, True):
             for payload in (b"", bytes(range(256)) + b"\x00\r\n\xff"):
                 with self.subTest(bluetooth=bluetooth, size=len(payload)), tempfile.TemporaryDirectory() as directory:
-                    backend, sent, progress, crc = self._begin_validation(directory, payload, bluetooth=bluetooth)
-                    backend._handle_line(f"UPLOAD COMPLETE validate.bin {len(payload)} {crc:08X}")
-                    self.assertEqual(sent[-1], "DOWNLOAD BEGIN validate.bin")
+                    backend, sent, progress, crc, name, tag = self._begin_validation(directory, payload, bluetooth=bluetooth)
+                    backend._handle_line(f"UPLOAD COMPLETE {name} {len(payload)} {crc:08X}")
+                    self.assertEqual(sent[-1], f"DOWNLOAD BEGINHEX {tag}")
                     self.assertEqual(progress[-1].state, TransferState.VERIFYING)
-                    backend._handle_line(f"DOWNLOAD READY validate.bin {len(payload)} {crc:08X}")
+                    backend._handle_line(f"DOWNLOAD READYHEX {tag} {len(payload)} {crc:08X}")
                     for sequence, offset in enumerate(range(0, len(payload), 64)):
                         self.assertEqual(sent[-1], f"DOWNLOAD DATA {sequence}")
                         backend._handle_line(f"DOWNLOAD DATA {sequence} {payload[offset:offset + 64].hex()}")
                     self.assertEqual(sent[-1], "DOWNLOAD END")
                     self.assertNotEqual(progress[-1].state, TransferState.COMPLETED)
-                    backend._handle_line(f"DOWNLOAD COMPLETE validate.bin {len(payload)} {crc:08X}")
+                    backend._handle_line(f"DOWNLOAD COMPLETEHEX {tag} {len(payload)} {crc:08X}")
                     self.assertEqual(progress[-1].state, TransferState.COMPLETED)
                     self.assertIn(hashlib.sha256(payload).hexdigest(), progress[-1].message)
                     self.assertIn("byte-for-byte match", progress[-1].message)
@@ -219,36 +226,36 @@ class TestHostFileTransfer(unittest.TestCase):
 
     def test_validation_choice_stays_no_rf_when_status_changes(self):
         with tempfile.TemporaryDirectory() as directory:
-            backend, sent, progress, crc = self._begin_validation(directory, b"abc")
+            backend, sent, progress, crc, name, tag = self._begin_validation(directory, b"abc")
             backend._handle_line('{"state":"Fault","test_mode":false,"tx_state":"Completed"}')
             self.assertNotEqual(progress[-1].state, TransferState.COMPLETED)
-            backend._handle_line(f"UPLOAD COMPLETE validate.bin 3 {crc:08X}")
-            self.assertEqual(sent[-1], "DOWNLOAD BEGIN validate.bin")
+            backend._handle_line(f"UPLOAD COMPLETE {name} 3 {crc:08X}")
+            self.assertEqual(sent[-1], f"DOWNLOAD BEGINHEX {tag}")
             self.assertFalse(any(command.startswith("TX") for command in sent))
 
     def test_validation_rejects_wrong_readback_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
-            backend, sent, progress, crc = self._begin_validation(directory, b"abc")
-            backend._handle_line(f"UPLOAD COMPLETE validate.bin 3 {crc:08X}")
-            backend._handle_line(f"DOWNLOAD READY validate.bin 4 {crc:08X}")
+            backend, sent, progress, crc, name, tag = self._begin_validation(directory, b"abc")
+            backend._handle_line(f"UPLOAD COMPLETE {name} 3 {crc:08X}")
+            backend._handle_line(f"DOWNLOAD READYHEX {tag} 4 {crc:08X}")
             self.assertEqual(progress[-1].state, TransferState.FAILED)
             self.assertIn("metadata", progress[-1].message)
             self.assertIsNone(backend._download_session)
-            self.assertEqual(backend._write_queue.get_nowait(), "DOWNLOAD CANCEL")
+            self.assertEqual(sent[-1], "DOWNLOAD CANCEL")
 
     def test_validation_rejects_corrupt_bytes_even_if_crc_collides(self):
         for collision in (False, True):
             with self.subTest(collision=collision), tempfile.TemporaryDirectory() as directory:
-                backend, sent, progress, crc = self._begin_validation(directory, b"abc")
-                backend._handle_line(f"UPLOAD COMPLETE validate.bin 3 {crc:08X}")
-                backend._handle_line(f"DOWNLOAD READY validate.bin 3 {crc:08X}")
+                backend, sent, progress, crc, name, tag = self._begin_validation(directory, b"abc")
+                backend._handle_line(f"UPLOAD COMPLETE {name} 3 {crc:08X}")
+                backend._handle_line(f"DOWNLOAD READYHEX {tag} 3 {crc:08X}")
                 # Inject a CRC collision to verify the independent byte comparison.
                 if collision:
                     with patch("rf3_gui.device.serial_device.binascii.crc32", return_value=crc):
                         backend._handle_line("DOWNLOAD DATA 0 78797A")
                 else:
                     backend._handle_line("DOWNLOAD DATA 0 78797A")
-                backend._handle_line(f"DOWNLOAD COMPLETE validate.bin 3 {crc:08X}")
+                backend._handle_line(f"DOWNLOAD COMPLETEHEX {tag} 3 {crc:08X}")
                 self.assertEqual(progress[-1].state, TransferState.FAILED)
                 self.assertIn("original file bytes" if collision else "CRC32", progress[-1].message)
                 self.assertFalse(any(command.startswith("TX") for command in sent))
@@ -256,9 +263,9 @@ class TestHostFileTransfer(unittest.TestCase):
     def test_validation_readback_retries_duplicates_and_disconnect_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             payload = bytes(range(70))
-            backend, sent, progress, crc = self._begin_validation(directory, payload)
-            backend._handle_line(f"UPLOAD COMPLETE validate.bin 70 {crc:08X}")
-            backend._handle_line(f"DOWNLOAD READY validate.bin 70 {crc:08X}")
+            backend, sent, progress, crc, name, tag = self._begin_validation(directory, payload)
+            backend._handle_line(f"UPLOAD COMPLETE {name} 70 {crc:08X}")
+            backend._handle_line(f"DOWNLOAD READYHEX {tag} 70 {crc:08X}")
             backend._on_host_transfer_timeout()
             self.assertEqual(backend._write_queue.get_nowait(), "DOWNLOAD DATA 0")
             first = f"DOWNLOAD DATA 0 {payload[:64].hex()}"
@@ -273,9 +280,9 @@ class TestHostFileTransfer(unittest.TestCase):
 
     def test_validation_missing_end_response_fails_without_rf(self):
         with tempfile.TemporaryDirectory() as directory:
-            backend, sent, progress, crc = self._begin_validation(directory, b"abc")
-            backend._handle_line(f"UPLOAD COMPLETE validate.bin 3 {crc:08X}")
-            backend._handle_line(f"DOWNLOAD READY validate.bin 3 {crc:08X}")
+            backend, sent, progress, crc, name, tag = self._begin_validation(directory, b"abc")
+            backend._handle_line(f"UPLOAD COMPLETE {name} 3 {crc:08X}")
+            backend._handle_line(f"DOWNLOAD READYHEX {tag} 3 {crc:08X}")
             backend._handle_line("DOWNLOAD DATA 0 616263")
             backend._on_host_transfer_timeout()
             self.assertEqual(progress[-1].state, TransferState.FAILED)
@@ -284,7 +291,7 @@ class TestHostFileTransfer(unittest.TestCase):
 
     def test_validation_failed_upload_never_starts_readback_or_rf(self):
         with tempfile.TemporaryDirectory() as directory:
-            backend, sent, progress, crc = self._begin_validation(directory, b"abc")
+            backend, sent, progress, crc, name, tag = self._begin_validation(directory, b"abc")
             backend._handle_line("UPLOAD ERROR crc_mismatch")
             self.assertEqual(progress[-1].state, TransferState.FAILED)
             self.assertIsNone(backend._upload_session)
@@ -293,8 +300,8 @@ class TestHostFileTransfer(unittest.TestCase):
 
     def test_validation_upload_completion_requires_matching_crc(self):
         with tempfile.TemporaryDirectory() as directory:
-            backend, sent, progress, crc = self._begin_validation(directory, b"abc")
-            backend._handle_line("UPLOAD COMPLETE validate.bin 3 00000000")
+            backend, sent, progress, crc, name, tag = self._begin_validation(directory, b"abc")
+            backend._handle_line(f"UPLOAD COMPLETE {name} 3 00000000")
             self.assertEqual(progress[-1].state, TransferState.FAILED)
             self.assertIsNone(backend._upload_session)
             self.assertFalse(any(command.startswith(("TX", "DOWNLOAD")) for command in sent))
@@ -311,7 +318,7 @@ class TestHostFileTransfer(unittest.TestCase):
             backend.start_tx(source)
             self.assertEqual(sent, [])
             backend._snapshot = replace(backend._snapshot, capabilities=replace(
-                backend._snapshot.capabilities, supports_host_file_download=True
+                backend._snapshot.capabilities, supports_host_file_download=True, supports_file_guard=True
             ))
             backend._awaiting_test_mode = True
             backend.start_tx(source)
@@ -444,7 +451,7 @@ class TestHostFileTransfer(unittest.TestCase):
             self.assertEqual(progress[-1].state, TransferState.FAILED)
 
     def test_old_firmware_without_retry_capability_fails_without_resending(self):
-        backend, _ = self._connected_backend()
+        backend, sent = self._connected_backend()
         from dataclasses import replace
         backend._snapshot = replace(backend._snapshot, capabilities=replace(
             backend._snapshot.capabilities, supports_host_chunk_retry=False
@@ -457,7 +464,7 @@ class TestHostFileTransfer(unittest.TestCase):
             backend._handle_line(f"UPLOAD READY retry.bin 3 {crc:08X}")
             backend._on_host_transfer_timeout()
             self.assertIsNone(backend._upload_session)
-            self.assertEqual(backend._write_queue.get_nowait(), "UPLOAD CANCEL")
+            self.assertEqual(sent[-1], "UPLOAD CANCEL")
             self.assertTrue(backend._write_queue.empty())
 
 

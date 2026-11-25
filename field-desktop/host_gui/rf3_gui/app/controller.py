@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from stat import S_ISREG
 
 from PySide6.QtCore import QObject, Signal
 
@@ -72,8 +73,8 @@ class AppController(QObject):
     def refresh_storage(self) -> None:
         self._backend.refresh_storage()
 
-    def import_file(self, source_path: Path) -> None:
-        self._backend.import_file(source_path)
+    def import_file(self, source_path: Path, *, replace_existing: bool = False) -> None:
+        self._backend.import_file(source_path, replace_existing=replace_existing)
 
     def export_file(self, remote_name: str, destination_path: Path) -> None:
         self._backend.export_file(remote_name, destination_path)
@@ -151,7 +152,15 @@ class AppController(QObject):
         self._backend.set_test_mode(enabled)
 
     def set_selected_file(self, path: Path) -> bool:
-        if not path.exists() or not path.is_file():
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            self.command_finished.emit("FILE", False, "Selected path is not a file")
+            return False
+        except OSError as exc:
+            self.command_finished.emit("FILE", False, f"Could not inspect the selected file: {exc}")
+            return False
+        if not S_ISREG(info.st_mode):
             self.command_finished.emit("FILE", False, "Selected path is not a file")
             return False
         try:
@@ -160,7 +169,7 @@ class AppController(QObject):
         except ValueError as exc:
             self.command_finished.emit("FILE", False, str(exc))
             return False
-        if path.stat().st_size > PROTOCOL_V2_MAX_FILE_SIZE:
+        if info.st_size > PROTOCOL_V2_MAX_FILE_SIZE:
             self.command_finished.emit(
                 "FILE",
                 False,
@@ -206,6 +215,10 @@ class AppController(QObject):
 
     def stop(self) -> None:
         self._backend.stop()
+
+    @property
+    def no_ack_selected(self) -> bool:
+        return self._backend.no_ack_selected
 
     def set_no_ack_mode(self, enabled: bool) -> bool:
         return self._backend.set_no_ack_mode(enabled)

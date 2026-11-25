@@ -27,27 +27,40 @@ def storage_delete_command(name: str) -> str:
     return "STORAGE DELETE " + name.encode("utf-8").hex().upper()
 
 
-def download_begin_hex_command(name: str, chunk_bytes: int = 64) -> str:
-    if not valid_storage_name(name):
+def download_begin_hex_command(name: str, chunk_bytes: int = 64, *, staged: bool = False) -> str:
+    if not valid_storage_name(name) and not (staged and is_staged_filename(name)):
         raise ValueError("Invalid SPIFFS file name")
     return "DOWNLOAD BEGINHEX " + name.encode("utf-8").hex().upper() + _chunk_argument(chunk_bytes)
 
 
 def import_filename(name: str) -> str:
-    sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", name)
-    sanitized = sanitized.strip(".") or "payload.bin"
-    while ".." in sanitized:
-        sanitized = sanitized.replace("..", "__")
-    if sanitized.lower().endswith(".part"):
-        sanitized += ".bin"
-    if sanitized == name and len(sanitized.encode("ascii")) <= 30:
-        return sanitized
-    tag = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
-    suffix = Path(sanitized).suffix
+    original_suffix = Path(name).suffix
+    suffix = re.sub(r"[^A-Za-z0-9._-]", "_", original_suffix)
+    if suffix.lower() == ".part":
+        suffix += ".bin"
+    stem = name[:-len(original_suffix)] if original_suffix else name
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", stem).strip(".") or "payload"
+    while ".." in stem:
+        stem = stem.replace("..", "__")
+    if stem + suffix == name and valid_storage_name(name):
+        return name
     if len(suffix) > 20:
         raise ValueError("File extension is too long to preserve in a SPIFFS name")
-    stem = Path(sanitized).stem[:30 - len(suffix) - len(tag) - 1] or "payload"
-    return f"{stem}_{tag}{suffix}"[:30]
+    tag = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    return f"{stem[:21 - len(suffix)]}_{tag}{suffix}"
+
+
+def staged_filename(name: str, data: bytes, *, verify_only: bool = False) -> str:
+    digest = hashlib.sha256(data).hexdigest()
+    if verify_only:
+        return f".~v{digest[:16]}"
+    return f".~t{digest[:16]}{transfer_extension(name)}"
+
+
+def is_staged_filename(name: str) -> bool:
+    if not re.fullmatch(r"(?:\.~t[0-9a-f]{16}(?:\.[A-Za-z0-9_-]{1,9})?|\.~v[0-9a-f]{16})", name):
+        return False
+    return not name.lower().endswith(".part")
 
 
 def upload_extension(name: str) -> str:
@@ -117,8 +130,10 @@ def _chunk_argument(chunk_bytes: int) -> str:
     return f" {chunk_bytes}" if chunk_bytes != 64 else ""
 
 
-def upload_begin_command(filename: str, size: int, crc32: int, chunk_bytes: int = 64) -> str:
-    return f"UPLOAD BEGIN {filename} {size} {crc32:08X}" + _chunk_argument(chunk_bytes)
+def upload_begin_command(filename: str, size: int, crc32: int, chunk_bytes: int = 64,
+                         *, create_only: bool = False) -> str:
+    action = ("BEGINNEW" if is_staged_filename(filename) else "BEGINCREATE") if create_only else "BEGIN"
+    return f"UPLOAD {action} {filename} {size} {crc32:08X}" + _chunk_argument(chunk_bytes)
 
 
 def upload_data_command(sequence: int, payload: bytes) -> str:
@@ -202,7 +217,14 @@ def select_stored_command(name: str) -> str:
     return "SELECTHEX " + name.encode("utf-8").hex().upper()
 
 
-def stored_tx_command(name: str, *, no_ack: bool = False) -> str:
-    if not valid_storage_name(name):
+def stored_tx_command(name: str, *, no_ack: bool = False,
+                      identity: tuple[int, int] | None = None, resume_from: str = "") -> str:
+    if not valid_storage_name(name) and not (identity is not None and is_staged_filename(name)):
         raise ValueError("Invalid SPIFFS file name")
-    return ("TXNOACKHEX " if no_ack else "TXHEX ") + name.encode("utf-8").hex().upper()
+    command = ("TXNOACKHEX " if no_ack else "TXHEX ") + name.encode("utf-8").hex().upper()
+    if identity is not None:
+        size, crc32 = identity
+        command += f" {size} {crc32:08X}"
+        if resume_from:
+            command += " " + resume_from
+    return command
